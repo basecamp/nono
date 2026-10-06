@@ -458,7 +458,9 @@ impl ProxyCredentialCaptureBackend {
             command.env_remove(name);
         }
 
-        let mut child = command.spawn().map_err(|err| {
+        // Registered so the supervisor's orphan reaper leaves this child's
+        // exit status to the wait loop below (#1620).
+        let mut child = crate::owned_children::spawn(&mut command).map_err(|err| {
             self.capture_error(
                 entry,
                 CaptureErrorDetails::new("spawn_failed", start.elapsed())
@@ -6205,5 +6207,98 @@ mod tests {
         }
 
         result
+    }
+
+    /// These tests run the supervisor's wildcard orphan reaper, which would
+    /// steal children from tests running concurrently in the same process.
+    /// Each one re-runs itself alone in a fresh test process.
+    #[cfg(target_os = "linux")]
+    mod capture_reap {
+        use super::*;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        const ISOLATED_ENV: &str = "NONO_CAPTURE_REAP_TEST";
+
+        fn isolated(name: &str, test: impl FnOnce()) {
+            if std::env::var(ISOLATED_ENV).ok().as_deref() == Some(name) {
+                test();
+                return;
+            }
+            let executable = std::env::current_exe().expect("test executable");
+            let status = Command::new(executable)
+                .args([
+                    "--exact",
+                    &format!("proxy_runtime::tests::capture_reap::{name}"),
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(ISOLATED_ENV, name)
+                .status()
+                .expect("run isolated test");
+            assert!(status.success(), "isolated {name}: {status}");
+        }
+
+        /// Issue #1620: the supervisor loop reaps reparented orphans with a
+        /// wildcard wait while capture commands run on proxy threads. A
+        /// capture child that exits between two `try_wait` polls must still
+        /// be collected by its owner, not by the reaper.
+        #[test]
+        fn capture_command_status_is_not_stolen_by_orphan_reaper() {
+            isolated(
+                "capture_command_status_is_not_stolen_by_orphan_reaper",
+                || {
+                    let mut entries = HashMap::new();
+                    entries.insert(
+                        "dummy".to_string(),
+                        test_capture_entry(vec![
+                            "/bin/echo".to_string(),
+                            "dummy-token".to_string(),
+                        ]),
+                    );
+                    let backend = ProxyCredentialCaptureBackend::new(
+                        &entries,
+                        "sess-test".to_string(),
+                        nono::CapabilitySet::default(),
+                    )
+                    .expect("capture backend");
+                    let entry = backend.entries.get("dummy").expect("capture entry");
+                    let request = nono_proxy::capture::CredentialCaptureRequest {
+                        credential_name: "dummy".to_string(),
+                        route_id: "dummy".to_string(),
+                        request_host: "example.com".to_string(),
+                        request_path: "/".to_string(),
+                        request_method: "GET".to_string(),
+                        session_id: String::new(),
+                        cache_scope: String::new(),
+                    };
+
+                    let stop = Arc::new(AtomicBool::new(false));
+                    let reaper = {
+                        let stop = Arc::clone(&stop);
+                        std::thread::spawn(move || {
+                            let not_a_child = nix::unistd::Pid::from_raw(i32::MAX);
+                            while !stop.load(Ordering::Relaxed) {
+                                let _ = crate::exec_strategy::reap_reparented_orphans(not_a_child);
+                                std::thread::yield_now();
+                            }
+                        })
+                    };
+
+                    let failures: Vec<String> = (0..20)
+                        .filter_map(|_| backend.run_capture_command(entry, &request).err())
+                        .map(|err| err.to_string())
+                        .collect();
+
+                    stop.store(true, Ordering::Relaxed);
+                    reaper.join().expect("reaper thread");
+                    assert!(
+                        failures.is_empty(),
+                        "{} of 20 captures failed: {:?}",
+                        failures.len(),
+                        failures.first()
+                    );
+                },
+            );
+        }
     }
 }

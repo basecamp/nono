@@ -2812,7 +2812,7 @@ type SupervisorLoopResult = (
 /// `ECHILD`. If the primary `child` is reaped here, its status is returned
 /// rather than dropped.
 #[cfg(target_os = "linux")]
-fn reap_reparented_orphans(child: Pid) -> Option<WaitStatus> {
+pub(crate) fn reap_reparented_orphans(child: Pid) -> Option<WaitStatus> {
     // Held for the whole drain so a concurrent spawn cannot produce a child
     // that is terminated but not yet registered.
     let owned = crate::owned_children::lock();
