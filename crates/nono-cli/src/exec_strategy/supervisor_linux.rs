@@ -117,8 +117,106 @@ impl NetworkDenialThrottle {
     }
 }
 
+/// Audit budget for capability requests refused by the approval [`RateLimiter`].
+///
+/// Those requests never reach the approval backend: the limiter decides them,
+/// so they are audited like a backend decision. A child spinning on ungranted
+/// paths must not be able to grow the audit log without bound, so past this
+/// budget refusals are counted and reported as one summary entry, as
+/// [`NetworkDenialThrottle`] does for network denials. Enforcement is
+/// unaffected either way.
+pub(super) struct RateLimitedCapabilityAudit {
+    limiter: RateLimiter,
+    suppressed: u64,
+    last_suppressed: Option<nono::supervisor::ApprovalRequest>,
+}
+
+/// Same defaults as the network denial audit budget.
+const RATE_LIMITED_CAPABILITY_AUDIT_RATE: u32 = crate::profile::NETWORK_DENIAL_AUDIT_DEFAULT_RATE;
+const RATE_LIMITED_CAPABILITY_AUDIT_BURST: u32 = crate::profile::NETWORK_DENIAL_AUDIT_DEFAULT_BURST;
+
+/// `backend` recorded for requests the approval rate limiter refused.
+const RATE_LIMITED_CAPABILITY_BACKEND: &str = "supervisor-rate-limit";
+
+impl RateLimitedCapabilityAudit {
+    pub(super) fn new() -> Self {
+        Self {
+            limiter: RateLimiter::new(
+                RATE_LIMITED_CAPABILITY_AUDIT_RATE,
+                RATE_LIMITED_CAPABILITY_AUDIT_BURST,
+            ),
+            suppressed: 0,
+            last_suppressed: None,
+        }
+    }
+
+    /// Returns true if this refusal should be recorded individually.
+    /// Otherwise it is counted, and kept as the example for the summary.
+    fn admit(&mut self, request: &nono::supervisor::ApprovalRequest) -> bool {
+        if self.limiter.try_acquire() {
+            true
+        } else {
+            self.suppressed = self.suppressed.saturating_add(1);
+            self.last_suppressed = Some(request.clone());
+            false
+        }
+    }
+}
+
+fn record_rate_limited_capability(
+    config: &SupervisorConfig<'_>,
+    request: nono::supervisor::ApprovalRequest,
+) -> Result<()> {
+    if let Some(recorder_mutex) = config.audit_recorder.as_ref() {
+        let entry = AuditEntry {
+            timestamp: std::time::SystemTime::now(),
+            request,
+            decision: ApprovalDecision::Denied {
+                reason: "approval rate limit exceeded".to_string(),
+            },
+            backend: RATE_LIMITED_CAPABILITY_BACKEND.to_string(),
+            duration_ms: 0,
+        };
+        let mut recorder = recorder_mutex
+            .lock()
+            .map_err(|_| NonoError::Snapshot("Audit recorder lock poisoned".to_string()))?;
+        recorder.record_capability_decision(entry)?;
+    }
+    Ok(())
+}
+
+/// Emit one summary entry for rate-limited capability requests that were
+/// refused but not individually recorded, then reset the counter. The entry
+/// carries the most recent such request; its reason gives the count.
+/// Failures are logged, never fatal.
+pub(super) fn flush_suppressed_rate_limited_capabilities(
+    config: &SupervisorConfig<'_>,
+    audit: &mut RateLimitedCapabilityAudit,
+) {
+    let count = std::mem::take(&mut audit.suppressed);
+    let Some(mut request) = audit.last_suppressed.take() else {
+        return;
+    };
+    if count == 0 {
+        return;
+    }
+    if let nono::supervisor::ApprovalRequest::Capability { reason, .. } = &mut request {
+        *reason = Some(format!(
+            "{count} capability requests were refused by the approval rate limiter but not \
+             individually recorded (audit rate limit exceeded); this is the most recent"
+        ));
+    }
+    if let Err(err) = record_rate_limited_capability(config, request) {
+        warn!(
+            "Failed to record rate-limited capability request summary: {}",
+            err
+        );
+    }
+}
+
 pub(super) struct SeccompNotificationState<'a> {
     pub(super) rate_limiter: &'a mut RateLimiter,
+    pub(super) rate_limited_audit: &'a mut RateLimitedCapabilityAudit,
     pub(super) denials: &'a mut Vec<DenialRecord>,
     pub(super) trust_interceptor: Option<&'a mut TrustInterceptor>,
     pub(super) pty: Option<&'a mut crate::pty_proxy::PtyProxy>,
@@ -202,7 +300,7 @@ fn open_proc_comm_for_access(
 /// 3. TOCTOU check: verify notification still valid
 /// 4. Check protected nono state roots -> deny (BEFORE initial-set fast-path)
 /// 5. Fast-path: if path is in initial set, open + inject fd immediately
-/// 6. Rate limit check -> deny if exceeded
+/// 6. Rate limit check -> deny if exceeded (audited within a budget)
 /// 7. Trust verification for instruction files (if trust_interceptor present)
 /// 8. Delegate to approval backend
 /// 9. Second TOCTOU check before inject/deny
@@ -246,6 +344,7 @@ fn handle_received_filesystem_notification(
     };
     let SeccompNotificationState {
         rate_limiter,
+        rate_limited_audit,
         denials,
         mut trust_interceptor,
         pty,
@@ -596,7 +695,17 @@ fn handle_received_filesystem_notification(
         return Ok(());
     }
 
-    // 6. Rate limit check
+    let request = nono::supervisor::ApprovalRequest::Capability {
+        request_id: format!("seccomp-{}", unique_request_id()),
+        path: path.clone(),
+        access,
+        reason: Some("Sandbox intercepted file operation (seccomp-notify)".to_string()),
+        child_pid: child.as_raw() as u32,
+        session_id: config.session_id.to_string(),
+    };
+
+    // 6. Rate limit check. The limiter, not the approval backend, decides
+    //    these requests, so they are audited too, within a budget.
     if !rate_limiter.try_acquire() {
         debug!("Rate limited seccomp notification for {}", path.display());
         record_denial(
@@ -607,7 +716,15 @@ fn handle_received_filesystem_notification(
                 reason: DenialReason::RateLimited,
             },
         );
-        let _ = deny_notif(notify_fd, notif.id);
+        let deny_result = deny_notif(notify_fd, notif.id);
+        let audit_result = if rate_limited_audit.admit(&request) {
+            flush_suppressed_rate_limited_capabilities(config, rate_limited_audit);
+            record_rate_limited_capability(config, request)
+        } else {
+            Ok(())
+        };
+        deny_result?;
+        audit_result?;
         return Ok(());
     }
 
@@ -651,14 +768,6 @@ fn handle_received_filesystem_notification(
     };
 
     // 8. Delegate to approval backend (for both instruction and non-instruction files)
-    let request = nono::supervisor::ApprovalRequest::Capability {
-        request_id: format!("seccomp-{}", unique_request_id()),
-        path: path.clone(),
-        access,
-        reason: Some("Sandbox intercepted file operation (seccomp-notify)".to_string()),
-        child_pid: child.as_raw() as u32,
-        session_id: config.session_id.to_string(),
-    };
     let decision_started: Instant = Instant::now();
 
     let decision = match super::request_approval_with_relay_paused(config, &request, pty) {
@@ -2072,6 +2181,124 @@ mod tests {
             assert_eq!(buffered.len(), 2);
             assert!(buffered[0].live_recorded);
             assert!(!buffered[1].live_recorded);
+        }
+
+        fn capability_request(path: &str) -> nono::supervisor::ApprovalRequest {
+            nono::supervisor::ApprovalRequest::Capability {
+                request_id: format!("req-{path}"),
+                path: PathBuf::from(path),
+                access: nono::AccessMode::Read,
+                reason: None,
+                child_pid: 42,
+                session_id: "test-net-decision".to_string(),
+            }
+        }
+
+        #[test]
+        fn rate_limited_capability_audit_records_burst_then_summarises() {
+            let backend = DenyAllBackend;
+            let audit_dir = tempfile::tempdir().expect("tempdir");
+            let recorder =
+                crate::audit_integrity::AuditRecorder::new(audit_dir.path().to_path_buf())
+                    .expect("recorder");
+            let mut config = make_config(&backend, 8080, vec![], &[]);
+            config.audit_recorder = Some(std::sync::Arc::new(std::sync::Mutex::new(recorder)));
+            let mut audit = super::super::RateLimitedCapabilityAudit::new();
+
+            // Nothing suppressed: no event.
+            super::super::flush_suppressed_rate_limited_capabilities(&config, &mut audit);
+
+            for _ in 0..super::super::RATE_LIMITED_CAPABILITY_AUDIT_BURST {
+                assert!(audit.admit(&capability_request("/admitted")));
+            }
+            for _ in 0..2 {
+                assert!(!audit.admit(&capability_request("/suppressed")));
+            }
+            assert!(!audit.admit(&capability_request("/last")));
+
+            super::super::flush_suppressed_rate_limited_capabilities(&config, &mut audit);
+            // Counter was reset: a second flush adds nothing.
+            super::super::flush_suppressed_rate_limited_capabilities(&config, &mut audit);
+
+            let events = std::fs::read_to_string(audit_dir.path().join("audit-events.ndjson"))
+                .expect("audit log");
+            let lines: Vec<&str> = events.lines().collect();
+            assert_eq!(lines.len(), 1, "exactly one summary entry:\n{events}");
+            let record: serde_json::Value = serde_json::from_str(lines[0]).expect("json");
+            let entry = &record["event"]["entry"];
+            assert_eq!(entry["backend"], "supervisor-rate-limit");
+            assert_eq!(entry["request"]["path"], "/last");
+            let reason = entry["request"]["reason"].as_str().unwrap_or_default();
+            assert!(reason.starts_with("3 capability requests"), "{reason}");
+        }
+
+        /// The summary is flushed when the supervisor loop exits
+        /// (`run_supervisor_loop`), which returns before
+        /// `finalize_supervised_exit` records `session_ended` and seals the
+        /// recorder (nolabs-ai/nono#2235). It goes to the recorder directly,
+        /// never through the network buffer that finalization replays, so it is
+        /// in the log once, ahead of `session_ended`, and the log verifies.
+        /// Flushed after the seal it would be refused, and lost.
+        #[test]
+        fn rate_limited_capability_summary_lands_once_before_the_seal() {
+            let backend = DenyAllBackend;
+            let audit_dir = tempfile::tempdir().expect("tempdir");
+            let recorder = std::sync::Arc::new(std::sync::Mutex::new(
+                crate::audit_integrity::AuditRecorder::new(audit_dir.path().to_path_buf())
+                    .expect("recorder"),
+            ));
+            let network_events = std::sync::Mutex::new(Vec::new());
+            let mut config = make_config(&backend, 8080, vec![], &[]);
+            config.audit_recorder = Some(std::sync::Arc::clone(&recorder));
+            config.network_audit_events = Some(&network_events);
+            let mut audit = super::super::RateLimitedCapabilityAudit::new();
+            let mut admitted = 0usize;
+            while audit.admit(&capability_request("/spin")) {
+                admitted += 1;
+                assert!(admitted < 100_000, "audit budget never ran out");
+            }
+
+            // Loop exit, then finalization.
+            super::super::flush_suppressed_rate_limited_capabilities(&config, &mut audit);
+            let summary = {
+                let mut recorder = recorder.lock().expect("lock");
+                recorder
+                    .record_session_ended("2026-01-01T00:00:00Z".to_string(), 0)
+                    .expect("end");
+                recorder.finalize().expect("integrity summary")
+            };
+            super::super::flush_suppressed_rate_limited_capabilities(&config, &mut audit);
+            assert!(
+                super::super::record_rate_limited_capability(&config, capability_request("/late"))
+                    .is_err(),
+                "a sealed recorder refuses a late entry"
+            );
+
+            assert!(
+                network_events.lock().expect("lock").is_empty(),
+                "nothing buffered for finalization to replay"
+            );
+            let events = std::fs::read_to_string(audit_dir.path().join("audit-events.ndjson"))
+                .expect("audit log");
+            let types: Vec<String> = events
+                .lines()
+                .map(|line| {
+                    let record: serde_json::Value = serde_json::from_str(line).expect("json");
+                    record["event"]["type"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string()
+                })
+                .collect();
+            assert_eq!(
+                types,
+                ["capability_decision", "session_ended"],
+                "one summary, before the seal:\n{events}"
+            );
+            assert!(events.contains(r#""backend":"supervisor-rate-limit""#));
+            let verified =
+                nono::audit::verify_audit_log(audit_dir.path(), Some(&summary)).expect("verify");
+            assert!(verified.records_verified);
         }
 
         fn unix_pathname(path: &Path) -> SockaddrInfo {
