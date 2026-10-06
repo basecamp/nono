@@ -578,6 +578,9 @@ async fn handle_h2_stream(
     };
 
     let ((), status) = tokio::try_join!(request_pump, response_pump)?;
+    if let Some(resolved) = &resolved {
+        resolved.observe_upstream_status(status.as_u16(), ctx.audit_log.as_ref());
+    }
 
     // Audit event.
     audit::log_l7_request(
@@ -729,6 +732,45 @@ mod tests {
                 )),
                 metadata: crate::capture::CredentialCaptureMetadata::default(),
             })
+        }
+    }
+
+    /// Capture backend that returns a fixed secret and records each
+    /// invalidation: whether the material it was asked to drop is the secret
+    /// it handed out.
+    #[derive(Debug)]
+    struct RecordingCaptureBackend {
+        secret: String,
+        invalidations: std::sync::Mutex<Vec<bool>>,
+    }
+
+    impl crate::capture::CredentialCaptureBackend for RecordingCaptureBackend {
+        fn capture(
+            &self,
+            _request: crate::capture::CredentialCaptureRequest,
+        ) -> std::result::Result<
+            crate::capture::CredentialCaptureResponse,
+            crate::capture::CredentialCaptureError,
+        > {
+            Ok(crate::capture::CredentialCaptureResponse {
+                material: crate::capture::CredentialCaptureMaterial::Secret(Zeroizing::new(
+                    self.secret.clone(),
+                )),
+                metadata: crate::capture::CredentialCaptureMetadata::default(),
+            })
+        }
+
+        fn invalidate(
+            &self,
+            request: &crate::capture::CredentialCaptureRequest,
+            material: &crate::capture::CredentialCaptureMaterial,
+        ) -> bool {
+            let same = request.credential_name == "my-cmd-cred"
+                && material.same_material(&crate::capture::CredentialCaptureMaterial::Secret(
+                    Zeroizing::new(self.secret.clone()),
+                ));
+            self.invalidations.lock().unwrap().push(same);
+            same
         }
     }
 
@@ -938,6 +980,17 @@ mod tests {
         u16,
         tokio::sync::oneshot::Receiver<(String, http::HeaderMap)>,
     ) {
+        spawn_mock_h2_upstream_with_status(ca, 200).await
+    }
+
+    /// Like [`spawn_mock_h2_upstream`], answering every request with `status`.
+    async fn spawn_mock_h2_upstream_with_status(
+        ca: &EphemeralCa,
+        status: u16,
+    ) -> (
+        u16,
+        tokio::sync::oneshot::Receiver<(String, http::HeaderMap)>,
+    ) {
         let server_config = upstream_server_config(ca);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -964,7 +1017,7 @@ mod tests {
                     );
                     let headers = request.headers().clone();
 
-                    let response = http::Response::builder().status(200).body(()).unwrap();
+                    let response = http::Response::builder().status(status).body(()).unwrap();
                     respond.send_response(response, true).unwrap();
 
                     let _ = tx.send((method_path, headers));
@@ -1364,6 +1417,104 @@ mod tests {
         })
         .await;
         assert!(result.is_ok(), "test timed out — h2 forwarding hung");
+    }
+
+    /// Send one request for the `cmd://` route to an upstream answering
+    /// `status`; return the backend's recorded invalidations.
+    async fn h2_cmd_route_invalidations(status: u16) -> Vec<bool> {
+        use std::time::Duration;
+
+        let ca = Arc::new(EphemeralCa::generate().unwrap());
+        let (upstream_port, rx) = spawn_mock_h2_upstream_with_status(&ca, status).await;
+        let tls_connector = h2_tls_connector_trusting(ca.cert_pem());
+        let (route_store, credential_store) =
+            make_cmd_route_stores("localhost", upstream_port, &tls_connector).await;
+        let cert_cache = Arc::new(CertCache::new(Arc::clone(&ca)));
+        let filter = ProxyFilter::allow_all();
+        let session_token = Zeroizing::new("session-tok".to_string());
+        let backend = Arc::new(RecordingCaptureBackend {
+            secret: "captured-secret".to_string(),
+            invalidations: std::sync::Mutex::new(Vec::new()),
+        });
+        let capture_backend: Arc<dyn crate::capture::CredentialCaptureBackend> = backend.clone();
+
+        let ctx = InterceptCtx {
+            route_id: Some("cmd-svc"),
+            host: "localhost",
+            port: upstream_port,
+            route_store: Arc::new(route_store),
+            credential_store: Arc::new(credential_store),
+            oauth_capture_store: Arc::new(crate::oauth_capture::OAuthCaptureStore::empty()),
+            session_token: &session_token,
+            cert_cache,
+            tls_connector: &tls_connector,
+            tls_connector_h2: &tls_connector,
+            filter: &filter,
+            audit_log: None,
+            upstream_proxy: None,
+            approval_backends: None,
+            credential_capture_backend: Some(capture_backend),
+            nonce_resolver: None,
+            enable_h2: true,
+        };
+
+        let (client_io, server_io) = tokio::io::duplex(65536);
+        let result = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                async {
+                    let _ = forward_h2_connection(server_io, &ctx).await;
+                },
+                async {
+                    let (mut h2_client, h2_conn) = h2::client::handshake(client_io).await.unwrap();
+                    let conn_handle = tokio::spawn(async move {
+                        let _ = h2_conn.await;
+                    });
+                    let request = http::Request::builder()
+                        .method("GET")
+                        .uri(format!("https://localhost:{}/v1/resource", upstream_port))
+                        .body(())
+                        .unwrap();
+                    let (response_fut, _send_stream) =
+                        h2_client.send_request(request, true).unwrap();
+                    let response = response_fut.await.unwrap();
+                    assert_eq!(
+                        response.status().as_u16(),
+                        status,
+                        "the upstream's status is relayed to the client"
+                    );
+                    let (_method_path, headers) = rx.await.unwrap();
+                    assert_eq!(
+                        headers.get("authorization").map(|v| v.to_str().unwrap()),
+                        Some("Bearer captured-secret")
+                    );
+                    drop(h2_client);
+                    conn_handle.abort();
+                    let _ = conn_handle.await;
+                }
+            );
+        })
+        .await;
+        assert!(result.is_ok(), "test timed out — h2 forwarding hung");
+        backend.invalidations.lock().unwrap().clone()
+    }
+
+    #[tokio::test]
+    async fn h2_forward_invalidates_captured_credential_on_upstream_401() {
+        assert_eq!(
+            h2_cmd_route_invalidations(401).await,
+            vec![true],
+            "a 401 for a captured credential asks the backend to drop exactly that material"
+        );
+    }
+
+    #[tokio::test]
+    async fn h2_forward_keeps_captured_credential_on_other_statuses() {
+        for status in [200, 403, 500] {
+            assert!(
+                h2_cmd_route_invalidations(status).await.is_empty(),
+                "status {status} must not invalidate the captured credential"
+            );
+        }
     }
 
     #[tokio::test]

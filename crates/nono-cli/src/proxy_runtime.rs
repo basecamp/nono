@@ -97,6 +97,21 @@ struct CachedCapturedCredential {
     expires_at: Instant,
 }
 
+/// First wait after a capture command fails before it is run again for the
+/// same cache key; each further failure doubles it, up to the maximum.
+const CAPTURE_FAILURE_BACKOFF_INITIAL: Duration = Duration::from_secs(1);
+const CAPTURE_FAILURE_BACKOFF_MAX: Duration = Duration::from_secs(30);
+
+/// A failed capture, remembered per cache key so that requests arriving
+/// within the backoff window get the failure at once instead of each running
+/// the failing command again.
+#[derive(Debug)]
+struct CaptureFailure {
+    error: nono_proxy::capture::CredentialCaptureError,
+    backoff: Duration,
+    retry_at: Instant,
+}
+
 #[derive(Debug)]
 struct CaptureErrorDetails {
     action: &'static str,
@@ -145,6 +160,9 @@ struct ProxyCredentialCaptureBackend {
     session_id: String,
     entries: HashMap<String, ResolvedCredentialCaptureEntry>,
     cache: Mutex<HashMap<String, CachedCapturedCredential>>,
+    failures: Mutex<HashMap<String, CaptureFailure>>,
+    failure_backoff_initial: Duration,
+    failure_backoff_max: Duration,
     active: Mutex<HashSet<String>>,
     active_cv: Condvar,
     redaction_policy: nono::ScrubPolicy,
@@ -316,6 +334,9 @@ impl ProxyCredentialCaptureBackend {
             session_id,
             entries: resolved,
             cache: Mutex::new(HashMap::new()),
+            failures: Mutex::new(HashMap::new()),
+            failure_backoff_initial: CAPTURE_FAILURE_BACKOFF_INITIAL,
+            failure_backoff_max: CAPTURE_FAILURE_BACKOFF_MAX,
             active: Mutex::new(HashSet::new()),
             active_cv: Condvar::new(),
             redaction_policy: nono::ScrubPolicy::secure_default(),
@@ -344,6 +365,68 @@ impl ProxyCredentialCaptureBackend {
             "{}\0{}\0{}",
             request.credential_name, request.request_host, cache_scope
         )
+    }
+
+    /// The failure remembered for `key` while its backoff window is open, as
+    /// the error to answer with (cache action `failure_backoff`).
+    fn failure_in_backoff(
+        &self,
+        key: &str,
+        now: Instant,
+    ) -> Option<nono_proxy::capture::CredentialCaptureError> {
+        let failures = self.failures.lock().ok()?;
+        let failure = failures.get(key)?;
+        if failure.retry_at <= now {
+            return None;
+        }
+        let mut error = failure.error.clone();
+        error.metadata.cache_action = "failure_backoff".to_string();
+        error.metadata.duration_ms = 0;
+        error.metadata.exit_status = None;
+        error.reason = format!(
+            "{} (not retried for {}s after the last failure)",
+            failure.error.reason,
+            failure
+                .retry_at
+                .saturating_duration_since(now)
+                .as_secs()
+                .max(1)
+        );
+        Some(error)
+    }
+
+    /// Remember a failed capture for `key`: the next attempt waits the
+    /// initial backoff, doubled for each failure since the last success (up
+    /// to the maximum). A failure long after the previous window closed
+    /// starts again from the initial backoff.
+    fn record_capture_failure(
+        &self,
+        key: &str,
+        error: &nono_proxy::capture::CredentialCaptureError,
+    ) {
+        let Ok(mut failures) = self.failures.lock() else {
+            return;
+        };
+        let now = Instant::now();
+        let backoff = match failures.get(key) {
+            Some(prev)
+                if now.saturating_duration_since(prev.retry_at) <= self.failure_backoff_max =>
+            {
+                prev.backoff
+                    .checked_mul(2)
+                    .unwrap_or(self.failure_backoff_max)
+                    .min(self.failure_backoff_max)
+            }
+            _ => self.failure_backoff_initial,
+        };
+        failures.insert(
+            key.to_string(),
+            CaptureFailure {
+                error: error.clone(),
+                backoff,
+                retry_at: now + backoff,
+            },
+        );
     }
 
     fn try_enter_capture(
@@ -706,6 +789,15 @@ impl nono_proxy::capture::CredentialCaptureBackend for ProxyCredentialCaptureBac
                 cache.remove(&key);
             }
 
+            if let Some(mut error) = self.failure_in_backoff(&key, now) {
+                error.metadata.command =
+                    Some(entry.source.command_path().to_string_lossy().into_owned());
+                error.metadata.argv =
+                    scrub_capture_argv(entry.source.args(), &self.redaction_policy);
+                error.metadata.cache_scope = Some(cache_scope);
+                return Err(error);
+            }
+
             if let Some(guard) = self.try_enter_capture(&key).map_err(|reason| {
                 nono_proxy::capture::CredentialCaptureError::new(
                     reason,
@@ -746,8 +838,12 @@ impl nono_proxy::capture::CredentialCaptureBackend for ProxyCredentialCaptureBac
                 if err.metadata.cache_scope.is_none() {
                     err.metadata.cache_scope = Some(cache_scope.clone());
                 }
+                self.record_capture_failure(&key, &err);
                 err
             })?;
+        if let Ok(mut failures) = self.failures.lock() {
+            failures.remove(&key);
+        }
         if !entry.ttl.is_zero() {
             let mut cache = self.cache.lock().map_err(|_| {
                 nono_proxy::capture::CredentialCaptureError::new(
@@ -769,6 +865,31 @@ impl nono_proxy::capture::CredentialCaptureBackend for ProxyCredentialCaptureBac
         }
         drop(guard);
         Ok(response)
+    }
+
+    fn invalidate(
+        &self,
+        request: &nono_proxy::capture::CredentialCaptureRequest,
+        material: &nono_proxy::capture::CredentialCaptureMaterial,
+    ) -> bool {
+        let Some(entry) = self.entries.get(&request.credential_name) else {
+            return false;
+        };
+        let cache_scope = Self::capture_cache_scope(entry, request);
+        let key = Self::capture_cache_key(request, &cache_scope);
+        let Ok(mut cache) = self.cache.lock() else {
+            return false;
+        };
+        // Only the material the upstream rejected: a credential captured
+        // since (by a concurrent request) stays cached.
+        if cache
+            .get(&key)
+            .is_some_and(|cached| cached.material.same_material(material))
+        {
+            cache.remove(&key);
+            return true;
+        }
+        false
     }
 }
 
@@ -4905,6 +5026,158 @@ mod tests {
         );
         let counter = std::fs::read_to_string(&counter_path).map_err(NonoError::Io)?;
         assert_eq!(counter, "x");
+        Ok(())
+    }
+
+    /// A capture request for credential `name` against one host and path.
+    fn test_capture_request(name: &str) -> nono_proxy::capture::CredentialCaptureRequest {
+        nono_proxy::capture::CredentialCaptureRequest {
+            credential_name: name.to_string(),
+            route_id: name.to_string(),
+            request_host: "api.example.com".to_string(),
+            request_path: "/v1/things".to_string(),
+            request_method: "GET".to_string(),
+            session_id: String::new(),
+            cache_scope: String::new(),
+        }
+    }
+
+    /// An entry whose command prints `token-N`, N counting its runs (in a file
+    /// under `dir`), so each capture that runs the command yields a new value.
+    fn counting_capture_entry(dir: &std::path::Path) -> crate::profile::CredentialCaptureEntry {
+        let counter = dir.join("runs");
+        test_capture_entry(vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            // Shell builtins only: other tests change PATH while this one runs.
+            "printf x >> \"$1\"; read -r c < \"$1\" || :; printf 'token-%s' \"${#c}\"".to_string(),
+            "sh".to_string(),
+            counter.to_string_lossy().into_owned(),
+        ])
+    }
+
+    fn capture_runs(dir: &std::path::Path) -> usize {
+        std::fs::read_to_string(dir.join("runs")).map_or(0, |s| s.len())
+    }
+
+    #[test]
+    fn proxy_credential_capture_backend_invalidate_evicts_the_rejected_material() -> Result<()> {
+        let temp = tempfile::tempdir().map_err(NonoError::Io)?;
+        let mut entries = HashMap::new();
+        entries.insert("api".to_string(), counting_capture_entry(temp.path()));
+        let backend = ProxyCredentialCaptureBackend::new(
+            &entries,
+            "sess-invalidate".to_string(),
+            nono::CapabilitySet::default(),
+        )?;
+        let backend: &dyn nono_proxy::capture::CredentialCaptureBackend = &backend;
+        let request = test_capture_request("api");
+
+        let first = backend
+            .capture(request.clone())
+            .map_err(|err| NonoError::SandboxInit(err.to_string()))?;
+        assert_capture_secret(&first, "token-1");
+        let cached = backend
+            .capture(request.clone())
+            .map_err(|err| NonoError::SandboxInit(err.to_string()))?;
+        assert_eq!(cached.metadata.cache_action, "cache_hit");
+
+        // The upstream rejected token-1: it is dropped, and the next request
+        // runs the command again.
+        assert!(backend.invalidate(&request, &first.material));
+        let second = backend
+            .capture(request.clone())
+            .map_err(|err| NonoError::SandboxInit(err.to_string()))?;
+        assert_eq!(second.metadata.cache_action, "captured");
+        assert_capture_secret(&second, "token-2");
+        assert_eq!(capture_runs(temp.path()), 2);
+
+        // A late 401 for token-1 never evicts token-2, captured since.
+        assert!(!backend.invalidate(&request, &first.material));
+        let still = backend
+            .capture(request.clone())
+            .map_err(|err| NonoError::SandboxInit(err.to_string()))?;
+        assert_eq!(still.metadata.cache_action, "cache_hit");
+        assert_capture_secret(&still, "token-2");
+        assert_eq!(capture_runs(temp.path()), 2);
+
+        // An unknown credential name evicts nothing.
+        assert!(!backend.invalidate(&test_capture_request("other"), &second.material));
+        Ok(())
+    }
+
+    #[test]
+    fn proxy_credential_capture_backend_backs_off_after_a_failure() -> Result<()> {
+        let temp = tempfile::tempdir().map_err(NonoError::Io)?;
+        let fail_flag = temp.path().join("fail");
+        let counter = temp.path().join("runs");
+        std::fs::write(&fail_flag, b"").map_err(NonoError::Io)?;
+        let mut entries = HashMap::new();
+        entries.insert(
+            "api".to_string(),
+            test_capture_entry(vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "printf x >> \"$1\"; [ -e \"$2\" ] && exit 3; printf token-ok".to_string(),
+                "sh".to_string(),
+                counter.to_string_lossy().into_owned(),
+                fail_flag.to_string_lossy().into_owned(),
+            ]),
+        );
+        let mut backend = ProxyCredentialCaptureBackend::new(
+            &entries,
+            "sess-backoff".to_string(),
+            nono::CapabilitySet::default(),
+        )?;
+        backend.failure_backoff_initial = Duration::from_millis(300);
+        backend.failure_backoff_max = Duration::from_millis(1200);
+        let backend: &dyn nono_proxy::capture::CredentialCaptureBackend = &backend;
+        let request = test_capture_request("api");
+        let runs = || std::fs::read_to_string(&counter).map_or(0, |s| s.len());
+
+        let err = backend
+            .capture(request.clone())
+            .expect_err("the command fails");
+        assert_ne!(err.metadata.cache_action, "failure_backoff");
+        assert_eq!(runs(), 1);
+
+        // Inside the window: the failure again, without running the command.
+        let err = backend
+            .capture(request.clone())
+            .expect_err("still failing, from the backoff");
+        assert_eq!(err.metadata.cache_action, "failure_backoff");
+        assert_eq!(err.metadata.cache_scope.as_deref(), Some("api.example.com"));
+        assert_eq!(runs(), 1);
+
+        // After the window the command runs again; a second failure doubles it.
+        std::thread::sleep(Duration::from_millis(350));
+        backend
+            .capture(request.clone())
+            .expect_err("fails when retried");
+        assert_eq!(runs(), 2);
+        std::thread::sleep(Duration::from_millis(350));
+        let err = backend
+            .capture(request.clone())
+            .expect_err("doubled window still open");
+        assert_eq!(err.metadata.cache_action, "failure_backoff");
+        assert_eq!(runs(), 2);
+
+        // Once the command succeeds, the backoff is forgotten.
+        std::fs::remove_file(&fail_flag).map_err(NonoError::Io)?;
+        std::thread::sleep(Duration::from_millis(350));
+        let ok = backend
+            .capture(request.clone())
+            .map_err(|e| NonoError::SandboxInit(e.to_string()))?;
+        assert_capture_secret(&ok, "token-ok");
+        assert_eq!(runs(), 3);
+        std::fs::write(&fail_flag, b"").map_err(NonoError::Io)?;
+        assert!(backend.invalidate(&request, &ok.material));
+        let err = backend.capture(request.clone()).expect_err("fails again");
+        assert_ne!(err.metadata.cache_action, "failure_backoff");
+        assert_eq!(runs(), 4);
+        let err = backend.capture(request).expect_err("backoff again");
+        assert_eq!(err.metadata.cache_action, "failure_backoff");
+        assert_eq!(runs(), 4);
         Ok(())
     }
 

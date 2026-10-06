@@ -871,14 +871,27 @@ pub(crate) async fn select_intercept_route<'a>(
 /// captures which are minted per request.
 pub(crate) enum ResolvedCredential<'a> {
     Static(&'a crate::credential::LoadedCredential),
-    Captured(Box<crate::credential::LoadedCredential>),
+    Captured(Box<reverse::CapturedCmdCredential>),
 }
 
 impl ResolvedCredential<'_> {
     pub(crate) fn as_ref(&self) -> &crate::credential::LoadedCredential {
         match self {
             ResolvedCredential::Static(cred) => cred,
-            ResolvedCredential::Captured(cred) => cred,
+            ResolvedCredential::Captured(captured) => &captured.credential,
+        }
+    }
+
+    /// The upstream answered `status` to the request this credential was
+    /// injected into: a captured credential the upstream rejected (401) is
+    /// dropped from the capture cache. Static credentials are left alone.
+    pub(crate) fn observe_upstream_status(
+        &self,
+        status: u16,
+        audit_log: Option<&audit::SharedAuditLog>,
+    ) {
+        if let ResolvedCredential::Captured(captured) = self {
+            captured.observe_upstream_status(status, audit::ProxyMode::ConnectIntercept, audit_log);
         }
     }
 }
@@ -1374,7 +1387,7 @@ where
         .as_ref()
         .map(|rewrite| rewrite.as_ref() as forward::ResponseRewrite<'_>);
 
-    if let Err(e) = forward::forward_request_with_response_rewrite(
+    match forward::forward_request_with_response_rewrite(
         tls_stream,
         request.as_bytes(),
         &body,
@@ -1384,21 +1397,28 @@ where
     )
     .await
     {
-        warn!("tls_intercept: upstream forwarding failed: {}", e);
-        audit::log_denied(
-            ctx.audit_log,
-            audit::ProxyMode::ConnectIntercept,
-            &audit::EventContext {
-                denial_category: Some(
-                    nono::undo::NetworkAuditDenialCategory::UpstreamConnectFailed,
-                ),
-                ..event_ctx
-            },
-            ctx.host,
-            ctx.port,
-            &e.to_string(),
-        );
-        let _ = reverse::send_error_generic(tls_stream, 502, "Bad Gateway").await;
+        Ok(status) => {
+            if let Some(resolved) = &resolved {
+                resolved.observe_upstream_status(status, ctx.audit_log);
+            }
+        }
+        Err(e) => {
+            warn!("tls_intercept: upstream forwarding failed: {}", e);
+            audit::log_denied(
+                ctx.audit_log,
+                audit::ProxyMode::ConnectIntercept,
+                &audit::EventContext {
+                    denial_category: Some(
+                        nono::undo::NetworkAuditDenialCategory::UpstreamConnectFailed,
+                    ),
+                    ..event_ctx
+                },
+                ctx.host,
+                ctx.port,
+                &e.to_string(),
+            );
+            let _ = reverse::send_error_generic(tls_stream, 502, "Bad Gateway").await;
+        }
     }
     Ok(())
 }

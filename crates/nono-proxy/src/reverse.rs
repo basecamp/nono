@@ -15,7 +15,9 @@
 //! forwarded without buffering.
 
 use crate::audit;
-use crate::capture::{CredentialCaptureBackend, CredentialCaptureRequest};
+use crate::capture::{
+    CredentialCaptureBackend, CredentialCaptureMaterial, CredentialCaptureRequest,
+};
 use crate::config::{EndpointPolicyOutcome, InjectMode};
 use crate::credential::{CmdCredentialRoute, CredentialStore, LoadedCredential};
 use crate::error::{ProxyError, Result};
@@ -480,7 +482,7 @@ pub async fn handle_reverse_proxy(
     } else {
         None
     };
-    let cred = cred.or(captured_credential.as_ref());
+    let cred = cred.or(captured_credential.as_ref().map(|c| &c.credential));
 
     let transformed_path = if let Some(cred) = cred {
         let cleaned_path = strip_proxy_artifacts(
@@ -629,6 +631,9 @@ pub async fn handle_reverse_proxy(
                 &upstream_path,
                 status,
             );
+            if let Some(captured) = &captured_credential {
+                captured.observe_upstream_status(status, audit::ProxyMode::Reverse, ctx.audit_log);
+            }
         }
         Err(e) => {
             warn!("Upstream connection failed: {}", e);
@@ -931,6 +936,79 @@ async fn handle_spiffe_route(
     Ok(())
 }
 
+/// A credential a `cmd://` route captured for one request, with what is needed
+/// to drop it from the capture backend's cache should the upstream reject it.
+pub(crate) struct CapturedCmdCredential {
+    pub(crate) credential: LoadedCredential,
+    backend: Arc<dyn CredentialCaptureBackend>,
+    request: CredentialCaptureRequest,
+    material: CredentialCaptureMaterial,
+    upstream: String,
+    request_port: u16,
+}
+
+impl CapturedCmdCredential {
+    /// The upstream answered `status` to the request this credential was
+    /// injected into. On 401 the captured credential is stale (expired,
+    /// revoked or rotated by its issuer): ask the backend to forget it, so the
+    /// next request runs the capture command again instead of re-sending the
+    /// rejected value until the cache TTL lapses. The 401 itself is still
+    /// relayed to the client; the request is not replayed (its body has been
+    /// streamed, and replaying a non-idempotent request is not safe).
+    pub(crate) fn observe_upstream_status(
+        &self,
+        status: u16,
+        proxy_mode: audit::ProxyMode,
+        audit_log: Option<&audit::SharedAuditLog>,
+    ) {
+        if status != 401 {
+            return;
+        }
+        let evicted = self.backend.invalidate(&self.request, &self.material);
+        let action = if evicted {
+            "invalidated_on_401"
+        } else {
+            "invalidate_skipped"
+        };
+        debug!(
+            "credential capture '{}': upstream answered 401; {}",
+            self.request.credential_name, action
+        );
+        let reason = if evicted {
+            "upstream rejected the captured credential (401); the cached capture was dropped"
+        } else {
+            "upstream rejected the captured credential (401); no cached capture held it"
+        };
+        audit::log_credential_capture(
+            audit_log,
+            proxy_mode,
+            audit::CredentialCaptureAudit {
+                route_id: &self.request.route_id,
+                credential_name: &self.request.credential_name,
+                action,
+                decision: nono::undo::NetworkAuditDecision::Allow,
+                command: None,
+                argv: None,
+                exit_status: None,
+                duration_ms: None,
+                stdout_bytes: None,
+                stderr_redacted: None,
+                cache_scope: None,
+                output_format: None,
+                header_names: None,
+                stdin_mode: None,
+                interactive: None,
+                upstream: Some(&self.upstream),
+                request_host: &self.request.request_host,
+                request_port: Some(self.request_port),
+                request_method: &self.request.request_method,
+                request_path: &self.request.request_path,
+                reason: Some(reason),
+            },
+        );
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn capture_cmd_credential(
     cmd: &CmdCredentialRoute,
@@ -943,7 +1021,7 @@ pub(crate) async fn capture_cmd_credential(
     proxy_mode: audit::ProxyMode,
     audit_log: Option<&audit::SharedAuditLog>,
     backend: Option<Arc<dyn CredentialCaptureBackend>>,
-) -> Result<LoadedCredential> {
+) -> Result<CapturedCmdCredential> {
     let Some(backend) = backend else {
         let reason = format!(
             "credential '{}' requires supervisor capture but no capture backend is configured",
@@ -988,7 +1066,9 @@ pub(crate) async fn capture_cmd_credential(
         session_id: String::new(),
         cache_scope: String::new(),
     };
-    let result = tokio::task::spawn_blocking(move || backend.capture(request))
+    let capture_backend = Arc::clone(&backend);
+    let capture_request = request.clone();
+    let result = tokio::task::spawn_blocking(move || capture_backend.capture(capture_request))
         .await
         .map_err(|err| ProxyError::Credential(format!("credential capture task failed: {err}")))?;
 
@@ -1021,7 +1101,15 @@ pub(crate) async fn capture_cmd_credential(
                     reason: None,
                 },
             );
-            Ok(cmd.materialize(response.material))
+            let material = response.material.clone();
+            Ok(CapturedCmdCredential {
+                credential: cmd.materialize(response.material),
+                backend,
+                request,
+                material,
+                upstream: upstream.to_string(),
+                request_port,
+            })
         }
         Err(err) => {
             audit::log_credential_capture(
@@ -2868,6 +2956,87 @@ pub(crate) fn injected_credential_header_names(cred: Option<&LoadedCredential>) 
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[derive(Debug, Default)]
+    struct CountingCaptureBackend {
+        invalidations: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl CredentialCaptureBackend for CountingCaptureBackend {
+        fn capture(
+            &self,
+            _request: CredentialCaptureRequest,
+        ) -> std::result::Result<
+            crate::capture::CredentialCaptureResponse,
+            crate::capture::CredentialCaptureError,
+        > {
+            Err(crate::capture::CredentialCaptureError::new(
+                "not used".to_string(),
+                crate::capture::CredentialCaptureMetadata::default(),
+            ))
+        }
+
+        fn invalidate(
+            &self,
+            request: &CredentialCaptureRequest,
+            material: &CredentialCaptureMaterial,
+        ) -> bool {
+            assert!(
+                material.same_material(&CredentialCaptureMaterial::Secret(Zeroizing::new(
+                    "tok-1".to_string()
+                )))
+            );
+            self.invalidations
+                .lock()
+                .unwrap()
+                .push(request.credential_name.clone());
+            true
+        }
+    }
+
+    #[test]
+    fn captured_cmd_credential_is_invalidated_on_401_only() {
+        let backend = Arc::new(CountingCaptureBackend::default());
+        let cmd = CmdCredentialRoute {
+            credential_name: "basecamp".to_string(),
+            inject_mode: InjectMode::Header,
+            proxy_inject_mode: InjectMode::Header,
+            header_name: "Authorization".to_string(),
+            proxy_header_name: "Authorization".to_string(),
+            credential_format: Some("Bearer {}".to_string()),
+            path_pattern: None,
+            proxy_path_pattern: None,
+            path_replacement: None,
+            query_param_name: None,
+            proxy_query_param_name: None,
+        };
+        let material = CredentialCaptureMaterial::Secret(Zeroizing::new("tok-1".to_string()));
+        let captured = CapturedCmdCredential {
+            credential: cmd.materialize(material.clone()),
+            backend: backend.clone(),
+            request: CredentialCaptureRequest {
+                credential_name: "basecamp".to_string(),
+                route_id: "basecamp-api".to_string(),
+                request_host: "3.basecampapi.com".to_string(),
+                request_path: "/1/projects.json".to_string(),
+                request_method: "GET".to_string(),
+                session_id: String::new(),
+                cache_scope: String::new(),
+            },
+            material,
+            upstream: "https://3.basecampapi.com".to_string(),
+            request_port: 443,
+        };
+        for status in [200, 204, 302, 403, 404, 500] {
+            captured.observe_upstream_status(status, audit::ProxyMode::Reverse, None);
+        }
+        assert!(backend.invalidations.lock().unwrap().is_empty());
+        captured.observe_upstream_status(401, audit::ProxyMode::Reverse, None);
+        assert_eq!(
+            *backend.invalidations.lock().unwrap(),
+            vec!["basecamp".to_string()]
+        );
+    }
 
     #[test]
     fn test_endpoint_approval_request_id_is_unique() {
