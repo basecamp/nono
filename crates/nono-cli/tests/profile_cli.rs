@@ -663,3 +663,95 @@ fn test_show_profile_includes_resolved_session_hooks() {
         "unset timeout must remain absent from JSON"
     );
 }
+
+// linux.* settings in profile show / diff output
+
+fn write_linux_profiles(dir: &std::path::Path) -> (String, String) {
+    let both = dir.join("linux-both.json");
+    std::fs::write(
+        &both,
+        r#"{
+            "meta": { "name": "linux-both" },
+            "linux": { "af_unix_mediation": "pathname", "sandbox_policy": "landlock" }
+        }"#,
+    )
+    .expect("write linux-both");
+    let policy_only = dir.join("linux-policy-only.json");
+    std::fs::write(
+        &policy_only,
+        r#"{
+            "meta": { "name": "linux-policy-only" },
+            "linux": { "sandbox_policy": "external" }
+        }"#,
+    )
+    .expect("write linux-policy-only");
+    (
+        both.to_str().expect("path").to_string(),
+        policy_only.to_str().expect("path").to_string(),
+    )
+}
+
+fn run_ok(args: &[&str]) -> String {
+    let output = nono_bin().args(args).output().expect("failed to run nono");
+    assert!(
+        output.status.success(),
+        "expected exit 0 for {args:?}, stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+#[test]
+fn test_show_profile_includes_linux_sandbox_policy() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (both, policy_only) = write_linux_profiles(dir.path());
+
+    let human = run_ok(&["profile", "show", &policy_only]);
+    assert!(
+        human.contains("Linux sandbox policy:") && human.contains("External"),
+        "expected Linux sandbox policy line, got:\n{human}"
+    );
+
+    let val: serde_json::Value =
+        serde_json::from_str(&run_ok(&["profile", "show", &both, "--json"]))
+            .expect("expected valid JSON output");
+    assert_eq!(
+        val["linux"],
+        serde_json::json!({ "af_unix_mediation": "pathname", "sandbox_policy": "landlock" }),
+        "JSON linux block should carry every configured linux setting"
+    );
+
+    let val: serde_json::Value =
+        serde_json::from_str(&run_ok(&["profile", "show", &policy_only, "--json"]))
+            .expect("expected valid JSON output");
+    assert_eq!(
+        val["linux"],
+        serde_json::json!({ "sandbox_policy": "external" }),
+        "JSON linux block should be emitted when only sandbox_policy is set"
+    );
+}
+
+#[test]
+fn test_diff_profile_includes_linux_sandbox_policy() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (both, policy_only) = write_linux_profiles(dir.path());
+
+    let human = run_ok(&["profile", "diff", &both, &policy_only]);
+    assert!(
+        human.contains("linux.sandbox_policy"),
+        "expected linux.sandbox_policy in diff output, got:\n{human}"
+    );
+
+    let val: serde_json::Value =
+        serde_json::from_str(&run_ok(&["profile", "diff", &both, &policy_only, "--json"]))
+            .expect("expected valid JSON output");
+    assert_eq!(
+        val["linux"]["sandbox_policy"],
+        serde_json::json!({
+            "profile1": "landlock",
+            "profile2": "external",
+            "changed": true,
+        }),
+        "diff JSON should compare linux.sandbox_policy, got: {val}"
+    );
+}
