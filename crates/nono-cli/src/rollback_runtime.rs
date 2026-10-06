@@ -41,6 +41,7 @@ pub(crate) struct RollbackExitContext<'a> {
         Option<&'a Mutex<Vec<nono::undo::NetworkAuditEvent>>>,
     pub(crate) audit_integrity_enabled: bool,
     pub(crate) proxy_handle: Option<&'a nono_proxy::server::ProxyHandle>,
+    pub(crate) scoped_proxy_handles: &'a [nono_proxy::server::ProxyHandle],
     pub(crate) executable_identity: Option<&'a ExecutableIdentity>,
     pub(crate) audit_signer: Option<&'a AuditSigner>,
     pub(crate) redaction_policy: &'a nono::ScrubPolicy,
@@ -512,6 +513,7 @@ pub(crate) fn finalize_supervised_exit(ctx: RollbackExitContext<'_>) -> Result<F
         supervisor_network_audit_events,
         audit_integrity_enabled,
         proxy_handle,
+        scoped_proxy_handles,
         executable_identity,
         audit_signer,
         redaction_policy,
@@ -527,6 +529,9 @@ pub(crate) fn finalize_supervised_exit(ctx: RollbackExitContext<'_>) -> Result<F
         Vec::new,
         nono_proxy::server::ProxyHandle::drain_audit_events,
     );
+    for handle in scoped_proxy_handles {
+        network_events.extend(handle.drain_audit_events());
+    }
     if let Some(events_mutex) = supervisor_network_audit_events {
         let mut supervisor_events = events_mutex.lock().map_err(|_| {
             nono::NonoError::Snapshot("Network audit event lock poisoned".to_string())
@@ -1015,5 +1020,103 @@ mod tests {
 
         metadata.session_id = "20260421-200001-22222".to_string();
         assert!(!record_session_in_ledger(&metadata));
+    }
+
+    /// Send a CONNECT for `host` that the proxy at `port` denies.
+    async fn send_denied_connect(port: u16, host: &str) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        stream
+            .write_all(
+                format!("CONNECT {host}:443 HTTP/1.1\r\nHost: {host}:443\r\n\r\n").as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        assert!(
+            String::from_utf8_lossy(&response).starts_with("HTTP/1.1 403"),
+            "expected the proxy to deny {host}"
+        );
+    }
+
+    /// Per-command proxies keep their own audit buffer. Finalization has to
+    /// drain those too, or a brokered command's network denials never reach
+    /// the session record.
+    #[test]
+    fn finalize_drains_command_scoped_proxy_audit_events() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state");
+        fs::create_dir_all(&state).unwrap();
+        let home = tmp.path().to_string_lossy().to_string();
+        let state_str = state.to_string_lossy().to_string();
+        let _env = EnvVarGuard::set_all(&[("HOME", &home), ("XDG_STATE_HOME", &state_str)]);
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let strict = || nono_proxy::config::ProxyConfig {
+            strict_filter: true,
+            allowed_hosts: Vec::new(),
+            ..nono_proxy::config::ProxyConfig::default()
+        };
+        let session_proxy = rt.block_on(nono_proxy::server::start(strict())).unwrap();
+        let scoped_proxies = vec![rt.block_on(nono_proxy::server::start(strict())).unwrap()];
+        rt.block_on(send_denied_connect(session_proxy.port, "session.example"));
+        rt.block_on(send_denied_connect(
+            scoped_proxies[0].port,
+            "command.example",
+        ));
+
+        let audit_state = create_audit_state(false, None, Some("scoped-proxy-drain"))
+            .unwrap()
+            .unwrap();
+        let command = vec!["/bin/true".to_string()];
+        let _outcome = finalize_supervised_exit(RollbackExitContext {
+            audit_state: Some(&audit_state),
+            rollback_state: None,
+            audit_snapshot_state: None,
+            audit_tracked_paths: Vec::new(),
+            audit_recorder: None,
+            supervisor_network_audit_events: None,
+            audit_integrity_enabled: false,
+            proxy_handle: Some(&session_proxy),
+            scoped_proxy_handles: &scoped_proxies,
+            executable_identity: None,
+            audit_signer: None,
+            redaction_policy: &nono::ScrubPolicy::secure_default(),
+            started: "2026-10-05T12:00:00Z",
+            ended: "2026-10-05T12:00:01Z",
+            command: &command,
+            exit_code: 0,
+            silent: true,
+            rollback_prompt_disabled: true,
+        })
+        .unwrap();
+
+        let meta =
+            nono::undo::SnapshotManager::load_session_metadata(&audit_state.session_dir).unwrap();
+        let denied: Vec<&str> = meta
+            .network_events
+            .iter()
+            .filter(|e| e.decision == nono::undo::NetworkAuditDecision::Deny)
+            .map(|e| e.target.as_str())
+            .collect();
+        assert!(
+            denied.contains(&"session.example"),
+            "session proxy denial missing: {denied:?}"
+        );
+        assert!(
+            denied.contains(&"command.example"),
+            "command proxy denial missing: {denied:?}"
+        );
+        assert!(
+            scoped_proxies[0].drain_audit_events().is_empty(),
+            "command proxy buffer must be drained"
+        );
+
+        session_proxy.shutdown();
+        scoped_proxies[0].shutdown();
     }
 }
