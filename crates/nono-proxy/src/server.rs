@@ -2525,6 +2525,109 @@ mod tests {
         handle.shutdown();
     }
 
+    /// A loopback origin that reflects the request's `Authorization` value in
+    /// a response header and in the body, the body written in two parts cut
+    /// inside the value. Sends the request head it saw on the channel.
+    async fn spawn_reflecting_origin() -> (String, tokio::sync::oneshot::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                let auth = head
+                    .lines()
+                    .find_map(|l| {
+                        l.split_once(':')
+                            .filter(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+                            .map(|(_, v)| v.trim().to_string())
+                    })
+                    .unwrap_or_default();
+                let body = format!("{{\"got\":\"{auth}\"}}");
+                let cut = body.find("sk-").map_or(0, |at| at + 6);
+                let response_head = format!(
+                    "HTTP/1.1 401 Unauthorized\r\nX-Echo: {auth}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(response_head.as_bytes()).await;
+                let _ = sock.write_all(&body.as_bytes()[..cut]).await;
+                let _ = sock.flush().await;
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                let _ = sock.write_all(&body.as_bytes()[cut..]).await;
+                let _ = sock.flush().await;
+                let _ = tx.send(head);
+            }
+        });
+        (format!("127.0.0.1:{}", addr.port()), rx)
+    }
+
+    #[tokio::test]
+    async fn reverse_proxy_scrubs_injected_credential_from_response() {
+        use crate::test_env::{ENV_LOCK, EnvVarGuard};
+        const SECRET: &str = "sk-reverse-scrub-secret-0123456789";
+        let _env = {
+            let _lock = ENV_LOCK.lock().expect("env mutex poisoned");
+            EnvVarGuard::set_all(&[("NONO_PROXY_TEST_SCRUB_REVERSE_KEY", SECRET)])
+        };
+        let (upstream, origin_rx) = spawn_reflecting_origin().await;
+        let mut route = declarative_route(&format!("http://{upstream}"));
+        route.credential_key = Some("env://NONO_PROXY_TEST_SCRUB_REVERSE_KEY".to_string());
+        route.credential_format = Some("Bearer {}".to_string());
+        let config = ProxyConfig {
+            routes: vec![route],
+            allowed_hosts: vec!["127.0.0.1".to_string()],
+            require_auth: true,
+            ..Default::default()
+        };
+        let handle = start(config).await.unwrap();
+        let token = handle.token.to_string();
+
+        let request = format!(
+            "GET /svc/whoami HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {token}\r\nAccept-Encoding: gzip\r\n\r\n"
+        );
+        let mut client = tokio::net::TcpStream::connect(("127.0.0.1", handle.port))
+            .await
+            .unwrap();
+        client.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.read_to_end(&mut response),
+        )
+        .await;
+        let response = String::from_utf8_lossy(&response).to_string();
+
+        let origin_saw = origin_rx.await.unwrap();
+        assert!(
+            origin_saw.contains(&format!("Bearer {SECRET}")),
+            "the upstream must receive the real credential: {origin_saw:?}"
+        );
+        assert!(
+            origin_saw
+                .to_lowercase()
+                .contains("accept-encoding: identity")
+                && !origin_saw.to_lowercase().contains("gzip"),
+            "a credentialed request asks for plain bytes: {origin_saw:?}"
+        );
+        assert!(response.starts_with("HTTP/1.1 401"), "{response:?}");
+        assert!(
+            !response.contains("sk-reverse-scrub"),
+            "no part of the credential reaches the client: {response:?}"
+        );
+        let masked = "*".repeat(format!("Bearer {SECRET}").len());
+        assert!(
+            response.contains(&format!("x-echo: {masked}")),
+            "{response:?}"
+        );
+        assert!(
+            response.ends_with(&format!("{{\"got\":\"{masked}\"}}")),
+            "{response:?}"
+        );
+        handle.shutdown();
+    }
+
     #[tokio::test]
     async fn reverse_proxy_rate_limit_rejects_after_burst() {
         // A route with a RouteRateLimiter of burst 1 and no delay budget lets

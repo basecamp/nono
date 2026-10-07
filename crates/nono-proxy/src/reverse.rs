@@ -595,11 +595,19 @@ pub async fn handle_reverse_proxy(
         req_builder = inject_credential_structured(cred, req_builder);
     }
 
+    // The response to a credentialed request is scrubbed of the credential
+    // (crate::scrub), which needs plain bytes.
+    let scrubber = cred.and_then(crate::scrub::CredentialScrubber::for_credential);
+    if scrubber.is_some() {
+        req_builder = req_builder.header("Accept-Encoding", "identity");
+    }
+
     let injected_header_names = injected_credential_header_names(cred);
     for (name, value) in &filtered_headers {
         if injected_header_names
             .iter()
             .any(|header| name.eq_ignore_ascii_case(header))
+            || (scrubber.is_some() && name.eq_ignore_ascii_case("accept-encoding"))
         {
             continue;
         }
@@ -618,7 +626,16 @@ pub async fn handle_reverse_proxy(
     ctx.upstream_pool
         .pin_host(&upstream_host, &check.resolved_addrs);
 
-    match pool_forward(ctx.upstream_pool, tls_config, req, stream).await {
+    match pool_forward(
+        ctx.upstream_pool,
+        tls_config,
+        req,
+        stream,
+        scrubber.as_ref(),
+        &method,
+    )
+    .await
+    {
         Ok(status) => {
             audit::log_l7_request(
                 ctx.audit_log,
@@ -1548,7 +1565,7 @@ async fn handle_oauth2_like(
         ..audit::EventContext::default()
     };
 
-    match pool_forward(ctx.upstream_pool, tls_config, req, stream).await {
+    match pool_forward(ctx.upstream_pool, tls_config, req, stream, None, method).await {
         Ok(status) => {
             audit::log_l7_request(
                 ctx.audit_log,
@@ -1815,11 +1832,18 @@ where
 /// Handles both the pool send and writing the full HTTP/1.1 response (status
 /// line, headers, body) back to the raw TCP stream. Returns the response
 /// status code on success.
+///
+/// With a `scrub`, the injected credential is masked in the response headers
+/// and body (same length, so `Content-Length` stays right), and a
+/// content-encoded response that may carry a body is refused before anything
+/// is written (see [`crate::scrub`]).
 async fn pool_forward(
     pool: &crate::pool::UpstreamPool,
     tls_config: &std::sync::Arc<rustls::ClientConfig>,
     req: http::Request<http_body_util::Full<bytes::Bytes>>,
     inbound: &mut TcpStream,
+    scrub: Option<&crate::scrub::CredentialScrubber>,
+    method: &str,
 ) -> Result<u16> {
     use http_body_util::BodyExt;
 
@@ -1829,6 +1853,31 @@ async fn pool_forward(
     let version = response.version();
 
     debug!("pool: upstream responded {} via {:?}", status, version);
+
+    if scrub.is_some() {
+        let encodings: Vec<&str> = response
+            .headers()
+            .get_all(http::header::CONTENT_ENCODING)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect();
+        let encoding = (!encodings.is_empty()).then(|| encodings.join(", "));
+        let content_length = response
+            .headers()
+            .get(http::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok());
+        if crate::scrub::refuses_content_encoding(
+            encoding.as_deref(),
+            method,
+            status,
+            content_length,
+        ) {
+            return Err(ProxyError::HttpParse(
+                crate::scrub::content_encoding_refusal(encoding.as_deref().unwrap_or_default()),
+            ));
+        }
+    }
+    let mut masked = false;
 
     // Write HTTP/1.1 status line
     let reason = response.status().canonical_reason().unwrap_or("OK");
@@ -1842,19 +1891,25 @@ async fn pool_forward(
         if name_str == "transfer-encoding" || name_str == "connection" {
             continue;
         }
-        inbound
-            .write_all(format!("{}: {}\r\n", name, value.to_str().unwrap_or("")).as_bytes())
-            .await?;
+        let mut line = format!("{}: {}\r\n", name, value.to_str().unwrap_or("")).into_bytes();
+        if let Some(scrub) = scrub {
+            masked |= scrub.mask_in_place(&mut line);
+        }
+        inbound.write_all(&line).await?;
     }
     inbound.write_all(b"\r\n").await?;
 
     // Stream body frames without buffering
+    let mut stream = scrub.map(crate::scrub::CredentialScrubber::stream);
     let mut body = response.into_body();
     loop {
         match body.frame().await {
             Some(Ok(frame)) => {
                 if let Some(data) = frame.data_ref() {
-                    inbound.write_all(data).await?;
+                    match stream.as_mut() {
+                        Some(stream) => inbound.write_all(&stream.push(data)).await?,
+                        None => inbound.write_all(data).await?,
+                    }
                 }
             }
             Some(Err(e)) => {
@@ -1864,7 +1919,14 @@ async fn pool_forward(
             None => break,
         }
     }
+    if let Some(stream) = stream.as_mut() {
+        inbound.write_all(&stream.finish()).await?;
+        masked |= stream.masked();
+    }
     inbound.flush().await?;
+    if masked {
+        warn!("credential scrub: masked the injected credential in an upstream response");
+    }
 
     Ok(status)
 }

@@ -329,6 +329,9 @@ async fn handle_h2_stream(
         handle::CredentialResolution::Forward { credential } => credential,
     };
     let cred = resolved.as_ref().map(|c| c.as_ref());
+    // The response to a credentialed request is scrubbed of the credential
+    // (crate::scrub), which needs plain bytes.
+    let scrubber = cred.and_then(crate::scrub::CredentialScrubber::for_credential);
 
     // SPIFFE assertion route: fetch access token, fail hard if SVID is gone.
     let spiffe_assertion_route = service.and_then(|s| ctx.credential_store.get_spiffe_assertion(s));
@@ -439,6 +442,13 @@ async fn handle_h2_stream(
                 upstream_headers.insert(name.clone(), value.clone());
             }
         }
+    }
+
+    if scrubber.is_some() {
+        upstream_headers.insert(
+            http::header::ACCEPT_ENCODING,
+            HeaderValue::from_static("identity"),
+        );
     }
 
     // Inject credential headers (primary + extra) for header/basic-auth modes.
@@ -552,9 +562,49 @@ async fn handle_h2_stream(
             })?;
 
         let status = response.status();
-        let resp_headers = response.headers().clone();
+        let mut resp_headers = response.headers().clone();
         let recv_resp_body = response.into_body();
         let resp_end_stream = recv_resp_body.is_end_stream();
+
+        if let Some(scrub) = scrubber.as_ref() {
+            let encoding = header_values_joined(&resp_headers, http::header::CONTENT_ENCODING);
+            let content_length = resp_headers
+                .get(http::header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok());
+            if !resp_end_stream
+                && crate::scrub::refuses_content_encoding(
+                    encoding.as_deref(),
+                    &method_str,
+                    status.as_u16(),
+                    content_length,
+                )
+            {
+                let reason =
+                    crate::scrub::content_encoding_refusal(encoding.as_deref().unwrap_or_default());
+                warn!("h2_forward: {}", reason);
+                audit::log_denied(
+                    ctx.audit_log.as_ref(),
+                    audit::ProxyMode::ConnectIntercept,
+                    &audit::EventContext {
+                        route_id: service,
+                        denial_category: Some(
+                            nono::undo::NetworkAuditDenialCategory::UpstreamConnectFailed,
+                        ),
+                        ..audit::EventContext::default()
+                    },
+                    &ctx.host,
+                    ctx.port,
+                    &reason,
+                );
+                send_h2_error(&mut respond, 502)?;
+                return Ok::<http::StatusCode, ProxyError>(http::StatusCode::BAD_GATEWAY);
+            }
+            if scrub_header_map(scrub, &mut resp_headers) {
+                warn!(
+                    "h2_forward: credential scrub masked the injected credential in a response header"
+                );
+            }
+        }
 
         // Send response headers back to client.
         let mut client_response = Response::builder().status(status);
@@ -571,7 +621,7 @@ async fn handle_h2_stream(
 
         // Stream response body back to client (frame-by-frame).
         if !resp_end_stream {
-            stream_body_to_client(recv_resp_body, &mut send_resp).await?;
+            stream_body_to_client(recv_resp_body, &mut send_resp, scrubber.as_ref()).await?;
         }
 
         Ok::<http::StatusCode, ProxyError>(status)
@@ -641,14 +691,52 @@ async fn stream_body_to_upstream(mut recv: RecvStream, send: &mut SendStream<Byt
     Ok(())
 }
 
+/// Every value of header `name`, joined with `, `.
+fn header_values_joined(headers: &HeaderMap, name: http::header::HeaderName) -> Option<String> {
+    let values: Vec<String> = headers
+        .get_all(name)
+        .iter()
+        .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned())
+        .collect();
+    (!values.is_empty()).then(|| values.join(", "))
+}
+
+/// Mask the injected credential in every header value. Returns whether
+/// anything was masked.
+fn scrub_header_map(scrub: &crate::scrub::CredentialScrubber, headers: &mut HeaderMap) -> bool {
+    let mut masked = false;
+    for value in headers.values_mut() {
+        if let Some(clean) = scrub.scrub_value(value.as_bytes())
+            && let Ok(clean) = HeaderValue::from_bytes(&clean)
+        {
+            *value = clean;
+            masked = true;
+        }
+    }
+    masked
+}
+
 /// Stream h2 DATA frames from upstream response to client without buffering.
-async fn stream_body_to_client(mut recv: RecvStream, send: &mut SendStream<Bytes>) -> Result<()> {
+/// With a scrubber, each frame is scrubbed of the injected credential first
+/// (a tail that could begin a match is held for the next frame).
+async fn stream_body_to_client(
+    mut recv: RecvStream,
+    send: &mut SendStream<Bytes>,
+    scrubber: Option<&crate::scrub::CredentialScrubber>,
+) -> Result<()> {
+    let mut scrub = scrubber.map(crate::scrub::CredentialScrubber::stream);
     loop {
         match recv.data().await {
             Some(Ok(data)) => {
                 let len = data.len();
-                send.send_data(data, false)
-                    .map_err(|e| ProxyError::HttpParse(format!("h2 send_data client: {e}")))?;
+                let data = match scrub.as_mut() {
+                    Some(scrub) => Bytes::from(scrub.push(&data)),
+                    None => data,
+                };
+                if !data.is_empty() {
+                    send.send_data(data, false)
+                        .map_err(|e| ProxyError::HttpParse(format!("h2 send_data client: {e}")))?;
+                }
                 recv.flow_control()
                     .release_capacity(len)
                     .map_err(|e| ProxyError::HttpParse(format!("h2 flow control: {e}")))?;
@@ -663,12 +751,25 @@ async fn stream_body_to_client(mut recv: RecvStream, send: &mut SendStream<Bytes
             None => break,
         }
     }
+    if let Some(scrub) = scrub.as_mut() {
+        let tail = scrub.finish();
+        if !tail.is_empty() {
+            send.send_data(Bytes::from(tail), false)
+                .map_err(|e| ProxyError::HttpParse(format!("h2 send_data client: {e}")))?;
+        }
+        if scrub.masked() {
+            warn!("h2_forward: credential scrub masked the injected credential in a response body");
+        }
+    }
     // Forward trailers (gRPC uses grpc-status + grpc-message as trailers).
-    if let Some(trailers) = recv
+    if let Some(mut trailers) = recv
         .trailers()
         .await
         .map_err(|e| ProxyError::HttpParse(format!("h2 recv trailers: {e}")))?
     {
+        if let Some(scrubber) = scrubber {
+            scrub_header_map(scrubber, &mut trailers);
+        }
         send.send_trailers(trailers)
             .map_err(|e| ProxyError::HttpParse(format!("h2 send_trailers client: {e}")))?;
     } else {
@@ -1283,6 +1384,171 @@ mod tests {
         })
         .await;
         assert!(result.is_ok(), "test timed out — h2 forwarding hung");
+    }
+
+    /// Spawn a mock h2 upstream that reflects the request's `authorization`
+    /// header back: in a response header, and in the body across two DATA
+    /// frames cut inside the value. `encoding` sets `content-encoding`.
+    /// Sends the request headers it saw on the channel.
+    async fn spawn_mock_h2_upstream_reflecting(
+        ca: &EphemeralCa,
+        encoding: Option<&'static str>,
+    ) -> (u16, tokio::sync::oneshot::Receiver<http::HeaderMap>) {
+        let server_config = upstream_server_config(ca);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (tcp_stream, _) = listener.accept().await.unwrap();
+            let tls_acceptor = tokio_rustls::TlsAcceptor::from(server_config);
+            let tls_stream = tls_acceptor.accept(tcp_stream).await.unwrap();
+            let mut h2_conn = h2::server::handshake(tls_stream).await.unwrap();
+            let mut tx = Some(tx);
+            while let Some(Ok((request, mut respond))) = h2_conn.accept().await {
+                let auth = request
+                    .headers()
+                    .get("authorization")
+                    .map(|v| v.to_str().unwrap().to_string())
+                    .unwrap_or_default();
+                let mut response = http::Response::builder()
+                    .status(401)
+                    .header("www-authenticate", format!("Bearer error=\"{auth}\""));
+                if let Some(encoding) = encoding {
+                    response = response.header("content-encoding", encoding);
+                }
+                let mut send = respond
+                    .send_response(response.body(()).unwrap(), false)
+                    .unwrap();
+                let body = format!("{{\"got\":\"{auth}\"}}");
+                let cut = body.find("sk-").unwrap() + 5;
+                send.send_data(Bytes::from(body[..cut].to_string()), false)
+                    .unwrap();
+                send.send_data(Bytes::from(body[cut..].to_string()), true)
+                    .unwrap();
+                if let Some(tx) = tx.take() {
+                    let _ = tx.send(request.headers().clone());
+                }
+            }
+        });
+        (port, rx)
+    }
+
+    /// Drive one POST through `forward_h2_connection` to a reflecting
+    /// upstream; returns the client's status, headers and body, and the
+    /// headers the upstream saw.
+    async fn h2_round_trip_reflecting(
+        encoding: Option<&'static str>,
+    ) -> (http::StatusCode, http::HeaderMap, Vec<u8>, http::HeaderMap) {
+        use std::time::Duration;
+
+        let ca = Arc::new(EphemeralCa::generate().unwrap());
+        let (upstream_port, rx) = spawn_mock_h2_upstream_reflecting(&ca, encoding).await;
+        let route_store = make_route_store(
+            "localhost",
+            upstream_port,
+            vec![EndpointRule {
+                method: "POST".to_string(),
+                path: "/v1/echo".to_string(),
+            }],
+        )
+        .await;
+        let credential_store = make_credential_store("sk-test-secret-key-0123456789");
+        let cert_cache = Arc::new(CertCache::new(Arc::clone(&ca)));
+        let tls_connector = h2_tls_connector_trusting(ca.cert_pem());
+        let filter = ProxyFilter::allow_all();
+        let session_token = Zeroizing::new("session-tok".to_string());
+        let ctx = InterceptCtx {
+            route_id: Some("test-svc"),
+            host: "localhost",
+            port: upstream_port,
+            route_store: Arc::new(route_store),
+            credential_store: Arc::new(credential_store),
+            oauth_capture_store: Arc::new(crate::oauth_capture::OAuthCaptureStore::empty()),
+            session_token: &session_token,
+            cert_cache,
+            tls_connector: &tls_connector,
+            tls_connector_h2: &tls_connector,
+            filter: &filter,
+            audit_log: None,
+            upstream_proxy: None,
+            approval_backends: None,
+            credential_capture_backend: None,
+            nonce_resolver: None,
+            enable_h2: true,
+        };
+        let (client_io, server_io) = tokio::io::duplex(65536);
+        let mut seen = None;
+        let result = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                async {
+                    let _ = forward_h2_connection(server_io, &ctx).await;
+                },
+                async {
+                    let (mut h2_client, h2_conn) = h2::client::handshake(client_io).await.unwrap();
+                    let conn_handle = tokio::spawn(async move {
+                        let _ = h2_conn.await;
+                    });
+                    let request = http::Request::builder()
+                        .method("POST")
+                        .uri(format!("https://localhost:{upstream_port}/v1/echo"))
+                        .header("accept-encoding", "gzip, br")
+                        .body(())
+                        .unwrap();
+                    let (response_fut, mut send_stream) =
+                        h2_client.send_request(request, false).unwrap();
+                    send_stream.send_data(Bytes::from("{}"), true).unwrap();
+                    let response = response_fut.await.unwrap();
+                    let status = response.status();
+                    let headers = response.headers().clone();
+                    let mut body_recv = response.into_body();
+                    let mut body = Vec::new();
+                    while let Some(Ok(data)) = body_recv.data().await {
+                        let len = data.len();
+                        body.extend_from_slice(&data);
+                        body_recv.flow_control().release_capacity(len).unwrap();
+                    }
+                    let upstream_headers = rx.await.unwrap();
+                    seen = Some((status, headers, body, upstream_headers));
+                    drop(h2_client);
+                    conn_handle.abort();
+                    let _ = conn_handle.await;
+                }
+            );
+        })
+        .await;
+        assert!(result.is_ok(), "test timed out — h2 forwarding hung");
+        seen.unwrap()
+    }
+
+    #[tokio::test]
+    async fn h2_forward_scrubs_injected_credential_from_response() {
+        let (status, headers, body, upstream_headers) = h2_round_trip_reflecting(None).await;
+        // The upstream got the real credential, and plain bytes were asked for.
+        assert_eq!(
+            upstream_headers.get("authorization").unwrap(),
+            "Bearer sk-test-secret-key-0123456789"
+        );
+        assert_eq!(upstream_headers.get("accept-encoding").unwrap(), "identity");
+        // The client sees neither its value nor any part of it.
+        assert_eq!(status, 401);
+        let challenge = headers.get("www-authenticate").unwrap().to_str().unwrap();
+        assert!(!challenge.contains("sk-test-secret"), "{challenge}");
+        let body = String::from_utf8(body).unwrap();
+        assert!(!body.contains("sk-test-secret"), "{body}");
+        assert_eq!(
+            body,
+            format!(
+                "{{\"got\":\"{}\"}}",
+                "*".repeat("Bearer sk-test-secret-key-0123456789".len())
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn h2_forward_refuses_content_encoded_credentialed_response() {
+        let (status, _headers, body, _) = h2_round_trip_reflecting(Some("gzip")).await;
+        assert_eq!(status, 502);
+        assert!(body.is_empty());
     }
 
     #[tokio::test]

@@ -38,6 +38,7 @@ pub mod pool;
 pub mod rate_limit;
 pub mod reverse;
 pub mod route;
+pub mod scrub;
 pub mod server;
 pub mod spiffe;
 pub mod tls_intercept;

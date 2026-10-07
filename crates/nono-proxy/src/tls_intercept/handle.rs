@@ -1230,7 +1230,10 @@ where
     // and matches the existing reverse-proxy contract). ---
     let strip_header = cred.map(|c| c.proxy_header_name.as_str()).unwrap_or("");
     let mut filtered_headers = reverse::filter_headers(&req.header_bytes, strip_header);
-    if is_oauth_capture_host {
+    // The response to a credentialed request is scrubbed of the credential,
+    // which needs plain bytes; OAuth capture reads the response too.
+    let scrubber = cred.and_then(crate::scrub::CredentialScrubber::for_credential);
+    if is_oauth_capture_host || scrubber.is_some() {
         filtered_headers.retain(|(name, _)| !name.eq_ignore_ascii_case("accept-encoding"));
         filtered_headers.push(("Accept-Encoding".to_string(), "identity".to_string()));
     }
@@ -1381,6 +1384,7 @@ where
         upstream_spec,
         audit_ctx,
         response_rewrite_ref,
+        scrubber.as_ref(),
     )
     .await
     {
