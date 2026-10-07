@@ -361,6 +361,10 @@ pub(crate) enum RouteSelection<'a> {
     /// The request was rejected. The denial has already been audited; the
     /// caller must return the given HTTP status to the client and stop.
     Rejected(u16),
+    /// A policy rule refused the request. The denial has already been
+    /// audited; the caller must answer `403` naming the rule and its reason
+    /// ([`reverse::send_policy_denial`]) and stop.
+    Denied(reverse::PolicyDenial),
     /// Endpoint policy authorized the request. The selected route (if any) is
     /// the one whose credential should be injected; `None` means forward
     /// without credentials (passthrough).
@@ -492,7 +496,10 @@ pub(crate) async fn select_intercept_route<'a>(
                         port,
                         &deny_reason,
                     );
-                    return RouteSelection::Rejected(403);
+                    return RouteSelection::Denied(reverse::PolicyDenial::new(
+                        &rule_label,
+                        "approval required and no approval backend is configured",
+                    ));
                 };
                 let (backend_name, backend) = match approval_backends.resolve(backend) {
                     Ok(resolved) => resolved,
@@ -522,7 +529,10 @@ pub(crate) async fn select_intercept_route<'a>(
                             &rule_label,
                             Some(&deny_reason),
                         );
-                        return RouteSelection::Rejected(403);
+                        return RouteSelection::Denied(reverse::PolicyDenial::new(
+                            &rule_label,
+                            "approval required and the approval backend is unavailable",
+                        ));
                     }
                 };
                 let request_reason = reason.map(str::to_string).unwrap_or_else(|| {
@@ -617,7 +627,10 @@ pub(crate) async fn select_intercept_route<'a>(
                             "tls_intercept: {}",
                             crate::approval::sanitize_reason_for_log(&deny_reason)
                         );
-                        return RouteSelection::Rejected(403);
+                        return RouteSelection::Denied(reverse::approval_denial(
+                            &rule_label,
+                            &reason,
+                        ));
                     }
                     Ok(Ok(Ok(nono::supervisor::ApprovalDecision::Timeout))) => {
                         let deny_reason = format!(
@@ -638,7 +651,10 @@ pub(crate) async fn select_intercept_route<'a>(
                             Some(&deny_reason),
                         );
                         warn!("tls_intercept: {}", deny_reason);
-                        return RouteSelection::Rejected(403);
+                        return RouteSelection::Denied(reverse::PolicyDenial::new(
+                            &rule_label,
+                            reverse::APPROVAL_NOT_GRANTED,
+                        ));
                     }
                     Ok(Ok(Err(err))) => {
                         let deny_reason = format!("endpoint approval backend error: {err}");
@@ -656,7 +672,10 @@ pub(crate) async fn select_intercept_route<'a>(
                             Some(&deny_reason),
                         );
                         warn!("{}", deny_reason);
-                        return RouteSelection::Rejected(403);
+                        return RouteSelection::Denied(reverse::PolicyDenial::new(
+                            &rule_label,
+                            reverse::APPROVAL_NOT_GRANTED,
+                        ));
                     }
                     Ok(Err(err)) => {
                         let deny_reason = format!("endpoint approval task failed: {err}");
@@ -674,7 +693,10 @@ pub(crate) async fn select_intercept_route<'a>(
                             Some(&deny_reason),
                         );
                         warn!("{}", deny_reason);
-                        return RouteSelection::Rejected(403);
+                        return RouteSelection::Denied(reverse::PolicyDenial::new(
+                            &rule_label,
+                            reverse::APPROVAL_NOT_GRANTED,
+                        ));
                     }
                     Err(_) => {
                         let deny_reason = format!(
@@ -695,7 +717,10 @@ pub(crate) async fn select_intercept_route<'a>(
                             Some(&deny_reason),
                         );
                         warn!("{}", deny_reason);
-                        return RouteSelection::Rejected(403);
+                        return RouteSelection::Denied(reverse::PolicyDenial::new(
+                            &rule_label,
+                            reverse::APPROVAL_NOT_GRANTED,
+                        ));
                     }
                 }
             }
@@ -740,7 +765,10 @@ pub(crate) async fn select_intercept_route<'a>(
                     &rule_label,
                     Some(deny_reason),
                 );
-                return RouteSelection::Rejected(403);
+                return RouteSelection::Denied(reverse::PolicyDenial::endpoint_policy(
+                    &rule_label,
+                    reason,
+                ));
             }
         }
     }
@@ -764,7 +792,10 @@ pub(crate) async fn select_intercept_route<'a>(
             port,
             &reason,
         );
-        return RouteSelection::Rejected(403);
+        return RouteSelection::Denied(reverse::PolicyDenial::new(
+            "endpoint_rules",
+            "no endpoint rule of this host's routes allows the request",
+        ));
     }
 
     // Ambiguity applies only to credential-injection routes within the active
@@ -796,7 +827,10 @@ pub(crate) async fn select_intercept_route<'a>(
             port,
             &reason,
         );
-        return RouteSelection::Rejected(403);
+        return RouteSelection::Denied(reverse::PolicyDenial::new(
+            "route.ambiguous",
+            "more than one credential route matches the request",
+        ));
     }
 
     let selected = credential_layer
@@ -816,7 +850,10 @@ pub(crate) async fn select_intercept_route<'a>(
             port,
             "no matching WebSocket upgrade rule",
         );
-        return RouteSelection::Rejected(403);
+        return RouteSelection::Denied(reverse::PolicyDenial::new(
+            "upgrades",
+            "no WebSocket upgrade rule allows this path",
+        ));
     }
     match selected.map(|(s, _)| s) {
         Some(svc) => debug!(
@@ -1099,6 +1136,10 @@ where
                     _ => "Forbidden",
                 };
                 reverse::send_error_generic(tls_stream, status, msg).await?;
+                return Ok(());
+            }
+            RouteSelection::Denied(denial) => {
+                reverse::send_policy_denial(tls_stream, &denial).await?;
                 return Ok(());
             }
             RouteSelection::Selected(selected) => selected,
@@ -2643,6 +2684,7 @@ mod tests {
             RouteSelection::Selected(None) => {
                 panic!("/foo must select the foo route, not passthrough")
             }
+            RouteSelection::Denied(denial) => panic!("unexpected denial: {denial:?}"),
             RouteSelection::Rejected(status) => {
                 panic!("/foo must be allowed, got rejection with status {status}")
             }
@@ -2654,6 +2696,7 @@ mod tests {
             RouteSelection::Selected(None) => {
                 panic!("/bar must select the bar route, not passthrough")
             }
+            RouteSelection::Denied(denial) => panic!("unexpected denial: {denial:?}"),
             RouteSelection::Rejected(status) => {
                 panic!("/bar must be allowed, got rejection with status {status}")
             }
@@ -2669,6 +2712,7 @@ mod tests {
                     selected.id
                 )
             }
+            RouteSelection::Denied(denial) => panic!("unexpected denial: {denial:?}"),
             RouteSelection::Rejected(status) => {
                 panic!("/other must pass through, got rejection with status {status}")
             }
@@ -2795,6 +2839,7 @@ mod tests {
             RouteSelection::Selected(None) => {
                 panic!("first request must select the limited route, not passthrough")
             }
+            RouteSelection::Denied(denial) => panic!("unexpected denial: {denial:?}"),
             RouteSelection::Rejected(status) => {
                 panic!("first request must be allowed, got rejection with status {status}")
             }
@@ -2806,6 +2851,7 @@ mod tests {
             .await
         {
             RouteSelection::Rejected(status) => assert_eq!(status, 429),
+            RouteSelection::Denied(denial) => panic!("expected 429, got denial {denial:?}"),
             RouteSelection::Selected(Some(selected)) => {
                 panic!(
                     "second request must be rate limited with 429, got route '{}'",
@@ -2915,10 +2961,86 @@ mod tests {
         )
         .await
         {
-            RouteSelection::Rejected(status) => assert_eq!(status, 403),
+            RouteSelection::Denied(denial) => {
+                assert_eq!(denial.rule, "endpoint_policy.approve[GET /gated]");
+                assert_eq!(denial.reason, "approval denied: operator said no");
+            }
+            RouteSelection::Rejected(status) => panic!("expected a named denial, got {status}"),
             RouteSelection::Selected(selected) => {
                 panic!("denied approval must reject the request, got Selected({selected:?})")
             }
+        }
+    }
+
+    /// An explicit endpoint-policy denial names its rule and the rule's
+    /// reason; a request no rule allows names the default.
+    #[tokio::test]
+    async fn select_intercept_route_policy_denial_names_rule_and_reason() {
+        let mut route = approval_gated_route("guarded");
+        route.endpoint_policy = Some(crate::config::EndpointPolicyConfig {
+            default: crate::config::EndpointPolicyDefault::default(),
+            deny: vec![crate::config::EndpointPolicyRule {
+                method: "POST".to_string(),
+                path: "/repos/*/git-receive-pack".to_string(),
+                backend: None,
+                reason: Some("push only to the session repository".to_string()),
+                timeout_secs: None,
+            }],
+            approve: Vec::new(),
+            allow: vec![crate::config::EndpointPolicyRule {
+                method: "GET".to_string(),
+                path: "/repos/**".to_string(),
+                backend: None,
+                reason: None,
+                timeout_secs: None,
+            }],
+        });
+        let store = RouteStore::load(&[route]).await.unwrap();
+        let select = |method: &'static str, path: &'static str| {
+            let store = &store;
+            async move {
+                select_intercept_route(
+                    store,
+                    "example.com",
+                    443,
+                    InterceptRouteRequest {
+                        method,
+                        path,
+                        websocket_path: None,
+                    },
+                    None,
+                    None,
+                )
+                .await
+            }
+        };
+        match select("POST", "/repos/other/git-receive-pack").await {
+            RouteSelection::Denied(denial) => {
+                assert_eq!(
+                    denial.rule,
+                    "endpoint_policy.deny[POST /repos/*/git-receive-pack]"
+                );
+                assert_eq!(denial.reason, "push only to the session repository");
+            }
+            other => panic!("expected a named denial, got {}", describe(&other)),
+        }
+        match select("DELETE", "/repos/x").await {
+            RouteSelection::Denied(denial) => {
+                assert_eq!(denial.rule, "endpoint_policy.default");
+                assert_eq!(
+                    denial.reason,
+                    "no rule of this route's endpoint policy allows the request"
+                );
+            }
+            other => panic!("expected a named denial, got {}", describe(&other)),
+        }
+    }
+
+    fn describe(selection: &RouteSelection<'_>) -> String {
+        match selection {
+            RouteSelection::Rejected(status) => format!("Rejected({status})"),
+            RouteSelection::Denied(denial) => format!("Denied({denial:?})"),
+            RouteSelection::Selected(selected) => format!("Selected({selected:?})"),
         }
     }
 
@@ -2949,7 +3071,11 @@ mod tests {
         )
         .await
         {
-            RouteSelection::Rejected(status) => assert_eq!(status, 403),
+            RouteSelection::Denied(denial) => {
+                assert_eq!(denial.rule, "endpoint_policy.approve[GET /gated]");
+                assert_eq!(denial.reason, "approval required and not granted");
+            }
+            RouteSelection::Rejected(status) => panic!("expected a named denial, got {status}"),
             RouteSelection::Selected(selected) => {
                 panic!("backend error must reject the request, got Selected({selected:?})")
             }
@@ -2981,7 +3107,11 @@ mod tests {
         )
         .await
         {
-            RouteSelection::Rejected(status) => assert_eq!(status, 403),
+            RouteSelection::Denied(denial) => {
+                assert_eq!(denial.rule, "endpoint_policy.approve[GET /gated]");
+                assert_eq!(denial.reason, "approval required and not granted");
+            }
+            RouteSelection::Rejected(status) => panic!("expected a named denial, got {status}"),
             RouteSelection::Selected(selected) => {
                 panic!("timed-out approval must reject the request, got Selected({selected:?})")
             }
@@ -3027,6 +3157,7 @@ mod tests {
             RouteSelection::Selected(None) => {
                 panic!("granted approval must select the gated route, not passthrough")
             }
+            RouteSelection::Denied(denial) => panic!("unexpected denial: {denial:?}"),
             RouteSelection::Rejected(status) => {
                 panic!("granted approval must be allowed, got rejection with status {status}")
             }
@@ -3432,7 +3563,10 @@ mod tests {
             None,
         )
         .await;
-        assert!(matches!(selection, RouteSelection::Rejected(403)));
+        assert!(matches!(
+            &selection,
+            RouteSelection::Denied(denial) if denial.rule == "upgrades"
+        ));
     }
 
     fn test_intercept_ctx<'a>(

@@ -2525,6 +2525,68 @@ mod tests {
         handle.shutdown();
     }
 
+    /// A reverse-proxy request the route's endpoint policy refuses is
+    /// answered 403 naming the rule (header and body) and the rule's reason,
+    /// and is never forwarded.
+    #[tokio::test]
+    async fn reverse_proxy_endpoint_denial_names_rule_and_reason() {
+        let upstream = spawn_mock_upstream().await;
+        let mut route = declarative_route(&format!("http://{upstream}"));
+        route.endpoint_policy = Some(crate::config::EndpointPolicyConfig {
+            default: crate::config::EndpointPolicyDefault::default(),
+            deny: vec![crate::config::EndpointPolicyRule {
+                method: "GET".to_string(),
+                path: "/admin/**".to_string(),
+                backend: None,
+                reason: Some("the admin API is not for agents".to_string()),
+                timeout_secs: None,
+            }],
+            approve: Vec::new(),
+            allow: Vec::new(),
+        });
+        let config = ProxyConfig {
+            routes: vec![route],
+            allowed_hosts: vec!["127.0.0.1".to_string()],
+            require_auth: true,
+            ..Default::default()
+        };
+        let handle = start(config).await.unwrap();
+        let token = handle.token.to_string();
+        let creds = {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode(format!("nono:{token}"))
+        };
+        let request = format!(
+            "GET /svc/admin/users HTTP/1.1\r\nHost: 127.0.0.1\r\nProxy-Authorization: Basic {creds}\r\n\r\n"
+        );
+        let mut client = tokio::net::TcpStream::connect(("127.0.0.1", handle.port))
+            .await
+            .unwrap();
+        client.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.read_to_end(&mut response),
+        )
+        .await;
+        let response = String::from_utf8_lossy(&response).to_string();
+        assert!(
+            response.starts_with("HTTP/1.1 403 Forbidden"),
+            "{response:?}"
+        );
+        assert!(
+            response.contains("X-Nono-Denied-By: endpoint_policy.deny[GET /admin/**]"),
+            "{response:?}"
+        );
+        assert!(
+            response.ends_with(
+                r#"{"error":"Forbidden","rule":"endpoint_policy.deny[GET /admin/**]","reason":"the admin API is not for agents"}"#
+            ),
+            "{response:?}"
+        );
+        handle.shutdown();
+    }
+
     #[tokio::test]
     async fn reverse_proxy_rate_limit_rejects_after_burst() {
         // A route with a RouteRateLimiter of burst 1 and no delay budget lets

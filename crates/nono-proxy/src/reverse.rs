@@ -1089,6 +1089,7 @@ async fn enforce_endpoint_policy(
             Ok(true)
         }
         EndpointPolicyOutcome::Deny { reason, rule_label } => {
+            let denial = PolicyDenial::endpoint_policy(&rule_label, reason);
             let reason = reason.map(str::to_string).unwrap_or_else(|| {
                 format!(
                     "endpoint denied by {}: {} {} on service '{}'",
@@ -1116,7 +1117,7 @@ async fn enforce_endpoint_policy(
                 &rule_label,
                 Some(&reason),
             );
-            send_error(stream, 403, "Forbidden").await?;
+            send_policy_denial(stream, &denial).await?;
             Ok(false)
         }
         EndpointPolicyOutcome::Approve {
@@ -1151,7 +1152,14 @@ async fn enforce_endpoint_policy(
                     &rule_label,
                     Some(&deny_reason),
                 );
-                send_error(stream, 403, "Forbidden").await?;
+                send_policy_denial(
+                    stream,
+                    &PolicyDenial::new(
+                        &rule_label,
+                        "approval required and no approval backend is configured",
+                    ),
+                )
+                .await?;
                 return Ok(false);
             };
             let (backend_name, backend) = match approval_backends.resolve(backend) {
@@ -1181,7 +1189,14 @@ async fn enforce_endpoint_policy(
                         &rule_label,
                         Some(&deny_reason),
                     );
-                    send_error(stream, 403, "Forbidden").await?;
+                    send_policy_denial(
+                        stream,
+                        &PolicyDenial::new(
+                            &rule_label,
+                            "approval required and the approval backend is unavailable",
+                        ),
+                    )
+                    .await?;
                     return Ok(false);
                 }
             };
@@ -1269,7 +1284,7 @@ async fn enforce_endpoint_policy(
                         &rule_label,
                         Some(&deny_reason),
                     );
-                    send_error(stream, 403, "Forbidden").await?;
+                    send_policy_denial(stream, &approval_denial(&rule_label, &reason)).await?;
                     Ok(false)
                 }
                 Ok(Ok(Ok(nono::supervisor::ApprovalDecision::Timeout))) => {
@@ -1291,7 +1306,11 @@ async fn enforce_endpoint_policy(
                         &rule_label,
                         Some(&deny_reason),
                     );
-                    send_error(stream, 403, "Forbidden").await?;
+                    send_policy_denial(
+                        stream,
+                        &PolicyDenial::new(&rule_label, APPROVAL_NOT_GRANTED),
+                    )
+                    .await?;
                     Ok(false)
                 }
                 Ok(Ok(Err(err))) => {
@@ -1310,7 +1329,11 @@ async fn enforce_endpoint_policy(
                         Some(&deny_reason),
                     );
                     warn!("{}", deny_reason);
-                    send_error(stream, 403, "Forbidden").await?;
+                    send_policy_denial(
+                        stream,
+                        &PolicyDenial::new(&rule_label, APPROVAL_NOT_GRANTED),
+                    )
+                    .await?;
                     Ok(false)
                 }
                 Ok(Err(err)) => {
@@ -1329,7 +1352,11 @@ async fn enforce_endpoint_policy(
                         Some(&deny_reason),
                     );
                     warn!("{}", deny_reason);
-                    send_error(stream, 403, "Forbidden").await?;
+                    send_policy_denial(
+                        stream,
+                        &PolicyDenial::new(&rule_label, APPROVAL_NOT_GRANTED),
+                    )
+                    .await?;
                     Ok(false)
                 }
                 Err(_) => {
@@ -1351,7 +1378,11 @@ async fn enforce_endpoint_policy(
                         Some(&deny_reason),
                     );
                     warn!("{}", deny_reason);
-                    send_error(stream, 403, "Forbidden").await?;
+                    send_policy_denial(
+                        stream,
+                        &PolicyDenial::new(&rule_label, APPROVAL_NOT_GRANTED),
+                    )
+                    .await?;
                     Ok(false)
                 }
             }
@@ -1801,6 +1832,116 @@ where
         "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
         status,
         reason,
+        body.len(),
+        body
+    );
+    stream.write_all(response.as_bytes()).await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+/// Response header naming the policy rule that refused a request.
+pub const DENIED_BY_HEADER: &str = "X-Nono-Denied-By";
+
+/// Longest rule label or reason a denial carries to the client.
+const MAX_DENIAL_FIELD: usize = 256;
+
+/// A policy decision that refused a request, as the client is told it: the
+/// rule that decided (the label the audit log records, such as
+/// `endpoint_policy.deny[POST /repos/*/git-receive-pack]` or
+/// `endpoint_policy.default`) and a one-line reason (the rule's configured
+/// `reason`, or a fixed description of the decision). It never carries the
+/// request's path or headers, so nothing the client did not send itself, and
+/// nothing secret, is echoed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyDenial {
+    pub rule: String,
+    pub reason: String,
+}
+
+impl PolicyDenial {
+    /// A denial by `rule` for `reason`, each made one printable line of at
+    /// most [`MAX_DENIAL_FIELD`] characters.
+    #[must_use]
+    pub fn new(rule: &str, reason: &str) -> Self {
+        Self {
+            rule: one_line(rule),
+            reason: one_line(reason),
+        }
+    }
+
+    /// The endpoint-policy denial for `rule_label`, with the rule's configured
+    /// `reason` when it has one.
+    #[must_use]
+    pub fn endpoint_policy(rule_label: &str, reason: Option<&str>) -> Self {
+        let fallback = if rule_label == "endpoint_policy.default" {
+            "no rule of this route's endpoint policy allows the request"
+        } else {
+            "this route's endpoint policy denies the request"
+        };
+        Self::new(rule_label, reason.unwrap_or(fallback))
+    }
+
+    /// The JSON body of the 403: `{"error":"Forbidden","rule":…,"reason":…}`.
+    #[must_use]
+    pub fn body(&self) -> String {
+        serde_json::json!({
+            "error": "Forbidden",
+            "rule": self.rule,
+            "reason": self.reason,
+        })
+        .to_string()
+    }
+}
+
+/// `text` as one line of printable characters, at most [`MAX_DENIAL_FIELD`].
+fn one_line(text: &str) -> String {
+    let line: String = text
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(MAX_DENIAL_FIELD)
+        .collect();
+    line.trim().to_string()
+}
+
+/// The reason a client is given when an approval it needed was not granted
+/// (timed out, or the backend failed).
+pub(crate) const APPROVAL_NOT_GRANTED: &str = "approval required and not granted";
+
+/// The denial for an approval refused by `rule_label`, with the approver's
+/// stated reason when there is one.
+#[must_use]
+pub(crate) fn approval_denial(rule_label: &str, approver_reason: &str) -> PolicyDenial {
+    if approver_reason.trim().is_empty() {
+        PolicyDenial::new(rule_label, "approval denied")
+    } else {
+        PolicyDenial::new(rule_label, &format!("approval denied: {approver_reason}"))
+    }
+}
+
+/// Send `403 Forbidden` for a policy denial: the rule in
+/// [`DENIED_BY_HEADER`] (ASCII only, so it is a valid header value), and the
+/// rule and reason in a JSON body.
+pub(crate) async fn send_policy_denial<S>(stream: &mut S, denial: &PolicyDenial) -> Result<()>
+where
+    S: tokio::io::AsyncWrite + Unpin,
+{
+    let body = denial.body();
+    let header_rule: String = denial
+        .rule
+        .chars()
+        .map(|c| {
+            if c.is_ascii_graphic() || c == ' ' {
+                c
+            } else {
+                '?'
+            }
+        })
+        .collect();
+    let response = format!(
+        "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\n{}: {}\r\nContent-Length: {}\r\n\r\n{}",
+        DENIED_BY_HEADER,
+        header_rule,
         body.len(),
         body
     );
@@ -2868,6 +3009,63 @@ pub(crate) fn injected_credential_header_names(cred: Option<&LoadedCredential>) 
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn policy_denial_is_one_bounded_line_in_json() {
+        let denial = PolicyDenial::new(
+            "endpoint_policy.deny[POST /x]",
+            "no\r\nX-Injected: 1 \"quoted\"",
+        );
+        assert_eq!(denial.reason, "no  X-Injected: 1 \"quoted\"");
+        let body: serde_json::Value = serde_json::from_str(&denial.body()).unwrap();
+        assert_eq!(body["error"], "Forbidden");
+        assert_eq!(body["rule"], "endpoint_policy.deny[POST /x]");
+        assert_eq!(body["reason"], "no  X-Injected: 1 \"quoted\"");
+        let long = PolicyDenial::new("r", &"x".repeat(1000));
+        assert_eq!(long.reason.chars().count(), MAX_DENIAL_FIELD);
+    }
+
+    #[test]
+    fn endpoint_policy_denial_falls_back_to_a_description() {
+        assert_eq!(
+            PolicyDenial::endpoint_policy("endpoint_policy.default", None).reason,
+            "no rule of this route's endpoint policy allows the request"
+        );
+        assert_eq!(
+            PolicyDenial::endpoint_policy("endpoint_policy.deny[GET /a]", None).reason,
+            "this route's endpoint policy denies the request"
+        );
+        assert_eq!(
+            PolicyDenial::endpoint_policy("endpoint_policy.deny[GET /a]", Some("not /a")).reason,
+            "not /a"
+        );
+        assert_eq!(approval_denial("r", " ").reason, "approval denied");
+        assert_eq!(
+            approval_denial("r", "use staging").reason,
+            "approval denied: use staging"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_policy_denial_names_rule_in_header_and_body() {
+        let mut out: Vec<u8> = Vec::new();
+        let denial = PolicyDenial::new("endpoint_policy.deny[POST /é]", "why");
+        send_policy_denial(&mut out, &denial).await.unwrap();
+        let text = String::from_utf8(out).unwrap();
+        let (head, body) = text.split_once("\r\n\r\n").unwrap();
+        assert!(head.starts_with("HTTP/1.1 403 Forbidden\r\n"), "{head}");
+        assert!(
+            head.contains("\r\nX-Nono-Denied-By: endpoint_policy.deny[POST /?]"),
+            "header value is ASCII: {head}"
+        );
+        assert!(
+            head.contains(&format!("Content-Length: {}", body.len())),
+            "{head}"
+        );
+        let body: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(body["rule"], "endpoint_policy.deny[POST /é]");
+        assert_eq!(body["reason"], "why");
+    }
 
     #[test]
     fn test_endpoint_approval_request_id_is_unique() {

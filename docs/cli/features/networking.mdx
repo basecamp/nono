@@ -354,6 +354,14 @@ nono run --allow-cwd --credential github \
 
 When any endpoint rules are configured for a service, requests that don't match receive `403 Forbidden` and are logged in the audit trail.
 
+A `403` from a policy decision names the rule that made it and why, so a client (or an agent reading its error) can tell a policy refusal from an upstream one and stop retrying. The rule is in the `X-Nono-Denied-By` header and, with a one-line reason, in the JSON body:
+
+```json
+{"error":"Forbidden","rule":"endpoint_policy.deny[POST /repos/*/git-receive-pack]","reason":"push only to the session repository"}
+```
+
+The rule is the label the audit trail records (`endpoint_policy.deny[...]`, `endpoint_policy.approve[...]`, `endpoint_policy.default`, `endpoint_rules`). The reason is the rule's `reason` when it has one, otherwise a fixed description; for an approval the operator refused, it carries the approver's stated reason. Neither echoes the request's path or headers.
+
 ### Profile Configuration
 
 Endpoint rules can also be defined on custom credentials within profiles:

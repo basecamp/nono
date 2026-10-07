@@ -300,6 +300,10 @@ async fn handle_h2_stream(
             send_h2_error(&mut respond, status)?;
             return Ok(());
         }
+        RouteSelection::Denied(denial) => {
+            send_h2_denial(&mut respond, &denial)?;
+            return Ok(());
+        }
         RouteSelection::Selected(selected) => selected,
     };
     let service = selected.map(|selected| selected.id);
@@ -689,6 +693,32 @@ fn send_h2_error(respond: &mut h2::server::SendResponse<Bytes>, status_code: u16
     respond
         .send_response(response, true)
         .map_err(|e| ProxyError::HttpParse(format!("h2 send error response: {}", e)))?;
+    Ok(())
+}
+
+/// Send `403` for a policy denial: the rule in
+/// [`reverse::DENIED_BY_HEADER`] and the rule and reason in a JSON body, as
+/// the HTTP/1.1 paths send it.
+fn send_h2_denial(
+    respond: &mut h2::server::SendResponse<Bytes>,
+    denial: &reverse::PolicyDenial,
+) -> Result<()> {
+    let body = denial.body();
+    let mut response = Response::builder()
+        .status(http::StatusCode::FORBIDDEN)
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .header(http::header::CONTENT_LENGTH, body.len());
+    if let Ok(rule) = HeaderValue::from_str(&denial.rule) {
+        response = response.header(reverse::DENIED_BY_HEADER, rule);
+    }
+    let response = response
+        .body(())
+        .map_err(|e| ProxyError::HttpParse(format!("h2 denial response build: {}", e)))?;
+    let mut send = respond
+        .send_response(response, false)
+        .map_err(|e| ProxyError::HttpParse(format!("h2 send denial response: {}", e)))?;
+    send.send_data(Bytes::from(body), true)
+        .map_err(|e| ProxyError::HttpParse(format!("h2 send denial body: {}", e)))?;
     Ok(())
 }
 
