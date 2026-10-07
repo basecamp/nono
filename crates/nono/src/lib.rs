@@ -72,8 +72,8 @@ pub use broker_path::{
 };
 pub use capability::{
     AccessMode, CapabilitySet, CapabilitySource, CoveringCapabilities, FsCapability, IpcMode,
-    NetworkMode, ProcessInfoMode, SignalMode, SocketScope, UnixSocketCapability, UnixSocketMode,
-    UnixSocketOp,
+    NetworkMode, ProcessInfoMode, SignalMode, SocketScope, UnixSocketCapability,
+    UnixSocketMediation, UnixSocketMode, UnixSocketOp,
 };
 pub use diagnostic::{
     DenialReason, DenialRecord, IpcDenialRecord, NonoDiagnostic, NonoDiagnosticCode,

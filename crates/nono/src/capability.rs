@@ -883,6 +883,28 @@ pub enum IpcMode {
     Full,
 }
 
+/// Whether pathname AF_UNIX connections are restricted to explicit grants.
+///
+/// A [`UnixSocketCapability`] always describes which pathname sockets a
+/// sandboxed process may use; this mode says whether the platform sandbox
+/// should *enforce* that list for `connect(2)` and addressed `sendmsg(2)`.
+///
+/// On Linux, `Pathname` handles Landlock's `LANDLOCK_ACCESS_FS_RESOLVE_UNIX`
+/// (ABI V9+, Linux 7.1) and grants it only on the paths of the unix socket
+/// capabilities. On older kernels the Landlock layer cannot express this and
+/// the mode has no Landlock effect; callers that need enforcement there must
+/// install their own mediation (nono-cli uses seccomp user notification for
+/// `linux.af_unix_mediation = "pathname"`). Ignored on other platforms.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnixSocketMediation {
+    /// Pathname AF_UNIX sockets are not restricted by the platform sandbox (default).
+    #[default]
+    Off,
+    /// Only pathname sockets covered by a unix socket capability may be connected to.
+    Pathname,
+}
+
 /// forcing all traffic through the nono proxy.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NetworkMode {
@@ -993,6 +1015,8 @@ pub struct CapabilitySet {
     process_info_mode: ProcessInfoMode,
     /// IPC mode (default: SharedMemoryOnly).
     ipc_mode: IpcMode,
+    /// Pathname AF_UNIX enforcement mode (default: Off).
+    unix_socket_mediation: UnixSocketMediation,
     /// Enable sandbox extension support for runtime capability expansion.
     /// On macOS, adds extension filter rules to the Seatbelt profile so that
     /// `sandbox_extension_consume()` tokens can expand the sandbox dynamically.
@@ -1283,6 +1307,15 @@ impl CapabilitySet {
         self
     }
 
+    /// Set the pathname AF_UNIX enforcement mode (builder pattern).
+    ///
+    /// See [`UnixSocketMediation`] for what each platform enforces.
+    #[must_use]
+    pub fn set_unix_socket_mediation(mut self, mode: UnixSocketMediation) -> Self {
+        self.unix_socket_mediation = mode;
+        self
+    }
+
     /// Set IPC mode (builder pattern)
     ///
     /// Controls whether the sandboxed process can use POSIX semaphores.
@@ -1409,6 +1442,13 @@ impl CapabilitySet {
     /// Set IPC mode (mutable)
     pub fn set_ipc_mode_mut(&mut self, mode: IpcMode) {
         self.ipc_mode = mode;
+    }
+
+    /// Set the pathname AF_UNIX enforcement mode (mutable).
+    ///
+    /// See [`UnixSocketMediation`] for what each platform enforces.
+    pub fn set_unix_socket_mediation_mut(&mut self, mode: UnixSocketMediation) {
+        self.unix_socket_mediation = mode;
     }
 
     /// Add a TCP connect port to the allowlist (mutable)
@@ -1670,6 +1710,12 @@ impl CapabilitySet {
     #[must_use]
     pub fn ipc_mode(&self) -> IpcMode {
         self.ipc_mode
+    }
+
+    /// Get the pathname AF_UNIX enforcement mode
+    #[must_use]
+    pub fn unix_socket_mediation(&self) -> UnixSocketMediation {
+        self.unix_socket_mediation
     }
 
     /// Get the network mode
@@ -3385,6 +3431,24 @@ mod tests {
         assert_eq!(caps.ipc_mode(), IpcMode::SharedMemoryOnly);
         caps.set_ipc_mode_mut(IpcMode::Full);
         assert_eq!(caps.ipc_mode(), IpcMode::Full);
+    }
+
+    #[test]
+    fn test_unix_socket_mediation_default_is_off() {
+        let caps = CapabilitySet::new();
+        assert_eq!(caps.unix_socket_mediation(), UnixSocketMediation::Off);
+    }
+
+    #[test]
+    fn test_unix_socket_mediation_setters() {
+        let caps = CapabilitySet::new().set_unix_socket_mediation(UnixSocketMediation::Pathname);
+        assert_eq!(caps.unix_socket_mediation(), UnixSocketMediation::Pathname);
+
+        let mut caps = CapabilitySet::new();
+        caps.set_unix_socket_mediation_mut(UnixSocketMediation::Pathname);
+        assert_eq!(caps.unix_socket_mediation(), UnixSocketMediation::Pathname);
+        caps.set_unix_socket_mediation_mut(UnixSocketMediation::Off);
+        assert_eq!(caps.unix_socket_mediation(), UnixSocketMediation::Off);
     }
 
     #[test]

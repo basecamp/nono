@@ -528,6 +528,17 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         ));
     }
 
+    // `linux.af_unix_mediation = "pathname"` also asks Landlock to enforce the
+    // session's unix socket grants where the kernel can (ABI V9+, ResolveUnix).
+    // The seccomp mediation configured below still runs: it narrows directory
+    // grants to UnixSocketCapability::covers() and mediates bind(2). Set after
+    // the command-sandbox runtime is prepared, so brokered command sandboxes
+    // keep their current AF_UNIX behaviour.
+    #[cfg(target_os = "linux")]
+    if flags.af_unix_mediation.is_pathname() {
+        caps.set_unix_socket_mediation_mut(nono::UnixSocketMediation::Pathname);
+    }
+
     apply_pre_fork_sandbox(
         strategy,
         &caps,

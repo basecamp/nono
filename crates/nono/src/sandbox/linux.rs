@@ -1,7 +1,8 @@
 //! Linux sandbox implementation using Landlock LSM
 
 use crate::capability::{
-    AccessMode, CapabilitySet, IpcMode, NetworkMode, SignalMode, merge_port_ranges,
+    AccessMode, CapabilitySet, IpcMode, NetworkMode, SignalMode, UnixSocketMediation,
+    merge_port_ranges,
 };
 use crate::error::{NonoError, Result};
 use crate::sandbox::SupportInfo;
@@ -18,6 +19,8 @@ use tracing::{debug, info, warn};
 
 const LANDLOCK_RULE_PATH_BENEATH: u32 = 1;
 const LANDLOCK_RULE_NET_PORT: u32 = 2;
+/// `LANDLOCK_CREATE_RULESET_VERSION`: ask `landlock_create_ruleset` for the ABI version.
+const LANDLOCK_CREATE_RULESET_VERSION: u32 = 1 << 0;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -270,8 +273,12 @@ impl PreparedLandlockSandbox {
 /// features are available at the detected ABI level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DetectedAbi {
-    /// The detected ABI version
+    /// The detected ABI version: the highest ABI that both the kernel and this
+    /// build of nono support. This is the ABI that enforcement uses.
     pub abi: ABI,
+    /// The kernel's own ABI version, when it is newer than `abi` (this build
+    /// does not know the kernel's newest features yet). Informational only.
+    newer_kernel_abi: Option<u32>,
 }
 
 /// Landlock scope policy derived from a capability set and kernel ABI.
@@ -295,7 +302,33 @@ impl DetectedAbi {
     /// Create a new `DetectedAbi` from a raw `landlock::ABI`.
     #[must_use]
     pub fn new(abi: ABI) -> Self {
-        Self { abi }
+        Self {
+            abi,
+            newer_kernel_abi: None,
+        }
+    }
+
+    /// Create a `DetectedAbi` for `abi` on a kernel that reports Landlock ABI
+    /// `kernel_version` (`None` when the kernel did not report one).
+    fn with_kernel_version(abi: ABI, kernel_version: Option<u32>) -> Self {
+        let newer_kernel_abi =
+            kernel_version.filter(|version| abi_version_number(abi).is_some_and(|n| *version > n));
+        Self {
+            abi,
+            newer_kernel_abi,
+        }
+    }
+
+    /// The running kernel's Landlock ABI version number.
+    ///
+    /// This is newer than [`DetectedAbi::abi`] when the kernel supports an ABI
+    /// this build of nono cannot use yet (e.g. a 7.2 kernel reports ABI 10).
+    /// Returns 0 for [`ABI::Unsupported`].
+    #[must_use]
+    pub fn kernel_abi_version(&self) -> u32 {
+        self.newer_kernel_abi
+            .or_else(|| abi_version_number(self.abi))
+            .unwrap_or(0)
     }
 
     /// Whether file rename across directories is supported (V2+).
@@ -311,9 +344,12 @@ impl DetectedAbi {
     }
 
     /// Whether execute access control is supported strongly enough for command sandbox execution.
+    ///
+    /// Every ABI from V3 on qualifies, including ones newer than V6: an
+    /// enumeration of known versions here would fail closed on newer kernels.
     #[must_use]
     pub fn has_execute(&self) -> bool {
-        matches!(self.abi, ABI::V3 | ABI::V4 | ABI::V5 | ABI::V6)
+        self.abi >= ABI::V3
     }
 
     /// Whether TCP network filtering is supported (V4+).
@@ -334,6 +370,15 @@ impl DetectedAbi {
         !Scope::from_all(self.abi).is_empty()
     }
 
+    /// Whether pathname UNIX socket resolution control is supported (V9+).
+    ///
+    /// `LANDLOCK_ACCESS_FS_RESOLVE_UNIX` restricts `connect(2)` and addressed
+    /// `sendmsg(2)` to pathname UNIX sockets created outside the sandbox.
+    #[must_use]
+    pub fn has_resolve_unix(&self) -> bool {
+        AccessFs::from_all(self.abi).contains(AccessFs::ResolveUnix)
+    }
+
     /// Return a human-readable version string (e.g., "V4").
     #[must_use]
     pub fn version_string(&self) -> &'static str {
@@ -344,6 +389,9 @@ impl DetectedAbi {
             ABI::V4 => "V4",
             ABI::V5 => "V5",
             ABI::V6 => "V6",
+            ABI::V7 => "V7",
+            ABI::V8 => "V8",
+            ABI::V9 => "V9",
             _ => "unknown",
         }
     }
@@ -369,6 +417,9 @@ impl DetectedAbi {
         }
         if self.has_scoping() {
             features.push("Signal and abstract UNIX socket scoping".to_string());
+        }
+        if self.has_resolve_unix() {
+            features.push("Pathname UNIX socket resolution (ResolveUnix)".to_string());
         }
         features
     }
@@ -408,17 +459,86 @@ pub fn landlock_scope_policy_with_abi(
 
 impl std::fmt::Display for DetectedAbi {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Landlock {}", self.version_string())
+        write!(f, "Landlock {}", self.version_string())?;
+        if let Some(kernel) = self.newer_kernel_abi {
+            write!(f, " (kernel ABI {kernel})")?;
+        }
+        Ok(())
     }
 }
 
-/// ABI probe order: highest to lowest.
-const ABI_PROBE_ORDER: [ABI; 6] = [ABI::V6, ABI::V5, ABI::V4, ABI::V3, ABI::V2, ABI::V1];
+/// ABI probe order: highest to lowest, through the highest ABI the `landlock`
+/// crate knows.
+const ABI_PROBE_ORDER: [ABI; 9] = [
+    ABI::V9,
+    ABI::V8,
+    ABI::V7,
+    ABI::V6,
+    ABI::V5,
+    ABI::V4,
+    ABI::V3,
+    ABI::V2,
+    ABI::V1,
+];
+
+/// The Landlock ABI version number of `abi`, or `None` for
+/// [`ABI::Unsupported`] (and for any version this build does not know).
+fn abi_version_number(abi: ABI) -> Option<u32> {
+    match abi {
+        ABI::V1 => Some(1),
+        ABI::V2 => Some(2),
+        ABI::V3 => Some(3),
+        ABI::V4 => Some(4),
+        ABI::V5 => Some(5),
+        ABI::V6 => Some(6),
+        ABI::V7 => Some(7),
+        ABI::V8 => Some(8),
+        ABI::V9 => Some(9),
+        _ => None,
+    }
+}
+
+/// The highest ABI this build can use on a kernel reporting ABI `version`.
+///
+/// A kernel newer than every ABI in [`ABI_PROBE_ORDER`] gets the highest one;
+/// a version of 0 (no Landlock) gets [`ABI::Unsupported`].
+fn abi_for_kernel_version(version: u32) -> ABI {
+    ABI_PROBE_ORDER
+        .iter()
+        .copied()
+        .find(|abi| abi_version_number(*abi).is_some_and(|n| n <= version))
+        .unwrap_or(ABI::Unsupported)
+}
+
+/// Ask the kernel for its Landlock ABI version.
+///
+/// `landlock_create_ruleset(NULL, 0, LANDLOCK_CREATE_RULESET_VERSION)` only
+/// reports the version: it creates no ruleset and returns no descriptor.
+/// Returns `None` when Landlock is not available (`ENOSYS`, `EOPNOTSUPP`).
+fn query_kernel_abi_version() -> Option<u32> {
+    // SAFETY: a NULL attribute pointer with size 0 is the documented version
+    // query; the kernel reads no user memory and allocates no descriptor.
+    let version = unsafe {
+        libc::syscall(
+            libc::SYS_landlock_create_ruleset,
+            std::ptr::null::<libc::c_void>(),
+            0_usize,
+            LANDLOCK_CREATE_RULESET_VERSION,
+        )
+    };
+    u32::try_from(version).ok().filter(|version| *version > 0)
+}
 
 /// Detect the highest Landlock ABI supported by the running kernel.
 ///
-/// Probes from V6 down to V1 using `HardRequirement` compatibility mode.
+/// Reads the kernel's ABI version, then probes from the highest ABI this build
+/// can use for it down to V1 using `HardRequirement` compatibility mode.
 /// Returns the highest ABI for which a full ruleset can be created.
+///
+/// The version bound matters because V7 and V8 add no access rights or
+/// scopes, so a ruleset probe alone cannot tell them from V6. A kernel newer
+/// than this build knows is detected as the highest known ABI, and its own
+/// version is kept for reporting ([`DetectedAbi::kernel_abi_version`]).
 ///
 /// The result is cached after the first call since the kernel ABI does not
 /// change at runtime.
@@ -440,10 +560,15 @@ pub fn detect_abi() -> Result<DetectedAbi> {
 
 fn detect_abi_uncached() -> Result<DetectedAbi> {
     let mut last_error = None;
+    let kernel_version = query_kernel_abi_version();
+    let ceiling = kernel_version.map(abi_for_kernel_version);
 
-    for &abi in &ABI_PROBE_ORDER {
+    for &abi in ABI_PROBE_ORDER
+        .iter()
+        .filter(|abi| ceiling.is_none_or(|ceiling| **abi <= ceiling))
+    {
         match probe_abi_candidate(abi) {
-            Ok(()) => return Ok(DetectedAbi::new(abi)),
+            Ok(()) => return Ok(DetectedAbi::with_kernel_version(abi, kernel_version)),
             Err(err) => {
                 debug!("ABI {:?} probe failed: {}", abi, err);
                 last_error = Some(format!("ABI {:?}: {}", abi, err));
@@ -712,6 +837,103 @@ fn open_path_rule(cap: &crate::capability::FsCapability, abi: ABI) -> Result<Ope
     })
 }
 
+/// Whether Landlock enforces the pathname AF_UNIX grants of `caps` on `abi`.
+///
+/// True only when the capability set asks for pathname socket enforcement
+/// ([`UnixSocketMediation::Pathname`]) and the kernel supports
+/// `LANDLOCK_ACCESS_FS_RESOLVE_UNIX` (V9+). Otherwise `ResolveUnix` is not
+/// handled at all, so pathname sockets behave exactly as on older kernels.
+fn resolve_unix_enforced(caps: &CapabilitySet, abi: &DetectedAbi) -> bool {
+    caps.unix_socket_mediation() == UnixSocketMediation::Pathname && abi.has_resolve_unix()
+}
+
+/// The filesystem access rights the ruleset handles for `caps` on `abi`.
+///
+/// Every right the ABI supports, except `ResolveUnix` unless pathname socket
+/// enforcement was requested: handling it without grants would deny every
+/// `connect(2)` to a pathname socket created outside the sandbox.
+fn handled_fs_access(caps: &CapabilitySet, abi: &DetectedAbi) -> BitFlags<AccessFs> {
+    let mut handled = AccessFs::from_all(abi.abi);
+    if !resolve_unix_enforced(caps, abi) {
+        handled.remove(AccessFs::ResolveUnix);
+    }
+    handled
+}
+
+/// A `ResolveUnix` rule for one pathname AF_UNIX socket grant.
+struct UnixSocketRule {
+    path_fd: OwnedFd,
+    resolved: PathBuf,
+}
+
+/// Open the Landlock rule targets for the unix socket grants in `caps`.
+///
+/// Called only when [`resolve_unix_enforced`] holds. Each grant becomes one
+/// `ResolveUnix` rule, opened once with `O_PATH`:
+///
+/// - a file grant ([`crate::SocketScope::File`]) is a rule on the socket's
+///   inode. Like every Landlock file rule it follows that inode: a server that
+///   unlinks and re-binds its socket during the session is no longer covered.
+/// - a directory grant is a rule on the directory, which Landlock applies to
+///   the whole subtree. [`crate::SocketScope::DirChildren`] is therefore
+///   enforced as its subtree here; callers that need it narrowed to direct
+///   children must mediate that themselves (nono-cli's seccomp mediation
+///   applies [`crate::UnixSocketCapability::covers`]).
+///
+/// A file grant whose socket does not exist yet gets no rule. That is a
+/// `ConnectBind` grant for a socket the sandbox binds itself, and a server
+/// created inside the sandbox's own Landlock domain stays reachable without
+/// one. A missing rule can only deny, never allow.
+fn open_unix_socket_rules(caps: &CapabilitySet) -> Result<Vec<UnixSocketRule>> {
+    let mut rules = Vec::with_capacity(caps.unix_socket_capabilities().len());
+    for cap in caps.unix_socket_capabilities() {
+        let path_fd = match open(
+            &cap.resolved,
+            OFlag::O_PATH | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(fd) => fd,
+            Err(nix::errno::Errno::ENOENT) if !cap.is_directory() => {
+                debug!(
+                    "Unix socket grant {} does not exist yet; no ResolveUnix rule \
+                     (a socket the sandbox binds itself stays reachable)",
+                    cap.resolved.display()
+                );
+                continue;
+            }
+            Err(e) => {
+                return Err(NonoError::SandboxInit(format!(
+                    "Cannot open Landlock rule path for unix socket grant {}: {}",
+                    cap.resolved.display(),
+                    e
+                )));
+            }
+        };
+        let file = std::fs::File::from(path_fd);
+        let metadata = file.metadata().map_err(|e| {
+            NonoError::SandboxInit(format!(
+                "Cannot inspect unix socket grant {}: {}",
+                cap.resolved.display(),
+                e
+            ))
+        })?;
+        // A file grant whose path is now a directory would widen to the whole
+        // subtree; refuse it, as file capabilities do.
+        if metadata.is_dir() != cap.is_directory() {
+            return Err(if cap.is_directory() {
+                NonoError::ExpectedDirectory(cap.resolved.clone())
+            } else {
+                NonoError::ExpectedFile(cap.resolved.clone())
+            });
+        }
+        rules.push(UnixSocketRule {
+            path_fd: file.into(),
+            resolved: cap.resolved.clone(),
+        });
+    }
+    Ok(rules)
+}
+
 /// Legacy check: whether the simple block-all seccomp filter can be used.
 ///
 /// Only true for plain `NetworkMode::Blocked` with no port exceptions.
@@ -895,7 +1117,7 @@ fn prepare_with_abi_inner(
         ));
     }
 
-    let handled_fs = AccessFs::from_all(target_abi);
+    let handled_fs = handled_fs_access(caps, abi);
     let needs_network_handling = tcp_network.handles_tcp()
         && (!matches!(caps.network_mode(), NetworkMode::AllowAll)
             || !caps.tcp_connect_ports().is_empty()
@@ -992,6 +1214,22 @@ fn prepare_with_abi_inner(
         });
     }
 
+    if resolve_unix_enforced(caps, abi) {
+        for rule in open_unix_socket_rules(caps)? {
+            let path_fd = move_fd_above_stdio(rule.path_fd).map_err(|e| {
+                NonoError::SandboxInit(format!(
+                    "Cannot reserve Landlock rule descriptor for unix socket grant {}: {}",
+                    rule.resolved.display(),
+                    e
+                ))
+            })?;
+            path_rules.push(PreparedPathRule {
+                path_fd,
+                allowed_access: BitFlags::from(AccessFs::ResolveUnix).bits(),
+            });
+        }
+    }
+
     Ok(PreparedLandlockSandbox {
         attr: RawLandlockRulesetAttr {
             handled_access_fs: handled_fs.bits(),
@@ -1054,7 +1292,7 @@ fn apply_with_abi_inner(
     }
 
     // Determine which access rights to handle based on ABI
-    let handled_fs = AccessFs::from_all(target_abi);
+    let handled_fs = handled_fs_access(caps, abi);
 
     debug!("Handling filesystem access: {:?}", handled_fs);
 
@@ -1282,11 +1520,12 @@ fn apply_with_abi_inner(
     // Failing silently would violate the principle of least surprise and
     // fail-secure design.
     //
-    // Pathname AF_UNIX socket grants currently enter Linux enforcement only
-    // through their implied FsCapability. Landlock PathBeneath is recursive for
-    // directory grants, so SocketScope::DirChildren and SocketScope::DirSubtree
-    // are not distinguishable on this Linux path until the seccomp AF_UNIX
-    // allowlist work enforces UnixSocketCapability::covers().
+    // Pathname AF_UNIX socket grants enter Landlock enforcement through their
+    // implied FsCapability and, on V9+ kernels with UnixSocketMediation::Pathname,
+    // as ResolveUnix rules (added after this loop). Landlock PathBeneath is
+    // recursive for directory grants, so SocketScope::DirChildren and
+    // SocketScope::DirSubtree are not distinguishable here; nono-cli's seccomp
+    // AF_UNIX mediation enforces UnixSocketCapability::covers() exactly.
     // Track device IDs of mounts already warned about to emit one warning
     // per mount, not one per capability path.
     let mut warned_unsupported_devs: std::collections::HashSet<u64> =
@@ -1345,6 +1584,22 @@ fn apply_with_abi_inner(
                     e
                 ))
             })?;
+    }
+
+    if resolve_unix_enforced(caps, abi) {
+        info!("Landlock enforces pathname AF_UNIX grants (ResolveUnix)");
+        for rule in open_unix_socket_rules(caps)? {
+            debug!("Adding ResolveUnix rule: {}", rule.resolved.display());
+            ruleset = ruleset
+                .add_rule(PathBeneath::new(rule.path_fd, AccessFs::ResolveUnix))
+                .map_err(|e| {
+                    NonoError::SandboxInit(format!(
+                        "Cannot add Landlock ResolveUnix rule for {}: {}",
+                        rule.resolved.display(),
+                        e
+                    ))
+                })?;
+        }
     }
 
     // Apply the ruleset - THIS IS IRREVERSIBLE
@@ -4020,6 +4275,418 @@ mod tests {
 
         let v6 = DetectedAbi::new(ABI::V6);
         assert!(v6.has_scoping());
+        assert!(!v6.has_resolve_unix());
+
+        // V7 (audit flags) and V8 (TSYNC) add no access rights or scopes.
+        for abi in [ABI::V7, ABI::V8] {
+            let detected = DetectedAbi::new(abi);
+            assert!(detected.has_execute(), "{abi:?} has execute");
+            assert!(detected.has_network(), "{abi:?} has network");
+            assert!(detected.has_ioctl_dev(), "{abi:?} has ioctl_dev");
+            assert!(detected.has_scoping(), "{abi:?} has scoping");
+            assert!(!detected.has_resolve_unix(), "{abi:?} lacks ResolveUnix");
+        }
+
+        let v9 = DetectedAbi::new(ABI::V9);
+        assert!(v9.has_execute());
+        assert!(v9.has_scoping());
+        assert!(v9.has_resolve_unix());
+    }
+
+    #[test]
+    fn test_has_execute_for_every_abi() {
+        // Regression: has_execute() once enumerated V3..=V6, so any newer ABI
+        // reported no execute support and command sandboxes failed closed.
+        assert!(!DetectedAbi::new(ABI::Unsupported).has_execute());
+        for abi in ABI_PROBE_ORDER {
+            let expected = abi >= ABI::V3;
+            assert_eq!(
+                DetectedAbi::new(abi).has_execute(),
+                expected,
+                "has_execute() for {abi:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_abi_probe_order_covers_every_known_abi_descending() {
+        let numbers: Vec<u32> = ABI_PROBE_ORDER
+            .iter()
+            .map(|abi| abi_version_number(*abi).expect("known ABI"))
+            .collect();
+        assert_eq!(numbers, vec![9, 8, 7, 6, 5, 4, 3, 2, 1]);
+        assert_eq!(abi_version_number(ABI::Unsupported), None);
+    }
+
+    #[test]
+    fn test_abi_for_kernel_version() {
+        assert_eq!(abi_for_kernel_version(0), ABI::Unsupported);
+        assert_eq!(abi_for_kernel_version(1), ABI::V1);
+        assert_eq!(abi_for_kernel_version(6), ABI::V6);
+        assert_eq!(abi_for_kernel_version(7), ABI::V7);
+        assert_eq!(abi_for_kernel_version(8), ABI::V8);
+        assert_eq!(abi_for_kernel_version(9), ABI::V9);
+        // Newer kernels than this build knows use the highest known ABI.
+        assert_eq!(abi_for_kernel_version(10), ABI::V9);
+        assert_eq!(abi_for_kernel_version(11), ABI::V9);
+        assert_eq!(abi_for_kernel_version(u32::MAX), ABI::V9);
+    }
+
+    #[test]
+    fn test_detected_abi_reports_newer_kernel_abi() {
+        let on_v10 = DetectedAbi::with_kernel_version(ABI::V9, Some(10));
+        assert_eq!(on_v10.abi, ABI::V9);
+        assert_eq!(on_v10.kernel_abi_version(), 10);
+        assert_eq!(on_v10.version_string(), "V9");
+        assert_eq!(format!("{on_v10}"), "Landlock V9 (kernel ABI 10)");
+
+        let same = DetectedAbi::with_kernel_version(ABI::V9, Some(9));
+        assert_eq!(same, DetectedAbi::new(ABI::V9));
+        assert_eq!(same.kernel_abi_version(), 9);
+        assert_eq!(format!("{same}"), "Landlock V9");
+
+        // A kernel version below the probed ABI is not "newer" and not shown.
+        let lower = DetectedAbi::with_kernel_version(ABI::V6, Some(5));
+        assert_eq!(lower.kernel_abi_version(), 6);
+        assert_eq!(format!("{lower}"), "Landlock V6");
+
+        let unreported = DetectedAbi::with_kernel_version(ABI::V4, None);
+        assert_eq!(unreported.kernel_abi_version(), 4);
+        assert_eq!(DetectedAbi::new(ABI::Unsupported).kernel_abi_version(), 0);
+    }
+
+    #[test]
+    fn test_detect_abi_matches_kernel_version() {
+        let Some(kernel_version) = query_kernel_abi_version() else {
+            assert!(
+                detect_abi().is_err(),
+                "no kernel ABI but detection succeeded"
+            );
+            return;
+        };
+        let detected = detect_abi().expect("kernel reports a Landlock ABI");
+        assert_eq!(detected.abi, abi_for_kernel_version(kernel_version));
+        assert_eq!(detected.kernel_abi_version(), kernel_version);
+    }
+
+    #[test]
+    fn test_handled_fs_access_resolve_unix_only_when_opted_in_on_v9() {
+        let off = CapabilitySet::new();
+        let on = CapabilitySet::new().set_unix_socket_mediation(UnixSocketMediation::Pathname);
+
+        let v9 = DetectedAbi::new(ABI::V9);
+        assert!(handled_fs_access(&on, &v9).contains(AccessFs::ResolveUnix));
+        assert_eq!(handled_fs_access(&on, &v9), AccessFs::from_all(ABI::V9));
+        // Without the opt-in a V9 kernel handles exactly what V8 did.
+        assert!(!handled_fs_access(&off, &v9).contains(AccessFs::ResolveUnix));
+        assert_eq!(handled_fs_access(&off, &v9), AccessFs::from_all(ABI::V8));
+
+        for abi in [ABI::V1, ABI::V5, ABI::V6, ABI::V7, ABI::V8] {
+            let detected = DetectedAbi::new(abi);
+            assert_eq!(handled_fs_access(&on, &detected), AccessFs::from_all(abi));
+            assert_eq!(handled_fs_access(&off, &detected), AccessFs::from_all(abi));
+            assert!(!resolve_unix_enforced(&on, &detected), "{abi:?}");
+        }
+    }
+
+    /// A directory with a listening socket at `<dir>/a.sock`, another at
+    /// `<dir>/sub/b.sock`, and a socket-free `<dir>/empty`.
+    #[cfg(target_os = "linux")]
+    struct SocketTree {
+        dir: tempfile::TempDir,
+        _listeners: Vec<std::os::unix::net::UnixListener>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl SocketTree {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().expect("tempdir");
+            std::fs::create_dir(dir.path().join("sub")).expect("create sub");
+            std::fs::create_dir(dir.path().join("empty")).expect("create empty");
+            let listeners = ["a.sock", "sub/b.sock"]
+                .iter()
+                .map(|name| {
+                    std::os::unix::net::UnixListener::bind(dir.path().join(name))
+                        .expect("bind unix socket")
+                })
+                .collect();
+            Self {
+                dir,
+                _listeners: listeners,
+            }
+        }
+
+        fn path(&self, name: &str) -> PathBuf {
+            self.dir
+                .path()
+                .canonicalize()
+                .expect("canonical tempdir")
+                .join(name)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn resolve_unix_rules(prepared: &PreparedLandlockSandbox) -> Vec<&PreparedPathRule> {
+        let resolve_unix = BitFlags::from(AccessFs::ResolveUnix).bits();
+        prepared
+            .path_rules
+            .iter()
+            .filter(|rule| rule.allowed_access & resolve_unix != 0)
+            .collect()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn fd_inode(fd: &OwnedFd) -> (u64, u64) {
+        use std::os::unix::fs::MetadataExt;
+        let file = std::fs::File::from(fd.try_clone().expect("dup rule fd"));
+        let metadata = file.metadata().expect("rule fd metadata");
+        (metadata.dev(), metadata.ino())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn path_inode(path: &Path) -> (u64, u64) {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::metadata(path).expect("path metadata");
+        (metadata.dev(), metadata.ino())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn prepared_v9_maps_each_unix_socket_grant_to_a_resolve_unix_rule() {
+        use crate::{UnixSocketCapability, UnixSocketMode};
+        let tree = SocketTree::new();
+        let mut caps =
+            CapabilitySet::new().set_unix_socket_mediation(UnixSocketMediation::Pathname);
+        caps.add_unix_socket(
+            UnixSocketCapability::new_file(tree.path("a.sock"), UnixSocketMode::Connect)
+                .expect("file grant"),
+        );
+        caps.add_unix_socket(
+            UnixSocketCapability::new_dir(tree.path("sub"), UnixSocketMode::Connect)
+                .expect("dir grant"),
+        );
+        caps.add_unix_socket(
+            UnixSocketCapability::new_dir_subtree(tree.path("empty"), UnixSocketMode::ConnectBind)
+                .expect("subtree grant"),
+        );
+        // A socket the sandbox binds itself: no inode yet, so no rule.
+        caps.add_unix_socket(
+            UnixSocketCapability::new_file(tree.path("later.sock"), UnixSocketMode::ConnectBind)
+                .expect("bind grant"),
+        );
+
+        let prepared =
+            prepare_landlock_with_abi(&caps, &DetectedAbi::new(ABI::V9)).expect("prepare policy");
+        let resolve_unix = BitFlags::from(AccessFs::ResolveUnix).bits();
+        assert_ne!(prepared.attr.handled_access_fs & resolve_unix, 0);
+
+        let rules = resolve_unix_rules(&prepared);
+        assert_eq!(rules.len(), 3, "file, dir and subtree grants");
+        for rule in &rules {
+            assert_eq!(rule.allowed_access, resolve_unix, "ResolveUnix only");
+        }
+        let targets: Vec<(u64, u64)> = rules.iter().map(|rule| fd_inode(&rule.path_fd)).collect();
+        assert_eq!(
+            targets,
+            vec![
+                path_inode(&tree.path("a.sock")),
+                path_inode(&tree.path("sub")),
+                path_inode(&tree.path("empty")),
+            ]
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn prepared_without_opt_in_or_below_v9_has_no_resolve_unix() {
+        use crate::{UnixSocketCapability, UnixSocketMode};
+        let tree = SocketTree::new();
+        let grant = UnixSocketCapability::new_file(tree.path("a.sock"), UnixSocketMode::Connect)
+            .expect("file grant");
+        let resolve_unix = BitFlags::from(AccessFs::ResolveUnix).bits();
+
+        let cases = [
+            (UnixSocketMediation::Off, ABI::V9),
+            (UnixSocketMediation::Pathname, ABI::V8),
+            (UnixSocketMediation::Pathname, ABI::V6),
+        ];
+        for (mediation, abi) in cases {
+            let mut caps = CapabilitySet::new().set_unix_socket_mediation(mediation);
+            caps.add_unix_socket(grant.clone());
+            let prepared =
+                prepare_landlock_with_abi(&caps, &DetectedAbi::new(abi)).expect("prepare policy");
+            assert_eq!(
+                prepared.attr.handled_access_fs & resolve_unix,
+                0,
+                "{mediation:?} on {abi:?} handles ResolveUnix"
+            );
+            assert!(
+                resolve_unix_rules(&prepared).is_empty(),
+                "{mediation:?} on {abi:?} built a ResolveUnix rule"
+            );
+            assert!(prepared.path_rules.is_empty());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn prepared_v9_refuses_a_file_socket_grant_that_is_now_a_directory() {
+        use crate::{CapabilitySource, SocketScope, UnixSocketCapability, UnixSocketMode};
+        let tree = SocketTree::new();
+        let mut caps =
+            CapabilitySet::new().set_unix_socket_mediation(UnixSocketMediation::Pathname);
+        // A file grant whose path was replaced by a directory would widen to
+        // the directory's whole subtree.
+        caps.add_unix_socket(UnixSocketCapability {
+            original: tree.path("sub"),
+            resolved: tree.path("sub"),
+            scope: SocketScope::File,
+            mode: UnixSocketMode::Connect,
+            source: CapabilitySource::User,
+        });
+
+        let Err(error) = prepare_landlock_with_abi(&caps, &DetectedAbi::new(ABI::V9)) else {
+            panic!("a file grant on a directory must be refused");
+        };
+        assert!(matches!(error, NonoError::ExpectedFile(_)), "{error}");
+    }
+
+    /// In a forked child, apply `caps` and try to connect to each of `paths`;
+    /// returns `(connected, errno)` per path.
+    #[cfg(target_os = "linux")]
+    fn run_pathname_connect_probe(
+        paths: &[PathBuf],
+        caps: &CapabilitySet,
+        detected: DetectedAbi,
+    ) -> Vec<(bool, i32)> {
+        let mut report_pipe = [0; 2];
+        // SAFETY: report_pipe points to two writable file descriptor slots.
+        assert_eq!(
+            unsafe { libc::pipe(report_pipe.as_mut_ptr()) },
+            0,
+            "pipe() failed"
+        );
+
+        // SAFETY: fork is used in a test helper; the child exits via _exit.
+        let child_pid = unsafe { libc::fork() };
+        assert!(child_pid >= 0, "fork() for pathname socket probe failed");
+
+        if child_pid == 0 {
+            let mut payload = vec![0_u8; paths.len() * 2];
+            match apply_auto_with_abi(caps, &detected) {
+                Ok(_) => {
+                    for (index, path) in paths.iter().enumerate() {
+                        let (connected, errno) = match std::os::unix::net::UnixStream::connect(path)
+                        {
+                            Ok(_) => (true, 0),
+                            Err(error) => (false, error.raw_os_error().unwrap_or(255)),
+                        };
+                        payload[index * 2] = if connected { 0 } else { 1 };
+                        payload[index * 2 + 1] = errno_to_u8(errno);
+                    }
+                }
+                Err(_) => payload.fill(2),
+            }
+            // SAFETY: payload is a valid buffer and report_pipe[1] is the write end.
+            let wrote = unsafe {
+                libc::write(
+                    report_pipe[1],
+                    payload.as_ptr().cast::<libc::c_void>(),
+                    payload.len(),
+                )
+            };
+            let exit_code = if wrote == isize::try_from(payload.len()).unwrap_or(-1) {
+                0
+            } else {
+                3
+            };
+            // SAFETY: _exit terminates the forked child without unwinding.
+            unsafe { libc::_exit(exit_code) };
+        }
+
+        // SAFETY: the parent no longer writes to the pipe.
+        unsafe { libc::close(report_pipe[1]) };
+        let mut status = 0;
+        // SAFETY: child_pid is the pid returned by fork in the parent.
+        assert_eq!(
+            unsafe { libc::waitpid(child_pid, &mut status, 0) },
+            child_pid
+        );
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "pathname socket probe child failed"
+        );
+
+        let mut payload = vec![0_u8; paths.len() * 2];
+        // SAFETY: payload is writable and report_pipe[0] is the read end.
+        let read = unsafe {
+            libc::read(
+                report_pipe[0],
+                payload.as_mut_ptr().cast::<libc::c_void>(),
+                payload.len(),
+            )
+        };
+        // SAFETY: the parent is done reading from the pipe.
+        unsafe { libc::close(report_pipe[0]) };
+        assert_eq!(read, isize::try_from(payload.len()).unwrap_or(-1));
+        assert!(
+            payload.iter().all(|byte| *byte != 2),
+            "sandbox could not be applied in the probe child"
+        );
+        payload
+            .chunks(2)
+            .map(|pair| (pair[0] == 0, i32::from(pair[1])))
+            .collect()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_resolve_unix_enforces_pathname_socket_grants_on_v9() {
+        use crate::{UnixSocketCapability, UnixSocketMode};
+        let detected = match detect_abi() {
+            Ok(detected) if detected.has_resolve_unix() => detected,
+            // Needs a Linux 7.1+ kernel (Landlock ABI V9).
+            _ => return,
+        };
+        let tree = SocketTree::new();
+        let targets = [tree.path("a.sock"), tree.path("sub/b.sock")];
+
+        let mut granted_a =
+            CapabilitySet::new().set_unix_socket_mediation(UnixSocketMediation::Pathname);
+        granted_a.add_unix_socket(
+            UnixSocketCapability::new_file(&targets[0], UnixSocketMode::Connect)
+                .expect("file grant"),
+        );
+        let report = run_pathname_connect_probe(&targets, &granted_a, detected);
+        assert_eq!(report[0], (true, 0), "granted socket must connect");
+        assert_eq!(
+            report[1],
+            (false, libc::EACCES),
+            "ungranted socket must be refused with EACCES"
+        );
+
+        let mut granted_sub =
+            CapabilitySet::new().set_unix_socket_mediation(UnixSocketMediation::Pathname);
+        granted_sub.add_unix_socket(
+            UnixSocketCapability::new_dir_subtree(tree.path("sub"), UnixSocketMode::Connect)
+                .expect("subtree grant"),
+        );
+        let report = run_pathname_connect_probe(&targets, &granted_sub, detected);
+        assert_eq!(report[0], (false, libc::EACCES), "a.sock is outside sub/");
+        assert_eq!(
+            report[1],
+            (true, 0),
+            "sub/b.sock is under the subtree grant"
+        );
+
+        // Without the opt-in, ResolveUnix is not handled and both connect.
+        let mut off = CapabilitySet::new();
+        off.add_unix_socket(
+            UnixSocketCapability::new_file(&targets[0], UnixSocketMode::Connect)
+                .expect("file grant"),
+        );
+        let report = run_pathname_connect_probe(&targets, &off, detected);
+        assert_eq!(report, vec![(true, 0), (true, 0)]);
     }
 
     #[test]
@@ -4538,6 +5205,13 @@ mod tests {
         assert_eq!(DetectedAbi::new(ABI::V1).version_string(), "V1");
         assert_eq!(DetectedAbi::new(ABI::V4).version_string(), "V4");
         assert_eq!(DetectedAbi::new(ABI::V6).version_string(), "V6");
+        assert_eq!(DetectedAbi::new(ABI::V7).version_string(), "V7");
+        assert_eq!(DetectedAbi::new(ABI::V8).version_string(), "V8");
+        assert_eq!(DetectedAbi::new(ABI::V9).version_string(), "V9");
+        assert_eq!(
+            DetectedAbi::new(ABI::Unsupported).version_string(),
+            "unknown"
+        );
     }
 
     #[test]
@@ -4569,6 +5243,15 @@ mod tests {
             names
                 .iter()
                 .any(|n| n == "Signal and abstract UNIX socket scoping")
+        );
+        assert!(!names.iter().any(|n| n.contains("ResolveUnix")));
+
+        let v9 = DetectedAbi::new(ABI::V9);
+        let names = v9.feature_names();
+        assert!(
+            names
+                .iter()
+                .any(|n| n == "Pathname UNIX socket resolution (ResolveUnix)")
         );
     }
 

@@ -117,6 +117,41 @@ fn af_unix_mediation_pathname_allows_connect_to_listed_socket() {
         .assert_stderr_lacks(&format!("send {socket_arg}"));
 }
 
+/// A listed socket must connect end to end, not merely escape the
+/// supervisor's denial. On Landlock V9+ kernels the session's socket grants are
+/// also enforced by Landlock (`ResolveUnix`), so a missing Landlock rule for
+/// the grant would fail this connect with EACCES after the supervisor allowed it.
+#[test]
+#[cfg(target_os = "linux")]
+fn af_unix_mediation_pathname_listed_socket_connects_end_to_end() {
+    let Some(py) = python3_bin() else {
+        eprintln!("skipping: no system python3 available");
+        return;
+    };
+
+    let t = nono_test!("af-unix-mediation-connects");
+    let sock_tmp = short_tempdir();
+    let socket_path = sock_tmp.path().join("c.sock");
+    let _listener = UnixDatagram::bind(&socket_path).expect("bind test datagram socket");
+
+    let socket_arg = socket_path.to_string_lossy().into_owned();
+    let profile = t.write_profile(
+        "af-unix-connects-test",
+        &format!(
+            r#"{{"meta":{{"name":"af-unix-connects-test"}},"workdir":{{"access":"readwrite"}},"linux":{{"af_unix_mediation":"pathname"}},"filesystem":{{"unix_socket":["{socket_arg}"]}}}}"#
+        ),
+    );
+    let py_script = format!(
+        "import socket; s=socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM); s.connect({socket_arg:?}); print('connected')"
+    );
+
+    t.run()
+        .profile(&profile)
+        .exec(Argv::new(&py).arg("-c").arg(&py_script))
+        .assert_success("connect to a listed socket succeeds")
+        .assert_stdout_contains("connected");
+}
+
 #[test]
 #[cfg(target_os = "macos")]
 fn filesystem_deny_blocks_unix_socket_connect_on_macos() {

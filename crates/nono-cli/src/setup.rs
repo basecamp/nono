@@ -205,6 +205,17 @@ impl SetupRunner {
         println!("  * Linux AF_UNIX mediation: off by default");
         println!("    - For stricter IPC isolation, set linux.af_unix_mediation = \"pathname\"");
         println!("    - Then grant required pathname sockets with filesystem.unix_socket entries");
+        if detected.has_resolve_unix() {
+            println!(
+                "    - This kernel also enforces those grants in Landlock (ResolveUnix, {})",
+                detected.version_string()
+            );
+        } else {
+            println!(
+                "    - Landlock enforcement of those grants needs ABI V9+ (Linux 7.1); \
+                 this kernel uses seccomp mediation only"
+            );
+        }
         println!(
             "    - In public-facing or privacy-sensitive deployments that keep it off, run nono inside a stronger outer boundary such as a MicroVM"
         );

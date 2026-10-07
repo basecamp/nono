@@ -45,8 +45,11 @@ Landlock capabilities have evolved across kernel versions:
 | 6.7+ | v4 | TCP `bind` and `connect` filtering |
 | 6.10+ | v5 | `IOCTL_DEV` - device ioctl filtering |
 | 6.12+ | v6 | Signal and abstract UNIX socket scoping |
+| 6.15+ | v7 | Audit logging flags (not used by nono) |
+| 7.0+ | v8 | `TSYNC`: restrict all threads (not used by nono) |
+| 7.1+ | v9 | `RESOLVE_UNIX` - pathname UNIX socket connect control |
 
-nono automatically detects the highest available ABI and uses it. On older kernels, some features are unavailable but core filesystem sandboxing still works.
+nono reads the kernel's ABI version and uses the highest ABI that both the kernel and nono support. A kernel newer than nono knows (for example ABI 10 on Linux 7.2) runs at nono's highest ABI, and `nono setup` reports both, e.g. `Landlock V9 (kernel ABI 10)`. On older kernels, some features are unavailable but core filesystem sandboxing still works.
 
 ## Access Rights Mapping
 
@@ -169,6 +172,27 @@ continues the syscall. Denied sockets do not have this race because nono returns
 `EACCES` directly and the kernel never runs the original syscall. Treat this
 mode as a strong default-deny IPC hardening layer; avoid broad socket grants for
 untrusted multi-threaded workloads.
+
+On kernels with Landlock ABI v9 (Linux 7.1+), nono also enforces the same
+grants in Landlock with `LANDLOCK_ACCESS_FS_RESOLVE_UNIX`, which the kernel
+checks when it resolves the socket path. A raced address then still has to
+resolve to a granted socket, so the race above can no longer reach a socket
+outside the grants. The kernel layer is added to seccomp mediation, not
+substituted for it:
+
+- `unix_socket` and `unix_socket_bind` grant an existing socket by its inode.
+  If a service unlinks and re-creates its socket during the session, the new
+  socket is not covered.
+- `unix_socket_dir*` and `unix_socket_subtree*` grants become a Landlock rule
+  on the directory, which covers its whole subtree; seccomp mediation still
+  narrows `unix_socket_dir*` to the directory's direct children.
+- Sockets created by the sandboxed process itself (or its children) stay
+  reachable, as with abstract socket scoping. Landlock denials return
+  `EACCES`.
+- Command sandboxes started through command policies are not covered yet.
+
+Without the opt-in, nono does not handle `RESOLVE_UNIX`, so pathname sockets
+behave the same on every kernel.
 
 High-risk socket categories include user service managers, session buses,
 keyring and credential agents, SSH/GPG agents, container runtimes, and package
