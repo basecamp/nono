@@ -3,8 +3,14 @@
 # attests build provenance, and publishes the tarballs as a prerelease tagged
 # `integration-<sha12>`.
 #
-# This is the only workflow meant to run on the fork. The upstream workflows
-# carried in .github/workflows are disabled in the fork's Actions settings.
+# rebuild-integration.yml starts it on each rebuild; start it by hand with
+# `gh workflow run build-integration.yml --ref integration`. A push does not
+# start it: a commit merged into integration is replaced by the next rebuild.
+# A failed build keeps one issue labelled integration-build open until a build
+# succeeds.
+#
+# The fork's own workflows are the only ones on integration: the rebuild
+# removes upstream's (.github/integration/rebuild).
 #
 # Verify a download with:
 #   gh attestation verify nono-integration-<sha12>-<target>.tar.gz \
@@ -15,8 +21,6 @@
 name: Build integration
 
 on:
-  push:
-    branches: [integration]
   workflow_dispatch:
 
 permissions: {}
@@ -182,3 +186,34 @@ jobs:
             --notes-file notes.md \
             --prerelease \
             --latest=false
+
+  report:
+    needs: [build, attest, release]
+    if: always() && github.repository == 'basecamp/nono' && github.ref == 'refs/heads/integration' && !cancelled()
+    name: Report
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read # check out .github/integration/issue
+      issues: write # open, comment on and close the integration-build issue
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/integration
+
+      - name: Open, update or close the issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RESULT: ${{ needs.release.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          tag="integration-${GITHUB_SHA::12}"
+          if [ "$RESULT" = success ]; then
+            .github/integration/issue integration-build success "$tag is built, attested and published ([run]($RUN_URL))."
+          else
+            .github/integration/issue integration-build failure "Building integration failed" \
+              "$(date -u +%F): building, attesting or publishing $tag (integration at ${GITHUB_SHA:0:12}) failed ([run]($RUN_URL)). No release was published; the latest integration-* release is still the newest build."
+          fi

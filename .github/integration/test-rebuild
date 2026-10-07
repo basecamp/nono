@@ -1,0 +1,139 @@
+#!/usr/bin/env bash
+# Offline test of .github/integration/rebuild against local repositories standing in for
+# upstream and the fork (nothing is fetched from or pushed to GitHub):
+#
+#   .github/integration/test-rebuild
+#
+# Cases: a rebuild that pushes (upstream's workflows removed, the fork layer and the recipe's
+# topics in, INTEGRATION.md written); a rerun that finds integration current and pushes nothing;
+# upstream moving; a topic that does not merge, and one that is missing (exit 1, a reason, nothing
+# pushed); a topic already upstream (noted, still a rebuild); a push whose lease is stale.
+# shellcheck disable=SC2015,SC2016 # `A && B || die` (die exits); backticks are Markdown
+set -euo pipefail
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+t="$(mktemp -d)"
+trap 'rm -rf "$t"' EXIT
+export GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.invalid GIT_COMMITTER_NAME=test GIT_COMMITTER_EMAIL=test@example.invalid
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+g() { git -C "$@"; }
+pass=0
+ok() { pass=$((pass + 1)); printf 'ok %s\n' "$*"; }
+die() { printf 'FAIL %s\n' "$*" >&2; exit 1; }
+
+# upstream: main with source and two workflows of its own.
+g "$t" init -q -b main up
+mkdir -p "$t/up/.github/workflows" "$t/up/src"
+printf 'one\ntwo\nthree\n' > "$t/up/src/a.txt"
+echo 'on: push' > "$t/up/.github/workflows/ci.yml"
+echo 'on: push' > "$t/up/.github/workflows/release.yml"
+g "$t/up" add -A && g "$t/up" commit -q -m 'upstream: initial'
+
+# fork: topics based on upstream main, and an integration carrying the fork layer.
+g "$t" clone -q --bare up fork.git
+g "$t" clone -q fork.git work
+w="$t/work"
+g "$w" switch -q -c fix/one main
+echo 'fix one' > "$w/src/one.txt"; g "$w" add -A; g "$w" commit -q -m 'fix one'
+g "$w" switch -q -c fix/two main
+printf 'one\nTWO\nthree\n' > "$w/src/a.txt"; g "$w" commit -q -am 'fix two'
+g "$w" switch -q -c integration main
+mkdir -p "$w/.github/integration"
+cp "$here/rebuild" "$here/issue" "$w/.github/integration/"
+printf '# recipe\n\nfix/one  Fixes one\nfix/two  Fixes `two` | pipes\n' > "$w/.github/integration/topics"
+echo 'name: build' > "$w/.github/workflows/build-integration.yml"
+echo 'name: rebuild' > "$w/.github/workflows/rebuild-integration.yml"
+g "$w" add -A; g "$w" commit -q -m 'fork layer'
+g "$w" push -q origin fix/one fix/two integration
+
+export UPSTREAM_URL="$t/up" FORK_URL="$t/fork.git"
+run() { # run ARGS...: the rebuild from the clone, stdout to $t/out, stderr to $t/err; sets rc
+  rc=0; (cd "$w" && REBUILD_REASON_FILE="$t/reason" "$w/.github/integration/rebuild" "$@") >"$t/out" 2>"$t/err" || rc=$?
+}
+tip() { g "$t/fork.git" rev-parse refs/heads/integration; }
+
+# 1. A rebuild that pushes.
+before="$(tip)"
+run --push
+[ "$rc" = 0 ] || die "1: rc=$rc $(cat "$t/err")"
+grep -qx 'changed=true' "$t/out" || die "1: not changed"
+after="$(tip)"; [ "$after" != "$before" ] || die "1: nothing pushed"
+grep -qx "sha=$after" "$t/out" || die "1: sha line is not the pushed tip"
+[ "$(g "$t/fork.git" ls-tree --name-only "$after" .github/workflows/ | sort | tr '\n' ' ')" \
+  = ".github/workflows/build-integration.yml .github/workflows/rebuild-integration.yml " ] \
+  || die "1: workflows on integration: $(g "$t/fork.git" ls-tree --name-only "$after" .github/workflows/)"
+[ "$(g "$t/fork.git" show "$after:src/a.txt")" = "$(printf 'one\nTWO\nthree')" ] || die "1: fix/two not merged"
+g "$t/fork.git" cat-file -e "$after:src/one.txt" || die "1: fix/one not merged"
+g "$t/fork.git" show "$after:INTEGRATION.md" | grep -q '| \[`fix/two`\].*| Fixes `two` \\| pipes |$' || die "1: INTEGRATION.md row"
+g "$t/fork.git" merge-base --is-ancestor "$(g "$t/up" rev-parse main)" "$after" || die "1: not on upstream main"
+ok "1: rebuild pushes upstream main + topics + fork layer, upstream workflows removed"
+
+# 2. A rerun finds it current.
+run --push
+[ "$rc" = 0 ] && grep -qx 'changed=false' "$t/out" && [ "$(tip)" = "$after" ] || die "2: rc=$rc $(cat "$t/out" "$t/err")"
+ok "2: rerun is current, pushes nothing"
+
+# 3. Upstream moves: rebuilt onto it.
+echo 'upstream two' > "$t/up/src/b.txt"; g "$t/up" add -A; g "$t/up" commit -q -m 'upstream: two'
+run --push
+[ "$rc" = 0 ] && grep -qx 'changed=true' "$t/out" || die "3: rc=$rc $(cat "$t/err")"
+g "$t/fork.git" merge-base --is-ancestor "$(g "$t/up" rev-parse main)" "$(tip)" || die "3: not rebuilt onto the new upstream main"
+ok "3: upstream moved, rebuilt onto it"
+
+# 4. A topic that does not merge stops it.
+printf 'one\nUPSTREAM\nthree\n' > "$t/up/src/a.txt"; g "$t/up" commit -q -am 'upstream: conflicts with fix/two'
+before="$(tip)"; rm -f "$t/reason"
+run --push
+[ "$rc" = 1 ] || die "4: rc=$rc"
+[ "$(tip)" = "$before" ] || die "4: pushed despite a conflict"
+grep -q '^topic branch fix/two (.*) does not merge onto upstream main .*: conflicts in src/a.txt$' "$t/reason" || die "4: reason: $(cat "$t/reason" 2>/dev/null)"
+[ "$(g "$w" worktree list | wc -l)" = 1 ] || die "4: temporary worktree left behind"
+ok "4: a conflicting topic stops the rebuild, names the files, pushes nothing"
+
+# 5. A topic missing from the fork stops it.
+g "$t/up" revert --no-edit HEAD >/dev/null
+g "$w" fetch -q origin && g "$w" switch -q --detach origin/integration
+printf 'fix/one  Fixes one\nfix/gone  Gone\n' > "$w/.github/integration/topics"
+g "$w" commit -q -am 'recipe: fix/gone' && g "$w" push -q -f origin HEAD:integration
+before="$(tip)"; rm -f "$t/reason"
+run --push
+[ "$rc" = 1 ] && [ "$(tip)" = "$before" ] || die "5: rc=$rc"
+grep -qx "topic branch fix/gone is in .github/integration/topics but not on $t/fork.git" "$t/reason" || die "5: reason: $(cat "$t/reason")"
+ok "5: a missing topic stops the rebuild, pushes nothing"
+
+# 6. A topic already upstream is noted, and the rebuild goes on.
+g "$t/up" fetch -q "$t/fork.git" fix/one && g "$t/up" cherry-pick FETCH_HEAD >/dev/null
+printf 'fix/one  Fixes one\n' > "$w/.github/integration/topics"
+g "$w" commit -q -am 'recipe: fix/one only' && g "$w" push -q -f origin HEAD:integration
+run --push
+[ "$rc" = 0 ] && grep -q 'note: fix/one .* changes nothing on upstream main' "$t/err" || die "6: rc=$rc $(cat "$t/err")"
+ok "6: a topic already upstream is noted"
+
+# 7. --layer takes the recipe from another commit; without --push nothing moves.
+g "$w" fetch -q origin && g "$w" switch -q --detach origin/integration
+printf 'fix/two  Fixes two\n' > "$w/.github/integration/topics"; g "$w" commit -q -am 'proposed recipe'
+before="$(tip)"
+run --layer HEAD
+[ "$rc" = 0 ] && [ "$(tip)" = "$before" ] || die "7: rc=$rc"
+sha="$(sed -n 's/^sha=//p' "$t/out")"
+[ "$(g "$w" show "$sha:src/a.txt")" = "$(printf 'one\nTWO\nthree')" ] \
+  && [ "$(g "$w" show "$sha:INTEGRATION.md" | grep -c '^| \[`fix/')" = 1 ] || die "7: --layer recipe not used"
+ok "7: --layer uses the proposed recipe; no --push, nothing pushed"
+
+# 8. A push whose lease went stale (integration moved meanwhile) is refused.
+echo 'upstream three' > "$t/up/src/c.txt"; g "$t/up" add -A; g "$t/up" commit -q -m 'upstream: three'
+# Move the fork's integration after the rebuild fetched it: a pre-push hook in the clone does it
+# (--git-dir: a hook runs with the pushing repository's GIT_DIR set).
+cat > "$w/.git/hooks/pre-push" <<EOF
+#!/bin/sh
+git --git-dir="$t/fork.git" update-ref refs/heads/integration refs/heads/fix/one
+EOF
+chmod +x "$w/.git/hooks/pre-push"
+rm -f "$t/reason"
+run --push
+rm -f "$w/.git/hooks/pre-push"
+[ "$rc" = 1 ] && grep -q '^pushing .* to integration was refused' "$t/reason" || die "8: rc=$rc $(cat "$t/reason" 2>/dev/null)"
+[ "$(tip)" = "$(g "$t/fork.git" rev-parse refs/heads/fix/one)" ] || die "8: the lease did not hold"
+ok "8: a stale lease refuses the push"
+
+echo "all $pass passed"
