@@ -2258,6 +2258,7 @@ fn endpoint_rule_to_proxy(
     ProxyEndpointPolicyRule {
         method: rule.method.clone(),
         path: rule.path.clone(),
+        query: rule.query.clone(),
         backend: rule.backend.clone(),
         reason: rule.reason.clone(),
         timeout_secs: resolve_approval_timeout(config, rule.backend.as_deref(), rule.timeout_secs),
@@ -4373,6 +4374,7 @@ mod tests {
                                 allow: vec![EndpointRuleConfig {
                                     method: "GET".to_string(),
                                     path: "/repos/example/**".to_string(),
+                                    query: Default::default(),
                                     backend: None,
                                     reason: None,
                                     timeout_secs: None,
@@ -4592,12 +4594,29 @@ mod tests {
     }
 
     #[test]
+    fn tool_sandbox_proxy_endpoint_policy_carries_query_matchers() {
+        let policy: EndpointPolicyConfig = serde_json::from_str(
+            r#"{"default":"deny","allow":[{"method":"GET","path":"/r/info/refs","query":{"service":"git-upload-pack"}}]}"#,
+        )
+        .expect("endpoint policy with query parses");
+        let proxy_policy =
+            endpoint_policy_to_proxy_policy(&CommandPoliciesConfig::default(), &policy);
+        assert_eq!(
+            proxy_policy.allow[0].query.get("service"),
+            Some(&nono_proxy::config::QueryValueMatcher::Glob(
+                "git-upload-pack".to_string()
+            ))
+        );
+    }
+
+    #[test]
     fn tool_sandbox_proxy_endpoint_policy_preserves_deny_and_approve_routes() {
         let policy = EndpointPolicyConfig {
             default: PolicyDecisionConfig::Decision(PolicyDecision::Deny),
             deny: vec![EndpointRuleConfig {
                 method: "DELETE".to_string(),
                 path: "/repos/example/**".to_string(),
+                query: Default::default(),
                 backend: None,
                 reason: Some("destructive endpoint".to_string()),
                 timeout_secs: None,
@@ -4605,6 +4624,7 @@ mod tests {
             approve: vec![EndpointRuleConfig {
                 method: "POST".to_string(),
                 path: "/repos/example/*/issues".to_string(),
+                query: Default::default(),
                 backend: Some("terminal".to_string()),
                 reason: None,
                 timeout_secs: None,
@@ -4612,6 +4632,7 @@ mod tests {
             allow: vec![EndpointRuleConfig {
                 method: "GET".to_string(),
                 path: "/repos/example/**".to_string(),
+                query: Default::default(),
                 backend: None,
                 reason: None,
                 timeout_secs: None,
@@ -4668,6 +4689,7 @@ mod tests {
                                 approve: vec![EndpointRuleConfig {
                                     method: "POST".to_string(),
                                     path: "/v1/tasks/*/comments".to_string(),
+                                    query: Default::default(),
                                     backend: None,
                                     reason: Some("comment write".to_string()),
                                     timeout_secs: Some(5),

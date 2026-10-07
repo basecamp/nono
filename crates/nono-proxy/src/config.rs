@@ -1049,12 +1049,45 @@ impl Default for EndpointPolicyDefault {
 pub struct EndpointPolicyRule {
     pub method: String,
     pub path: String,
+    /// Query-parameter matchers, keyed by parameter name (see
+    /// [`QueryValueMatcher`]). Every named parameter must be present. In an
+    /// allow or approve rule every value of a repeated parameter must match;
+    /// in a deny rule one matching value is enough. Empty: the query string
+    /// is not looked at.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub query: std::collections::BTreeMap<String, QueryValueMatcher>,
     #[serde(default)]
     pub backend: Option<String>,
     #[serde(default)]
     pub reason: Option<String>,
     #[serde(default)]
     pub timeout_secs: Option<u64>,
+}
+
+/// What a query parameter's value must be: one glob, or any of several
+/// (`{"any": [...]}`). Globs are matched against the percent-decoded value;
+/// `*` matches any run of characters, `/` included.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum QueryValueMatcher {
+    Glob(String),
+    Any(QueryAnyMatcher),
+}
+
+/// `{"any": [glob, ...]}`: the value matches one of the globs.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QueryAnyMatcher {
+    pub any: Vec<String>,
+}
+
+impl QueryValueMatcher {
+    fn globs(&self) -> Vec<&str> {
+        match self {
+            Self::Glob(glob) => vec![glob.as_str()],
+            Self::Any(any) => any.any.iter().map(String::as_str).collect(),
+        }
+    }
 }
 
 /// Explicit L7 endpoint policy for a route.
@@ -1098,6 +1131,11 @@ struct CompiledPolicyRule {
     method: String,
     path: String,
     matcher: globset::GlobMatcher,
+    /// Query matchers: parameter name and the globs any of which a value may
+    /// match. Empty: the query string is not looked at.
+    query: Vec<(String, Vec<globset::GlobMatcher>)>,
+    /// `?name=glob&...` for the rule label; empty without query matchers.
+    query_label: String,
     backend: Option<String>,
     reason: Option<String>,
     timeout_secs: Option<u64>,
@@ -1244,6 +1282,7 @@ impl CompiledEndpointPolicy {
             .map(|rule| EndpointPolicyRule {
                 method: rule.method.clone(),
                 path: rule.path.clone(),
+                query: Default::default(),
                 backend: None,
                 reason: None,
                 timeout_secs: None,
@@ -1311,23 +1350,33 @@ impl CompiledEndpointPolicy {
             };
         }
         let normalized = normalize_path(path);
-        if let Some(rule) = first_policy_match(&self.deny, method, &normalized) {
+        let query = parse_query_params(path);
+        if let Some(rule) = first_policy_match(&self.deny, method, &normalized, &query, true) {
             return EndpointPolicyOutcome::Deny {
                 reason: rule.reason.as_deref(),
-                rule_label: format!("endpoint_policy.deny[{} {}]", rule.method, rule.path),
+                rule_label: format!(
+                    "endpoint_policy.deny[{} {}{}]",
+                    rule.method, rule.path, rule.query_label
+                ),
             };
         }
-        if let Some(rule) = first_policy_match(&self.approve, method, &normalized) {
+        if let Some(rule) = first_policy_match(&self.approve, method, &normalized, &query, false) {
             return EndpointPolicyOutcome::Approve {
                 backend: rule.backend.as_deref(),
                 reason: rule.reason.as_deref(),
                 timeout_secs: rule.timeout_secs,
-                rule_label: format!("endpoint_policy.approve[{} {}]", rule.method, rule.path),
+                rule_label: format!(
+                    "endpoint_policy.approve[{} {}{}]",
+                    rule.method, rule.path, rule.query_label
+                ),
             };
         }
-        if let Some(rule) = first_policy_match(&self.allow, method, &normalized) {
+        if let Some(rule) = first_policy_match(&self.allow, method, &normalized, &query, false) {
             return EndpointPolicyOutcome::Allow {
-                rule_label: format!("endpoint_policy.allow[{} {}]", rule.method, rule.path),
+                rule_label: format!(
+                    "endpoint_policy.allow[{} {}{}]",
+                    rule.method, rule.path, rule.query_label
+                ),
             };
         }
 
@@ -1356,10 +1405,50 @@ fn compile_policy_rules(rules: &[EndpointPolicyRule]) -> Result<Vec<CompiledPoli
             .literal_separator(true)
             .build()
             .map_err(|e| format!("invalid endpoint path pattern '{}': {}", rule.path, e))?;
+        let mut query = Vec::with_capacity(rule.query.len());
+        let mut query_label = String::new();
+        for (name, matcher) in &rule.query {
+            if name.is_empty() || name.chars().any(char::is_control) {
+                return Err(format!(
+                    "invalid query parameter name {name:?} in endpoint rule '{} {}'",
+                    rule.method, rule.path
+                ));
+            }
+            let globs = matcher.globs();
+            if globs.is_empty() {
+                return Err(format!(
+                    "query parameter '{name}' in endpoint rule '{} {}' has an empty `any` list",
+                    rule.method, rule.path
+                ));
+            }
+            let mut matchers = Vec::with_capacity(globs.len());
+            for value in &globs {
+                let glob = GlobBuilder::new(value)
+                    .literal_separator(false)
+                    .build()
+                    .map_err(|e| {
+                        format!("invalid query value pattern '{value}' for '{name}': {e}")
+                    })?;
+                matchers.push(glob.compile_matcher());
+            }
+            query_label.push(if query_label.is_empty() { '?' } else { '&' });
+            query_label.push_str(name);
+            query_label.push('=');
+            if globs.len() == 1 {
+                query_label.push_str(globs[0]);
+            } else {
+                query_label.push('{');
+                query_label.push_str(&globs.join(","));
+                query_label.push('}');
+            }
+            query.push((name.clone(), matchers));
+        }
         compiled.push(CompiledPolicyRule {
             method: rule.method.clone(),
             path: rule.path.clone(),
             matcher: glob.compile_matcher(),
+            query,
+            query_label,
             backend: rule.backend.clone(),
             reason: rule.reason.clone(),
             timeout_secs: rule.timeout_secs,
@@ -1372,10 +1461,93 @@ fn first_policy_match<'a>(
     rules: &'a [CompiledPolicyRule],
     method: &str,
     normalized_path: &str,
+    query: &Option<QueryParams>,
+    deny: bool,
 ) -> Option<&'a CompiledPolicyRule> {
     rules.iter().find(|r| {
         (r.method == "*" || r.method.eq_ignore_ascii_case(method))
             && r.matcher.is_match(normalized_path)
+            && query_matches(&r.query, query, deny)
+    })
+}
+
+/// Decoded query parameters: each name with its values in order.
+type QueryParams = std::collections::HashMap<String, Vec<String>>;
+
+/// The request's query parameters, percent- and `+`-decoded. `None` when the
+/// query cannot be read the one way an upstream would: a malformed `%`
+/// escape, a value that is not UTF-8, a control character, or a `;` (which
+/// some servers treat as a separator).
+fn parse_query_params(path: &str) -> Option<QueryParams> {
+    let mut params = QueryParams::new();
+    let Some((_, query)) = path.split_once('?') else {
+        return Some(params);
+    };
+    let query = query.split('#').next().unwrap_or(query);
+    if query.contains(';') {
+        return None;
+    }
+    for pair in query.split('&').filter(|pair| !pair.is_empty()) {
+        let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+        let name = decode_query_component(name)?;
+        let value = decode_query_component(value)?;
+        params.entry(name).or_default().push(value);
+    }
+    Some(params)
+}
+
+fn decode_query_component(raw: &str) -> Option<String> {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' => {
+                let hex = bytes.get(i + 1..i + 3)?;
+                let hex = std::str::from_utf8(hex).ok()?;
+                out.push(u8::from_str_radix(hex, 16).ok()?);
+                i += 3;
+            }
+            byte => {
+                out.push(byte);
+                i += 1;
+            }
+        }
+    }
+    let decoded = String::from_utf8(out).ok()?;
+    (!decoded.chars().any(char::is_control)).then_some(decoded)
+}
+
+/// Whether `query` satisfies a rule's query matchers. Every named parameter
+/// must be present. An allow or approve rule needs every value of it to match
+/// (a repeated parameter cannot slip a second value past the rule); a deny
+/// rule needs one. A query that cannot be read matches no allow or approve
+/// rule with query matchers and every deny rule with them.
+fn query_matches(
+    matchers: &[(String, Vec<globset::GlobMatcher>)],
+    query: &Option<QueryParams>,
+    deny: bool,
+) -> bool {
+    if matchers.is_empty() {
+        return true;
+    }
+    let Some(params) = query else {
+        return deny;
+    };
+    matchers.iter().all(|(name, globs)| {
+        let Some(values) = params.get(name) else {
+            return false;
+        };
+        let value_matches = |value: &String| globs.iter().any(|glob| glob.is_match(value));
+        if deny {
+            values.iter().any(value_matches)
+        } else {
+            values.iter().all(value_matches)
+        }
     })
 }
 
@@ -1999,6 +2171,7 @@ mod tests {
             deny: vec![EndpointPolicyRule {
                 method: "POST".to_string(),
                 path: "/v1/tasks/*/comments".to_string(),
+                query: Default::default(),
                 backend: None,
                 reason: Some("blocked".to_string()),
                 timeout_secs: None,
@@ -2006,6 +2179,7 @@ mod tests {
             approve: vec![EndpointPolicyRule {
                 method: "POST".to_string(),
                 path: "/v1/tasks/*/comments".to_string(),
+                query: Default::default(),
                 backend: Some("terminal".to_string()),
                 reason: None,
                 timeout_secs: Some(5),
@@ -2013,6 +2187,7 @@ mod tests {
             allow: vec![EndpointPolicyRule {
                 method: "POST".to_string(),
                 path: "/v1/tasks/*/comments".to_string(),
+                query: Default::default(),
                 backend: None,
                 reason: None,
                 timeout_secs: None,
@@ -2038,6 +2213,7 @@ mod tests {
             allow: vec![EndpointPolicyRule {
                 method: "GET".to_string(),
                 path: "/repos/*".to_string(),
+                query: Default::default(),
                 backend: None,
                 reason: None,
                 timeout_secs: None,
@@ -2058,6 +2234,222 @@ mod tests {
             compiled.evaluate("GET", "/repos/a/b/c/d"),
             EndpointPolicyOutcome::Deny { .. }
         ));
+    }
+
+    fn git_policy() -> CompiledEndpointPolicy {
+        let rule = |method: &str, path: &str, service: QueryValueMatcher| EndpointPolicyRule {
+            method: method.to_string(),
+            path: path.to_string(),
+            query: [("service".to_string(), service)].into_iter().collect(),
+            backend: None,
+            reason: None,
+            timeout_secs: None,
+        };
+        CompiledEndpointPolicy::compile(
+            Some(&EndpointPolicyConfig {
+                default: EndpointPolicyDefault::default(),
+                deny: vec![rule(
+                    "*",
+                    "/acme/*/info/refs",
+                    QueryValueMatcher::Glob("git-receive-*".to_string()),
+                )],
+                approve: Vec::new(),
+                allow: vec![
+                    rule(
+                        "GET",
+                        "/acme/*/info/refs",
+                        QueryValueMatcher::Glob("git-upload-pack".to_string()),
+                    ),
+                    rule(
+                        "GET",
+                        "/acme/widget.git/info/refs",
+                        QueryValueMatcher::Any(QueryAnyMatcher {
+                            any: vec![
+                                "git-upload-pack".to_string(),
+                                "git-receive-pack".to_string(),
+                            ],
+                        }),
+                    ),
+                ],
+            }),
+            &[],
+        )
+        .unwrap()
+    }
+
+    fn allowed(policy: &CompiledEndpointPolicy, method: &str, path: &str) -> bool {
+        matches!(
+            policy.evaluate(method, path),
+            EndpointPolicyOutcome::Allow { .. }
+        )
+    }
+
+    #[test]
+    fn query_matcher_allows_only_the_named_value() {
+        let p = git_policy();
+        assert!(allowed(
+            &p,
+            "GET",
+            "/acme/gems.git/info/refs?service=git-upload-pack"
+        ));
+        assert!(!allowed(
+            &p,
+            "GET",
+            "/acme/gems.git/info/refs?service=git-receive-pack"
+        ));
+        assert!(!allowed(&p, "GET", "/acme/gems.git/info/refs"));
+        assert!(!allowed(&p, "GET", "/acme/gems.git/info/refs?service="));
+    }
+
+    #[test]
+    fn query_matcher_any_of_several_values() {
+        let p = git_policy();
+        // The session repository: the deny rule names receive-pack for every
+        // repository, and deny wins, so the narrow allow never sees it.
+        match p.evaluate("GET", "/acme/widget.git/info/refs?service=git-receive-pack") {
+            EndpointPolicyOutcome::Deny { rule_label, .. } => {
+                assert_eq!(
+                    rule_label,
+                    "endpoint_policy.deny[* /acme/*/info/refs?service=git-receive-*]"
+                );
+            }
+            other => panic!("expected the deny rule, got {other:?}"),
+        }
+        let only_allow = CompiledEndpointPolicy::compile(
+            Some(&EndpointPolicyConfig {
+                default: EndpointPolicyDefault::default(),
+                deny: Vec::new(),
+                approve: Vec::new(),
+                allow: vec![EndpointPolicyRule {
+                    method: "GET".to_string(),
+                    path: "/acme/widget.git/info/refs".to_string(),
+                    query: [(
+                        "service".to_string(),
+                        QueryValueMatcher::Any(QueryAnyMatcher {
+                            any: vec![
+                                "git-upload-pack".to_string(),
+                                "git-receive-pack".to_string(),
+                            ],
+                        }),
+                    )]
+                    .into_iter()
+                    .collect(),
+                    backend: None,
+                    reason: None,
+                    timeout_secs: None,
+                }],
+            }),
+            &[],
+        )
+        .unwrap();
+        match only_allow.evaluate("GET", "/acme/widget.git/info/refs?service=git-receive-pack") {
+            EndpointPolicyOutcome::Allow { rule_label } => assert_eq!(
+                rule_label,
+                "endpoint_policy.allow[GET /acme/widget.git/info/refs?service={git-upload-pack,git-receive-pack}]"
+            ),
+            other => panic!("expected allow, got {other:?}"),
+        }
+        assert!(!allowed(
+            &only_allow,
+            "GET",
+            "/acme/widget.git/info/refs?service=git-archive"
+        ));
+    }
+
+    /// A repeated parameter cannot slip a second value past an allow rule,
+    /// and one matching value is enough for a deny rule.
+    #[test]
+    fn query_matcher_repeated_parameter() {
+        let p = git_policy();
+        assert!(!allowed(
+            &p,
+            "GET",
+            "/acme/gems.git/info/refs?service=git-upload-pack&service=git-receive-pack"
+        ));
+        assert!(matches!(
+            p.evaluate(
+                "GET",
+                "/acme/gems.git/info/refs?service=x&service=git-receive-pack"
+            ),
+            EndpointPolicyOutcome::Deny { .. }
+        ));
+    }
+
+    /// Encodings are decoded before matching, and a query the upstream could
+    /// read another way (bad escape, `;`, control byte) matches no allow rule
+    /// with query matchers and every deny rule with them.
+    #[test]
+    fn query_matcher_decodes_and_fails_closed() {
+        let p = git_policy();
+        assert!(allowed(
+            &p,
+            "GET",
+            "/acme/gems.git/info/refs?ser%76ice=git%2Dupload-pack"
+        ));
+        assert!(matches!(
+            p.evaluate(
+                "GET",
+                "/acme/gems.git/info/refs?service=git%2dreceive%2Dpack"
+            ),
+            EndpointPolicyOutcome::Deny { .. }
+        ));
+        for odd in [
+            "/acme/gems.git/info/refs?service=git-upload-pack%",
+            "/acme/gems.git/info/refs?service=git-upload-pack;service=git-receive-pack",
+            "/acme/gems.git/info/refs?service=git-upload-pack%0a",
+            "/acme/gems.git/info/refs?service=%ff",
+        ] {
+            assert!(!allowed(&p, "GET", odd), "{odd}");
+            assert!(
+                matches!(p.evaluate("GET", odd), EndpointPolicyOutcome::Deny { .. }),
+                "{odd}"
+            );
+        }
+        // A fragment is not part of the query.
+        assert!(allowed(
+            &p,
+            "GET",
+            "/acme/gems.git/info/refs?service=git-upload-pack#x"
+        ));
+    }
+
+    #[test]
+    fn query_matcher_parses_from_json_and_rejects_empty_any() {
+        let rule: EndpointPolicyRule = serde_json::from_str(
+            r#"{"method":"GET","path":"/x","query":{"a":"v*","b":{"any":["1","2"]}}}"#,
+        )
+        .unwrap();
+        assert_eq!(rule.query["a"], QueryValueMatcher::Glob("v*".to_string()));
+        assert!(
+            serde_json::from_str::<EndpointPolicyRule>(
+                r#"{"method":"GET","path":"/x","query":{"a":{"all":["1"]}}}"#
+            )
+            .is_err()
+        );
+        let empty = EndpointPolicyConfig {
+            default: EndpointPolicyDefault::default(),
+            deny: Vec::new(),
+            approve: Vec::new(),
+            allow: vec![EndpointPolicyRule {
+                method: "GET".to_string(),
+                path: "/x".to_string(),
+                query: [(
+                    "a".to_string(),
+                    QueryValueMatcher::Any(QueryAnyMatcher { any: vec![] }),
+                )]
+                .into_iter()
+                .collect(),
+                backend: None,
+                reason: None,
+                timeout_secs: None,
+            }],
+        };
+        assert!(CompiledEndpointPolicy::compile(Some(&empty), &[]).is_err());
+        // Without query matchers a rule ignores the query, as before.
+        let plain: EndpointPolicyRule =
+            serde_json::from_str(r#"{"method":"GET","path":"/x"}"#).unwrap();
+        assert!(plain.query.is_empty());
+        assert!(!serde_json::to_string(&plain).unwrap().contains("query"));
     }
 
     #[test]
@@ -2110,6 +2502,7 @@ mod tests {
             deny: vec![EndpointPolicyRule {
                 method: "*".to_string(),
                 path: "/v1/secrets/**".to_string(),
+                query: Default::default(),
                 backend: None,
                 reason: None,
                 timeout_secs: None,
@@ -2179,6 +2572,7 @@ mod tests {
             approve: vec![EndpointPolicyRule {
                 method: "GET".to_string(),
                 path: "/v1/secrets/**".to_string(),
+                query: Default::default(),
                 backend: Some("terminal".to_string()),
                 reason: Some("sensitive endpoint".to_string()),
                 timeout_secs: Some(10),

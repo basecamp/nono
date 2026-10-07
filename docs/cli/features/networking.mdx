@@ -354,6 +354,23 @@ nono run --allow-cwd --credential github \
 
 When any endpoint rules are configured for a service, requests that don't match receive `403 Forbidden` and are logged in the audit trail.
 
+An `endpoint_policy` rule (in `deny`, `approve` or `allow`) can also match the query string. `query` maps a parameter name to a glob, or to `{"any": [globs]}`, matched against the percent-decoded value:
+
+```json
+{
+  "endpoint_policy": {
+    "default": { "decision": "deny" },
+    "allow": [
+      { "method": "GET", "path": "/acme/*/info/refs", "query": { "service": "git-upload-pack" } },
+      { "method": "GET", "path": "/acme/widget.git/info/refs",
+        "query": { "service": { "any": ["git-upload-pack", "git-receive-pack"] } } }
+    ]
+  }
+}
+```
+
+Every named parameter must be present. In an allow or approve rule, every value of a repeated parameter must match, so `?service=git-upload-pack&service=git-receive-pack` matches neither rule above; in a deny rule one matching value is enough. A query that an upstream could read another way (a malformed `%` escape, a value that is not UTF-8, a control character, a `;`) matches no allow or approve rule with `query`, and every deny rule with it. A rule without `query` ignores the query string, as before.
+
 ### Profile Configuration
 
 Endpoint rules can also be defined on custom credentials within profiles:

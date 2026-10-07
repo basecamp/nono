@@ -2417,6 +2417,7 @@ mod tests {
                 allow: vec![EndpointPolicyRule {
                     method: "GET".to_string(),
                     path: "/repos/my-org/**".to_string(),
+                    query: Default::default(),
                     backend: None,
                     reason: None,
                     timeout_secs: None,

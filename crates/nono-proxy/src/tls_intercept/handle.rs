@@ -2866,6 +2866,7 @@ mod tests {
                 approve: vec![crate::config::EndpointPolicyRule {
                     method: "GET".to_string(),
                     path: "/gated".to_string(),
+                    query: Default::default(),
                     backend: None,
                     reason: None,
                     timeout_secs: Some(2),

@@ -954,6 +954,9 @@ pub struct EndpointPolicyConfig {
 pub struct EndpointRuleConfig {
     pub method: String,
     pub path: String,
+    /// Query-parameter matchers (nono_proxy::config::EndpointPolicyRule::query).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub query: std::collections::BTreeMap<String, nono_proxy::config::QueryValueMatcher>,
     #[serde(default)]
     pub backend: Option<String>,
     #[serde(default)]
@@ -6373,6 +6376,7 @@ mod tests {
                                     allow: vec![EndpointRuleConfig {
                                         method: "GET".to_string(),
                                         path: "/repos/nolabs-ai/nono/issues".to_string(),
+                                        query: Default::default(),
                                         backend: None,
                                         reason: None,
                                         timeout_secs: Some(0),

@@ -2104,6 +2104,16 @@
       "properties": {
         "method": { "type": "string" },
         "path": { "type": "string" },
+        "query": {
+          "type": "object",
+          "description": "Query-parameter matchers keyed by parameter name: a glob, or {\"any\": [globs]}. Every named parameter must be present; in an allow or approve rule every value of a repeated parameter must match, in a deny rule one is enough.",
+          "additionalProperties": {
+            "oneOf": [
+              { "type": "string" },
+              { "type": "object", "additionalProperties": false, "required": ["any"], "properties": { "any": { "type": "array", "minItems": 1, "items": { "type": "string" } } } }
+            ]
+          }
+        },
         "backend": { "$ref": "#/$defs/CommandPolicyIdentifier" },
         "reason": { "type": "string" },
         "timeout_secs": { "type": "integer", "minimum": 1 }

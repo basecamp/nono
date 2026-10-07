@@ -2525,6 +2525,76 @@ mod tests {
         handle.shutdown();
     }
 
+    /// An endpoint rule's query matcher is enforced end to end on the reverse
+    /// proxy: the named value is forwarded, another value of the same
+    /// parameter is refused and never reaches the upstream.
+    #[tokio::test]
+    async fn reverse_proxy_endpoint_query_matcher_gates_the_request() {
+        async fn status_for(port: u16, token: &str, target: &str) -> String {
+            let creds = {
+                use base64::Engine;
+                base64::engine::general_purpose::STANDARD.encode(format!("nono:{token}"))
+            };
+            let request = format!(
+                "GET {target} HTTP/1.1\r\nHost: 127.0.0.1\r\nProxy-Authorization: Basic {creds}\r\n\r\n"
+            );
+            let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .unwrap();
+            client.write_all(request.as_bytes()).await.unwrap();
+            let mut buf = [0u8; 1024];
+            let n = client.read(&mut buf).await.unwrap_or(0);
+            String::from_utf8_lossy(&buf[..n])
+                .lines()
+                .next()
+                .unwrap_or("")
+                .to_string()
+        }
+        let upstream = spawn_mock_upstream().await;
+        let mut route = declarative_route(&format!("http://{upstream}"));
+        route.endpoint_policy = Some(crate::config::EndpointPolicyConfig {
+            default: crate::config::EndpointPolicyDefault::default(),
+            deny: Vec::new(),
+            approve: Vec::new(),
+            allow: vec![crate::config::EndpointPolicyRule {
+                method: "GET".to_string(),
+                path: "/repo/info/refs".to_string(),
+                query: [(
+                    "service".to_string(),
+                    crate::config::QueryValueMatcher::Glob("git-upload-pack".to_string()),
+                )]
+                .into_iter()
+                .collect(),
+                backend: None,
+                reason: None,
+                timeout_secs: None,
+            }],
+        });
+        let config = ProxyConfig {
+            routes: vec![route],
+            allowed_hosts: vec!["127.0.0.1".to_string()],
+            require_auth: true,
+            ..Default::default()
+        };
+        let handle = start(config).await.unwrap();
+        let token = handle.token.to_string();
+        let refused = status_for(
+            handle.port,
+            &token,
+            "/svc/repo/info/refs?service=git-receive-pack",
+        )
+        .await;
+        assert!(refused.contains("403"), "{refused:?}");
+        let allowed = status_for(
+            handle.port,
+            &token,
+            "/svc/repo/info/refs?service=git-upload-pack",
+        )
+        .await;
+        assert!(allowed.contains("200"), "{allowed:?}");
+        handle.shutdown();
+    }
+
     #[tokio::test]
     async fn reverse_proxy_rate_limit_rejects_after_burst() {
         // A route with a RouteRateLimiter of burst 1 and no delay budget lets
@@ -2813,6 +2883,7 @@ mod tests {
             deny: vec![EndpointPolicyRule {
                 method: "*".to_string(),
                 path: "/v1/secrets/**".to_string(),
+                query: Default::default(),
                 backend: None,
                 reason: None,
                 timeout_secs: None,
