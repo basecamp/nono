@@ -180,6 +180,25 @@ fn strip_proxy_headers(header_bytes: &[u8]) -> Vec<u8> {
     out
 }
 
+/// `header_bytes` with every `Host` line removed and `Host: {authority}` first.
+fn replace_host_header(header_bytes: &[u8], authority: &str) -> Vec<u8> {
+    let mut out = format!("Host: {authority}\r\n").into_bytes();
+    let mut rest = header_bytes;
+    while !rest.is_empty() {
+        let end = rest
+            .windows(2)
+            .position(|w| w == b"\r\n")
+            .map_or(rest.len(), |i| i + 2);
+        let (line, tail) = rest.split_at(end);
+        let name = line.split(|&b| b == b':').next().unwrap_or_default();
+        if !name.trim_ascii().eq_ignore_ascii_case(b"host") {
+            out.extend_from_slice(line);
+        }
+        rest = tail;
+    }
+    out
+}
+
 /// Credential names every route on `host_port` redeems. The absolute-form path
 /// has only the target host to go on, so when several routes share an upstream it
 /// must not grant one route's phantoms to another: intersect instead.
@@ -2134,6 +2153,13 @@ async fn handle_forward_http(
             _ => (strip_proxy_headers(header_bytes), false),
         };
 
+    // The upstream is the request-target's authority, so that is the Host it
+    // is told: a client-supplied Host naming another site would otherwise
+    // pick a virtual host the filter never checked on a shared front end.
+    let filtered_headers = replace_host_header(
+        &filtered_headers,
+        &reverse::format_host_header(UpstreamScheme::Http, &host, port),
+    );
     let mut request_bytes = Vec::with_capacity(origin_line.len() + filtered_headers.len() + 64);
     request_bytes.extend_from_slice(origin_line.as_bytes());
     request_bytes.extend_from_slice(&filtered_headers);
@@ -5073,6 +5099,62 @@ mod tests {
             rewrite_absolute_to_origin_form("POST http://host.example:8080/x HTTP/1.0").unwrap(),
             "POST /x HTTP/1.0\r\n"
         );
+    }
+
+    #[test]
+    fn replace_host_header_sets_the_target_authority() {
+        let headers =
+            b"Host: api.github.com\r\nAccept: */*\r\nhost: second.example\r\nX-Host: kept\r\n";
+        let out = String::from_utf8(replace_host_header(headers, "127.0.0.1:8080")).unwrap();
+        assert_eq!(
+            out,
+            "Host: 127.0.0.1:8080\r\nAccept: */*\r\nX-Host: kept\r\n"
+        );
+        assert_eq!(
+            String::from_utf8(replace_host_header(b"", "example.com")).unwrap(),
+            "Host: example.com\r\n"
+        );
+    }
+
+    /// A cleartext absolute-form request is forwarded to the URL's host and
+    /// tells it that host, whatever Host header the client sent.
+    #[tokio::test]
+    async fn forward_http_host_header_is_the_target_not_the_clients() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+
+        let (origin_addr, origin_rx) = spawn_echo_origin().await;
+        let config = ProxyConfig {
+            allowed_hosts: vec!["127.0.0.1".to_string()],
+            ..ProxyConfig::default()
+        };
+        let handle = start(config).await.unwrap();
+        let token = handle.token.to_string();
+        let mut stream = TcpStream::connect(("127.0.0.1", handle.port))
+            .await
+            .unwrap();
+        let creds = {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode(format!("nono:{}", token))
+        };
+        let request = format!(
+            "GET http://127.0.0.1:{}/x HTTP/1.1\r\nHost: api.github.com\r\nProxy-Authorization: Basic {}\r\n\r\n",
+            origin_addr.port(),
+            creds
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        let received = origin_rx.await.unwrap();
+        assert!(
+            received.contains(&format!("Host: 127.0.0.1:{}\r\n", origin_addr.port())),
+            "upstream must be told its own authority: {received:?}"
+        );
+        assert!(
+            !received.to_lowercase().contains("api.github.com"),
+            "the client's Host must not reach the upstream: {received:?}"
+        );
+        handle.shutdown();
     }
 
     #[test]
