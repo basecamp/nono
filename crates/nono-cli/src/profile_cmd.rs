@@ -974,6 +974,13 @@ pub(crate) fn cmd_show(args: ProfileShowArgs) -> Result<()> {
             theme::fg(&format!("{mode:?}"), t.text)
         );
     }
+    if let Some(policy) = profile.linux.sandbox_policy {
+        println!(
+            "  {} {}",
+            theme::fg("Linux sandbox policy:", t.subtext),
+            theme::fg(&format!("{policy:?}"), t.text)
+        );
+    }
 
     // Session lifecycle hooks. These are merged through `extends`, so show
     // the resolved before/after values rather than the profile's raw input.
@@ -1292,8 +1299,15 @@ fn profile_to_json(
         security.insert("wsl2_proxy_policy".into(), serde_json::json!(v));
     }
     val["security"] = serde_json::Value::Object(security);
+    let mut linux = serde_json::Map::new();
     if let Some(v) = profile.linux.af_unix_mediation {
-        val["linux"] = serde_json::json!({ "af_unix_mediation": v });
+        linux.insert("af_unix_mediation".into(), serde_json::json!(v));
+    }
+    if let Some(v) = profile.linux.sandbox_policy {
+        linux.insert("sandbox_policy".into(), serde_json::json!(v));
+    }
+    if !linux.is_empty() {
+        val["linux"] = serde_json::Value::Object(linux);
     }
 
     // Filesystem (canonical schema).
@@ -1545,6 +1559,12 @@ pub(crate) fn cmd_diff(args: ProfileDiffArgs) -> Result<()> {
         "linux.af_unix_mediation",
         &p1.linux.af_unix_mediation.map(|v| format!("{v:?}")),
         &p2.linux.af_unix_mediation.map(|v| format!("{v:?}")),
+        t,
+    );
+    any_diff |= diff_scalar_option(
+        "linux.sandbox_policy",
+        &p1.linux.sandbox_policy.map(|v| format!("{v:?}")),
+        &p2.linux.sandbox_policy.map(|v| format!("{v:?}")),
         t,
     );
     any_diff |= diff_scalar_option(
@@ -2096,6 +2116,11 @@ fn diff_to_json(name1: &str, name2: &str, p1: &Profile, p2: &Profile) -> serde_j
                 "profile1": p1.linux.af_unix_mediation,
                 "profile2": p2.linux.af_unix_mediation,
                 "changed": p1.linux.af_unix_mediation != p2.linux.af_unix_mediation,
+            },
+            "sandbox_policy": {
+                "profile1": p1.linux.sandbox_policy,
+                "profile2": p2.linux.sandbox_policy,
+                "changed": p1.linux.sandbox_policy != p2.linux.sandbox_policy,
             }
         },
         "filesystem": diff_fs_json(&p1.filesystem, &p2.filesystem),
