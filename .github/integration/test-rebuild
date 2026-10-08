@@ -7,7 +7,8 @@
 # Cases: a rebuild that pushes (upstream's workflows removed, the fork layer and the recipe's
 # topics in, INTEGRATION.md written); a rerun that finds integration current and pushes nothing;
 # upstream moving; a topic that does not merge, and one that is missing (exit 1, a reason, nothing
-# pushed); a topic already upstream (noted, still a rebuild); a push whose lease is stale.
+# pushed); a topic already upstream (noted, still a rebuild); a push whose lease is stale; a layer
+# without the recipe.
 # shellcheck disable=SC2015,SC2016 # `A && B || die` (die exits); backticks are Markdown
 set -euo pipefail
 
@@ -135,5 +136,15 @@ rm -f "$w/.git/hooks/pre-push"
 [ "$rc" = 1 ] && grep -q '^pushing .* to integration was refused' "$t/reason" || die "8: rc=$rc $(cat "$t/reason" 2>/dev/null)"
 [ "$(tip)" = "$(g "$t/fork.git" rev-parse refs/heads/fix/one)" ] || die "8: the lease did not hold"
 ok "8: a stale lease refuses the push"
+
+# 9. A layer without the recipe (deleted or renamed) stops it: it never rebuilds with no topics.
+rm -f "$w/.git/hooks/pre-push"
+g "$w" switch -q --detach "$sha"   # case 7's rebuild: the fork layer, recipe included
+g "$w" rm -q .github/integration/topics && g "$w" commit -q -m 'recipe removed'
+before="$(tip)"; rm -f "$t/reason"
+run --push --layer HEAD
+[ "$rc" = 1 ] && [ "$(tip)" = "$before" ] || die "9: rc=$rc $(cat "$t/err")"
+grep -q '^cannot read .github/integration/topics' "$t/reason" || die "9: reason: $(cat "$t/reason" 2>/dev/null)"
+ok "9: a layer without the recipe stops the rebuild, pushes nothing"
 
 echo "all $pass passed"

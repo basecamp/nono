@@ -59,12 +59,25 @@ jobs:
           gh auth setup-git
           .github/integration/rebuild --push | tee -a "$GITHUB_OUTPUT"
 
+      # Whenever integration's tip has no release and no build queued or running, not only when this
+      # run changed it: a dispatch that failed after an earlier push is retried by the next run.
       - name: Start the build
-        if: steps.rebuild.outputs.changed == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-        run: gh workflow run build-integration.yml --ref integration
+          SHA: ${{ steps.rebuild.outputs.sha }}
+        run: |
+          set -euo pipefail
+          tag="integration-${SHA:0:12}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "$tag is already built"
+          elif [ -n "$(gh run list --workflow build-integration.yml --commit "$SHA" --limit 20 \
+                         --json status --jq '.[] | select(.status != "completed") | .status')" ]; then
+            echo "a build of ${SHA:0:12} is queued or running"
+          else
+            gh workflow run build-integration.yml --ref integration
+            echo "started build-integration.yml on ${SHA:0:12}"
+          fi
 
       - name: Reason
         id: reason

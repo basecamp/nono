@@ -25,8 +25,11 @@ on:
 
 permissions: {}
 
+# One build at a time: builds report to one shared issue, so an older build finishing after a
+# newer one must not close the issue the newer one opened. A build queued behind another replaces
+# any older one still waiting (the newer integration supersedes it).
 concurrency:
-  group: build-integration-${{ github.sha }}
+  group: build-integration
   cancel-in-progress: false
 
 env:

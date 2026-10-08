@@ -64,7 +64,10 @@ base="$(git -C "$repo" rev-parse refs/integration/upstream)"
 layer_commit="$(git -C "$repo" rev-parse --verify -q "${layer:-refs/integration/old}^{commit}")" \
   || { say "--layer $layer: no such commit in $repo"; exit 2; }
 
-# The recipe: "<branch> <description>" lines; blank lines and # comments skipped.
+# The recipe: "<branch> <description>" lines; blank lines and # comments skipped. Read whole
+# first: a recipe that cannot be read stops the rebuild, never reads as one with no topics.
+recipe="$(git -C "$repo" show "$layer_commit:$RECIPE" 2>/dev/null)" \
+  || fail "cannot read $RECIPE in ${layer:-$BRANCH} ${layer_commit:0:12}: nothing rebuilt"
 topics=() descs=()
 while IFS= read -r line || [ -n "$line" ]; do
   case "$line" in ''|'#'*) continue ;; esac
@@ -73,7 +76,7 @@ while IFS= read -r line || [ -n "$line" ]; do
   [[ "$t" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ && "$t" != *..* && "$t" != *.lock && "$t" != */ ]] \
     || fail "$RECIPE: '$t' is not a branch name"
   topics+=("$t") descs+=("$d")
-done < <(git -C "$repo" show "$layer_commit:$RECIPE")
+done <<<"$recipe"
 
 if [ "${#topics[@]}" -gt 0 ]; then
   specs=()
