@@ -1,0 +1,15 @@
+# The topic branches `integration` carries, merged onto upstream nolabs-ai/nono `main` in this
+# order by .github/integration/rebuild. One per line: the branch, then what it fixes (Markdown,
+# copied into INTEGRATION.md). Each branch is based on upstream `main`.
+#
+# A branch here that is missing or does not merge stops the rebuild: nothing is pushed or built,
+# and an issue stays open until a rebuild succeeds. Drop a line when its fix lands upstream.
+#
+# Not carried:
+#   fix/credential-capture-owned-children  superseded by nolabs-ai/nono#2073, which fixes
+#     nolabs-ai/nono#1620 and also covers supervisor credential sources (the branch is kept)
+
+fix/supervisor-audit-rate-limited-capability-requests  Remainder of nolabs-ai/nono#2043 after #2047: capability requests refused by the approval rate limiter left no audit record
+fix/drain-command-proxy-audit  Follow-up to nolabs-ai/nono#1981: command-scoped proxy audit events were never drained into the session audit record
+fix/profile-show-sandbox-policy  `nono profile show` / `profile diff` omitted `linux.sandbox_policy` in text and JSON
+fix/claude-securestorage-config-dir  nolabs-ai/nono#1950: export empty `CLAUDE_SECURESTORAGE_CONFIG_DIR` alongside the injected `CLAUDE_CONFIG_DIR`
