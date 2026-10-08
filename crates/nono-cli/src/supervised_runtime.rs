@@ -33,6 +33,9 @@ pub(crate) struct SupervisedRuntimeContext<'a> {
     pub(crate) trust: &'a TrustLaunchOptions,
     pub(crate) proxy: Option<&'a ProxyLaunchOptions>,
     pub(crate) proxy_handle: Option<&'a nono_proxy::server::ProxyHandle>,
+    /// Per-command (scoped) proxies. Their audit buffers are drained into the
+    /// session record alongside the session proxy's.
+    pub(crate) scoped_proxy_handles: &'a [nono_proxy::server::ProxyHandle],
     pub(crate) executable_identity: Option<&'a ExecutableIdentity>,
     pub(crate) audit_signer: Option<&'a AuditSigner>,
     pub(crate) redaction_policy: &'a nono::ScrubPolicy,
@@ -220,6 +223,7 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
         trust,
         proxy,
         proxy_handle,
+        scoped_proxy_handles,
         executable_identity,
         audit_signer,
         redaction_policy,
@@ -482,6 +486,7 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
         supervisor_network_audit_events: supervisor_network_audit_events.as_ref(),
         audit_integrity_enabled: !rollback.no_audit_integrity,
         proxy_handle,
+        scoped_proxy_handles,
         executable_identity,
         audit_signer,
         redaction_policy,

@@ -787,6 +787,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
                 trust,
                 proxy,
                 proxy_handle: proxy_handle.as_ref(),
+                scoped_proxy_handles: &scoped_proxy_handles,
                 executable_identity: executable_identity.as_ref(),
                 audit_signer: audit_signer.as_ref(),
                 redaction_policy: &flags.redaction_policy,
