@@ -13,3 +13,4 @@ fix/supervisor-audit-rate-limited-capability-requests  Remainder of nolabs-ai/no
 fix/drain-command-proxy-audit  Follow-up to nolabs-ai/nono#1981: command-scoped proxy audit events were never drained into the session audit record
 fix/profile-show-sandbox-policy  `nono profile show` / `profile diff` omitted `linux.sandbox_policy` in text and JSON
 fix/claude-securestorage-config-dir  nolabs-ai/nono#1950: export empty `CLAUDE_SECURESTORAGE_CONFIG_DIR` alongside the injected `CLAUDE_CONFIG_DIR`
+metadata-ops-confine  nolabs-ai/nono#914: Landlock does not mediate chmod/utime; `linux.metadata_mediation = "write_grants"` confines them to write grants
