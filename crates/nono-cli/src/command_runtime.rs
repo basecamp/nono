@@ -390,6 +390,15 @@ pub(crate) fn run_wrap(wrap_args: WrapArgs, silent: bool) -> Result<()> {
     }
 
     #[cfg(target_os = "linux")]
+    if prepared.metadata_mediation.is_write_grants() {
+        return Err(NonoError::ConfigParse(
+            "nono wrap does not support linux.metadata_mediation = \"write_grants\" because \
+             direct exec cannot run the seccomp supervisor. Use `nono run` instead."
+                .to_string(),
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
     if prepared.proc_comm_notify {
         return Err(NonoError::ConfigParse(
             "nono wrap does not support NVIDIA GPU thread-name mediation because direct \

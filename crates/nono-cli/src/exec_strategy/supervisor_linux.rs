@@ -1051,6 +1051,12 @@ pub(super) fn handle_combined_notification(
     ipc_denials: &mut Vec<nono::diagnostic::IpcDenialRecord>,
 ) -> Result<()> {
     let notif = nono::sandbox::recv_notif(notify_fd)?;
+    if nono::sandbox::is_metadata_syscall(notif.data.nr) {
+        if !config.seccomp_policy.metadata_mediation {
+            return nono::sandbox::deny_notif(notify_fd, notif.id);
+        }
+        return handle_metadata_notification(notify_fd, initial_caps, state.denials, notif);
+    }
     if matches!(
         notif.data.nr,
         nono::sandbox::SYS_OPENAT | nono::sandbox::SYS_OPENAT2
@@ -1075,6 +1081,112 @@ pub(super) fn handle_combined_notification(
             ipc_denials,
             notif,
         )
+    }
+}
+
+/// Decision for a trapped file mode or timestamp change.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) enum MetadataDecision {
+    Allow,
+    Deny(DenialReason),
+}
+
+/// Decide a mode or timestamp change under `linux.metadata_mediation =
+/// "write_grants"`: allowed where Landlock would allow a write.
+///
+/// That is a target within a write grant (directory grants cover their
+/// subtree, file grants only themselves, as in Landlock), or one the child
+/// named through a descriptor it holds open for writing, which passed
+/// Landlock's write check when it was opened or came from outside the
+/// sandbox. Protected roots need no separate check: setup refuses any grant
+/// that overlaps one, and nothing inside one can be opened for writing.
+pub(super) fn decide_metadata_target(
+    path: Option<&std::path::Path>,
+    via_writable_fd: bool,
+    initial_caps: &[InitialCapability],
+) -> MetadataDecision {
+    if via_writable_fd {
+        return MetadataDecision::Allow;
+    }
+    let Some(path) = path else {
+        // A pipe, socket or anonymous inode reached without write access.
+        return MetadataDecision::Deny(DenialReason::PolicyBlocked);
+    };
+    match match_initial_capability(path, AccessMode::Write, initial_caps) {
+        InitialCapabilityMatch::Sufficient(_) => MetadataDecision::Allow,
+        InitialCapabilityMatch::Insufficient(_) => {
+            MetadataDecision::Deny(DenialReason::InsufficientAccess)
+        }
+        InitialCapabilityMatch::None => MetadataDecision::Deny(DenialReason::PolicyBlocked),
+    }
+}
+
+/// Handle a trapped file mode or timestamp change.
+///
+/// The supervisor resolves the target to a descriptor of its own, decides on
+/// that inode, applies the change to the same descriptor and completes the
+/// notification with the result; the child's own syscall never runs (see
+/// `nono::sandbox::read_metadata_request`). Denials return `EACCES`, as a
+/// Landlock denial would; every other result is the kernel's own.
+fn handle_metadata_notification(
+    notify_fd: std::os::fd::RawFd,
+    initial_caps: &[InitialCapability],
+    denials: &mut Vec<DenialRecord>,
+    notif: nono::sandbox::SeccompNotif,
+) -> Result<()> {
+    use nono::sandbox::{
+        notif_id_valid, read_metadata_request, respond_notif_errno, respond_notif_success,
+    };
+
+    let request = read_metadata_request(&notif);
+    // Everything just read from the child's memory, procfs entries and
+    // descriptor table belongs to the thread still waiting on this
+    // notification only if it is still pending.
+    if !notif_id_valid(notify_fd, notif.id)? {
+        debug!("Seccomp metadata notification expired");
+        return Ok(());
+    }
+    let request = match request {
+        Ok(request) => request,
+        Err(error) => {
+            return respond_notif_errno(
+                notify_fd,
+                notif.id,
+                error.raw_os_error().unwrap_or(libc::EACCES),
+            );
+        }
+    };
+    if let Some(target) = request.target()
+        && let MetadataDecision::Deny(reason) =
+            decide_metadata_target(target.path(), target.via_writable_fd(), initial_caps)
+    {
+        debug!(
+            "Seccomp: {:?} on {} denied outside write grants",
+            request.change(),
+            target
+                .path()
+                .map_or_else(|| "<no path>".into(), |path| path.display().to_string()),
+        );
+        record_denial(
+            denials,
+            DenialRecord {
+                path: target.path().map_or_else(
+                    || std::path::PathBuf::from("<no path>"),
+                    |path| path.to_path_buf(),
+                ),
+                access: AccessMode::Write,
+                reason,
+            },
+        );
+        return respond_notif_errno(notify_fd, notif.id, libc::EACCES);
+    }
+    match request.apply() {
+        Ok(()) => respond_notif_success(notify_fd, notif.id),
+        Err(error) => respond_notif_errno(
+            notify_fd,
+            notif.id,
+            error.raw_os_error().unwrap_or(libc::EIO),
+        ),
     }
 }
 
@@ -1835,6 +1947,98 @@ mod tests {
         ));
     }
 
+    // --- decide_metadata_target tests ----------------------------------------
+    //
+    // Mode and timestamp changes are allowed where Landlock would allow a
+    // write, and nowhere else.
+
+    fn metadata_caps() -> Vec<InitialCapability> {
+        vec![
+            InitialCapability {
+                path: PathBuf::from("/work/own"),
+                access: AccessMode::ReadWrite,
+                is_file: false,
+            },
+            InitialCapability {
+                path: PathBuf::from("/work/shared"),
+                access: AccessMode::Read,
+                is_file: false,
+            },
+            InitialCapability {
+                path: PathBuf::from("/work/shared/drop"),
+                access: AccessMode::Write,
+                is_file: false,
+            },
+            InitialCapability {
+                path: PathBuf::from("/work/notes.txt"),
+                access: AccessMode::ReadWrite,
+                is_file: true,
+            },
+        ]
+    }
+
+    fn decide(path: &str, via_writable_fd: bool) -> MetadataDecision {
+        decide_metadata_target(Some(Path::new(path)), via_writable_fd, &metadata_caps())
+    }
+
+    #[test]
+    fn metadata_changes_are_allowed_within_write_grants() {
+        for path in [
+            "/work/own",
+            "/work/own/f",
+            "/work/own/deep/er/f",
+            "/work/shared/drop/f",
+            "/work/notes.txt",
+        ] {
+            assert_eq!(decide(path, false), MetadataDecision::Allow, "{path}");
+        }
+    }
+
+    #[test]
+    fn metadata_changes_are_denied_outside_write_grants() {
+        assert_eq!(
+            decide("/work/shared/f", false),
+            MetadataDecision::Deny(DenialReason::InsufficientAccess)
+        );
+        for path in [
+            "/work",
+            "/work/other/f",
+            // Component boundaries, not string prefixes.
+            "/work/owner/f",
+            "/work/notes.txt.bak",
+            // A file grant covers no "subpath".
+            "/work/notes.txt/x",
+            "/etc/passwd",
+        ] {
+            assert_eq!(
+                decide(path, false),
+                MetadataDecision::Deny(DenialReason::PolicyBlocked),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn metadata_changes_through_a_writable_descriptor_are_allowed() {
+        // Opening it for writing already passed Landlock, or the descriptor
+        // came from outside the sandbox (an inherited redirect, say).
+        assert_eq!(decide("/elsewhere/log", true), MetadataDecision::Allow);
+        assert_eq!(
+            decide_metadata_target(None, true, &metadata_caps()),
+            MetadataDecision::Allow
+        );
+    }
+
+    #[test]
+    fn metadata_changes_to_pathless_objects_need_a_writable_descriptor() {
+        // Pipes, sockets, anonymous inodes, unlinked files, and files reached
+        // through another mount namespace all arrive without a path.
+        assert_eq!(
+            decide_metadata_target(None, false, &metadata_caps()),
+            MetadataDecision::Deny(DenialReason::PolicyBlocked)
+        );
+    }
+
     // --- decide_network_notification tests (issue #685, #1901) --------------
     //
     // These exercise the seccomp network supervisor. Key invariants:
@@ -1926,6 +2130,7 @@ mod tests {
                     proxy_fallback: true,
                     af_unix_mediation: true,
                     proc_comm_notify: false,
+                    metadata_mediation: false,
                 },
                 tool_sandbox_runtime: None,
             }
@@ -1944,6 +2149,7 @@ mod tests {
                 proxy_fallback: true,
                 af_unix_mediation: false,
                 proc_comm_notify: false,
+                metadata_mediation: false,
             };
             config
         }
@@ -2056,6 +2262,7 @@ mod tests {
                 proxy_fallback: false,
                 af_unix_mediation: true,
                 proc_comm_notify: false,
+                metadata_mediation: false,
             };
             config
         }
@@ -2380,6 +2587,7 @@ mod tests {
                 proxy_fallback,
                 af_unix_mediation,
                 proc_comm_notify: false,
+                metadata_mediation: false,
             };
             let unix = libc::AF_UNIX as u16;
             let inet = libc::AF_INET as u16;

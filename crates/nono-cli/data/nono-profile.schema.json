@@ -659,6 +659,13 @@
           ],
           "description": "Opt-in pathname AF_UNIX mediation. 'off' preserves compatibility. 'pathname' requires explicit filesystem.unix_socket* grants for pathname Unix socket connect/bind."
         },
+        "metadata_mediation": {
+          "oneOf": [
+            { "$ref": "#/$defs/LinuxMetadataMediation" },
+            { "type": "null" }
+          ],
+          "description": "Opt-in file mode and timestamp mediation. Landlock does not mediate chmod/utimensat and their relatives, so with 'off' (default) a sandboxed process can change the mode bits and timestamps of any file it can name. 'write_grants' allows those changes only within write grants, or through a descriptor the process holds open for writing."
+        },
         "sandbox_policy": {
           "oneOf": [
             { "$ref": "#/$defs/LinuxSandboxPolicy" },
@@ -672,6 +679,11 @@
       "type": "string",
       "enum": ["off", "pathname"],
       "description": "Linux pathname AF_UNIX mediation mode."
+    },
+    "LinuxMetadataMediation": {
+      "type": "string",
+      "enum": ["off", "write_grants"],
+      "description": "Linux file mode and timestamp mediation mode."
     },
     "LinuxSandboxPolicy": {
       "type": "string",

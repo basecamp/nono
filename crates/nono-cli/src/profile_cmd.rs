@@ -967,6 +967,13 @@ pub(crate) fn cmd_show(args: ProfileShowArgs) -> Result<()> {
             theme::fg(&format!("{policy:?}"), t.text)
         );
     }
+    if let Some(mode) = profile.linux.metadata_mediation {
+        println!(
+            "  {} {}",
+            theme::fg("Linux metadata mediation:", t.subtext),
+            theme::fg(&format!("{mode:?}"), t.text)
+        );
+    }
     if let Some(mode) = profile.linux.af_unix_mediation {
         println!(
             "  {} {}",
@@ -1314,6 +1321,10 @@ fn profile_to_json(
         "bypass_protection": profile.filesystem.bypass_protection,
         "suppress_save_prompt": profile.filesystem.suppress_save_prompt,
     });
+    // Merged into whatever `linux` object the lines above built.
+    if let Some(v) = profile.linux.metadata_mediation {
+        val["linux"]["metadata_mediation"] = serde_json::json!(v);
+    }
 
     // Groups and commands are emitted only when populated, so default-empty
     // profiles don't carry noise. This matches the canonical input shape.
@@ -1539,6 +1550,12 @@ pub(crate) fn cmd_diff(args: ProfileDiffArgs) -> Result<()> {
         "wsl2_proxy_policy",
         &p1.security.wsl2_proxy_policy.map(|v| format!("{v:?}")),
         &p2.security.wsl2_proxy_policy.map(|v| format!("{v:?}")),
+        t,
+    );
+    any_diff |= diff_scalar_option(
+        "linux.metadata_mediation",
+        &p1.linux.metadata_mediation.map(|v| format!("{v:?}")),
+        &p2.linux.metadata_mediation.map(|v| format!("{v:?}")),
         t,
     );
     any_diff |= diff_scalar_option(
@@ -2092,6 +2109,11 @@ fn diff_to_json(name1: &str, name2: &str, p1: &Profile, p2: &Profile) -> serde_j
             "changed": p1.security.wsl2_proxy_policy != p2.security.wsl2_proxy_policy,
         },
         "linux": {
+            "metadata_mediation": {
+                "profile1": p1.linux.metadata_mediation,
+                "profile2": p2.linux.metadata_mediation,
+                "changed": p1.linux.metadata_mediation != p2.linux.metadata_mediation,
+            },
             "af_unix_mediation": {
                 "profile1": p1.linux.af_unix_mediation,
                 "profile2": p2.linux.af_unix_mediation,

@@ -691,6 +691,16 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
     }
 
     #[cfg(target_os = "linux")]
+    if flags.metadata_mediation.is_write_grants() && nono::sandbox::is_wsl2() {
+        return Err(NonoError::SandboxInit(
+            "WSL2: linux.metadata_mediation = \"write_grants\" requires seccomp user \
+             notification, but WSL2 reports EBUSY for seccomp notify listeners. Disable \
+             metadata mediation or run on native Linux."
+                .to_string(),
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
     if flags.proc_comm_notify && nono::sandbox::is_wsl2() {
         return Err(NonoError::SandboxInit(
             "WSL2: NVIDIA GPU thread-name mediation requires seccomp user notification, \
@@ -743,6 +753,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
             proxy_fallback: seccomp_proxy_fallback,
             af_unix_mediation: flags.af_unix_mediation.is_pathname(),
             proc_comm_notify: flags.proc_comm_notify,
+            metadata_mediation: flags.metadata_mediation.is_write_grants(),
         },
         #[cfg(target_os = "linux")]
         sandbox_policy: flags.sandbox_policy,

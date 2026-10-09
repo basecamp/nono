@@ -1648,6 +1648,39 @@ pub const SYS_SENDMSG: i32 = libc::SYS_sendmsg as i32;
 #[cfg(target_os = "linux")]
 pub const SYS_SENDMMSG: i32 = libc::SYS_sendmmsg as i32;
 
+// File mode and timestamp syscalls (public for the CLI supervisor handler).
+// Landlock does not mediate them; see `with_metadata_notifications`.
+pub const SYS_FCHMOD: i32 = libc::SYS_fchmod as i32;
+pub const SYS_FCHMODAT: i32 = libc::SYS_fchmodat as i32;
+/// `fchmodat2(2)` (Linux 6.6). One number on every architecture; not yet in `libc`.
+pub const SYS_FCHMODAT2: i32 = 452;
+pub const SYS_UTIMENSAT: i32 = libc::SYS_utimensat as i32;
+// Legacy forms that only x86_64 still carries; aarch64 has just the *at variants.
+#[cfg(target_arch = "x86_64")]
+pub const SYS_CHMOD: i32 = libc::SYS_chmod as i32;
+#[cfg(target_arch = "x86_64")]
+pub const SYS_UTIME: i32 = libc::SYS_utime as i32;
+#[cfg(target_arch = "x86_64")]
+pub const SYS_UTIMES: i32 = libc::SYS_utimes as i32;
+#[cfg(target_arch = "x86_64")]
+pub const SYS_FUTIMESAT: i32 = libc::SYS_futimesat as i32;
+
+/// Every native syscall that changes a file's mode bits or timestamps.
+#[cfg(target_arch = "x86_64")]
+pub const METADATA_SYSCALLS: &[i32] = &[
+    SYS_CHMOD,
+    SYS_FCHMOD,
+    SYS_FCHMODAT,
+    SYS_FCHMODAT2,
+    SYS_UTIME,
+    SYS_UTIMES,
+    SYS_FUTIMESAT,
+    SYS_UTIMENSAT,
+];
+/// Every native syscall that changes a file's mode bits or timestamps.
+#[cfg(target_arch = "aarch64")]
+pub const METADATA_SYSCALLS: &[i32] = &[SYS_FCHMOD, SYS_FCHMODAT, SYS_FCHMODAT2, SYS_UTIMENSAT];
+
 /// struct open_how from <linux/openat2.h>
 ///
 /// Used by openat2() syscall. args[2] is a pointer to this struct, NOT the flags integer.
@@ -2680,6 +2713,18 @@ pub fn respond_notif_errno(notify_fd: std::os::fd::RawFd, notif_id: u64, errno: 
     Ok(())
 }
 
+/// Complete a seccomp notification with a return value of 0.
+///
+/// For syscalls the supervisor has performed on the child's behalf: the
+/// child's own syscall never runs and returns 0.
+///
+/// # Errors
+///
+/// Returns an error if the ioctl fails.
+pub fn respond_notif_success(notify_fd: std::os::fd::RawFd, notif_id: u64) -> Result<()> {
+    respond_notif_errno(notify_fd, notif_id, 0)
+}
+
 /// Continue a seccomp notification, letting the child's original syscall run.
 ///
 /// This resumes the original syscall with its original userspace arguments.
@@ -3433,12 +3478,82 @@ pub fn prepare_seccomp_af_unix_filter() -> PreparedSeccompNotifyFilter {
     }
 }
 
+/// Pre-build a notification program that traps only the file mode and
+/// timestamp syscalls (see [`PreparedSeccompNotifyFilter::with_metadata_notifications`]),
+/// for sessions that mediate those without mediating any network syscall.
+#[must_use]
+pub fn prepare_seccomp_metadata_filter() -> PreparedSeccompNotifyFilter {
+    let allow_all = vec![SockFilterInsn {
+        code: BPF_RET | BPF_K,
+        jt: 0,
+        jf: 0,
+        k: SECCOMP_RET_ALLOW,
+    }];
+    PreparedSeccompNotifyFilter {
+        filter: prepend_seccomp_arch_guard_vec(allow_all, SECCOMP_RET_ERRNO | libc::EPERM as u32),
+    }
+    .with_metadata_notifications()
+}
+
+/// Build `ld [nr]; jeq nr_0..nr_n -> USER_NOTIF`, falling through to the
+/// instruction after the notify return when no number matches.
+fn notify_on_syscalls(syscalls: &[i32]) -> Vec<SockFilterInsn> {
+    let count = syscalls.len();
+    let mut filter = Vec::with_capacity(count + 2);
+    filter.push(SockFilterInsn {
+        code: BPF_LD | BPF_W | BPF_ABS,
+        jt: 0,
+        jf: 0,
+        k: SECCOMP_DATA_NR_OFFSET,
+    });
+    for (index, &nr) in syscalls.iter().enumerate() {
+        // The notify return sits right after the last comparison: the
+        // comparison at `index` jumps over the `count - index - 1` after it.
+        let remaining = (count - index - 1) as u8;
+        let last = index + 1 == count;
+        filter.push(SockFilterInsn {
+            code: BPF_JMP | BPF_JEQ | BPF_K,
+            jt: remaining,
+            jf: u8::from(last),
+            k: nr as u32,
+        });
+    }
+    filter.push(SockFilterInsn {
+        code: BPF_RET | BPF_K,
+        jt: 0,
+        jf: 0,
+        k: SECCOMP_RET_USER_NOTIF,
+    });
+    filter
+}
+
 /// A seccomp notification program prepared before raw clone.
 pub struct PreparedSeccompNotifyFilter {
     filter: ArchGuarded<Vec<SockFilterInsn>>,
 }
 
 impl PreparedSeccompNotifyFilter {
+    /// Add file mode and timestamp notifications to this program.
+    ///
+    /// Landlock does not mediate `chmod(2)`, `utimensat(2)` or their
+    /// relatives, so a sandboxed process can change the mode bits and
+    /// timestamps of any file it can name. Trapping them lets the supervisor
+    /// emulate each call against its own write-grant policy (see
+    /// `sandbox::metadata`).
+    ///
+    /// Unlike the openat notifier, this filter restricts, so it must not be
+    /// evaded through another ABI: a non-native syscall is denied with `EPERM`,
+    /// as in the network filters this composes with. The original program and
+    /// its relative jumps are retained unchanged.
+    #[must_use]
+    pub fn with_metadata_notifications(self) -> Self {
+        let mut filter = notify_on_syscalls(METADATA_SYSCALLS);
+        filter.extend_from_slice(self.filter.as_slice());
+        Self {
+            filter: prepend_seccomp_arch_guard_vec(filter, SECCOMP_RET_ERRNO | libc::EPERM as u32),
+        }
+    }
+
     /// Add filesystem notifications to this network notification program.
     ///
     /// Linux permits only one NEW_LISTENER filter per thread. A combined
@@ -5353,6 +5468,133 @@ mod tests {
                 SECCOMP_RET_ERRNO | libc::EPERM as u32
             );
         }
+    }
+
+    /// Syscalls whose decisions a metadata layer must leave to the program
+    /// underneath it.
+    fn non_metadata_syscalls() -> Vec<i32> {
+        vec![
+            SYS_OPENAT,
+            SYS_OPENAT2,
+            SYS_SOCKET,
+            SYS_SOCKETPAIR,
+            SYS_CONNECT,
+            SYS_BIND,
+            SYS_SENDTO,
+            SYS_SENDMSG,
+            SYS_SENDMMSG,
+            SYS_IO_URING_SETUP,
+            libc::SYS_read as i32,
+            libc::SYS_write as i32,
+            libc::SYS_execve as i32,
+            libc::SYS_flock as i32,
+            libc::SYS_fchown as i32,
+            libc::SYS_fchownat as i32,
+            libc::SYS_fstat as i32,
+        ]
+    }
+
+    #[test]
+    fn metadata_syscalls_cover_every_mode_and_time_entry_point() {
+        let mut expected = vec![
+            libc::SYS_fchmod as i32,
+            libc::SYS_fchmodat as i32,
+            452, // fchmodat2
+            libc::SYS_utimensat as i32,
+        ];
+        #[cfg(target_arch = "x86_64")]
+        expected.extend([
+            libc::SYS_chmod as i32,
+            libc::SYS_utime as i32,
+            libc::SYS_utimes as i32,
+            libc::SYS_futimesat as i32,
+        ]);
+        let mut actual = METADATA_SYSCALLS.to_vec();
+        actual.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn metadata_notifications_trap_mode_and_time_syscalls_only() {
+        let filters = [
+            ("metadata only", prepare_seccomp_metadata_filter(), None),
+            (
+                "af_unix",
+                prepare_seccomp_af_unix_filter().with_metadata_notifications(),
+                Some(prepare_seccomp_af_unix_filter()),
+            ),
+            (
+                "proxy",
+                prepare_seccomp_proxy_filter(true).with_metadata_notifications(),
+                Some(prepare_seccomp_proxy_filter(true)),
+            ),
+        ];
+        for (label, combined, original) in filters {
+            for &nr in METADATA_SYSCALLS {
+                assert_eq!(
+                    evaluate_static_bpf(combined.filter.as_slice(), nr, [0; 6]),
+                    SECCOMP_RET_USER_NOTIF,
+                    "{label}: syscall {nr} must reach the supervisor"
+                );
+            }
+            for nr in non_metadata_syscalls() {
+                for family in [libc::AF_UNIX, libc::AF_INET] {
+                    let args = [family as u64, libc::SOCK_STREAM as u64, 0, 0, 0, 0];
+                    let expected = original.as_ref().map_or(SECCOMP_RET_ALLOW, |original| {
+                        evaluate_static_bpf(original.filter.as_slice(), nr, args)
+                    });
+                    assert_eq!(
+                        evaluate_static_bpf(combined.filter.as_slice(), nr, args),
+                        expected,
+                        "{label}: syscall {nr} must keep the underlying decision"
+                    );
+                }
+            }
+            // A compat-ABI chmod must not slip past: deny the whole ABI.
+            assert_eq!(
+                evaluate_static_bpf_with_arch(
+                    combined.filter.as_slice(),
+                    NATIVE_AUDIT_ARCH ^ 1,
+                    SYS_FCHMODAT as u32,
+                    [0; 6]
+                ),
+                SECCOMP_RET_ERRNO | libc::EPERM as u32,
+                "{label}: non-native ABI"
+            );
+            #[cfg(target_arch = "x86_64")]
+            assert_eq!(
+                evaluate_static_bpf_with_arch(
+                    combined.filter.as_slice(),
+                    NATIVE_AUDIT_ARCH,
+                    SYS_CHMOD as u32 | X32_SYSCALL_BIT,
+                    [0; 6]
+                ),
+                SECCOMP_RET_ERRNO | libc::EPERM as u32,
+                "{label}: x32 ABI"
+            );
+        }
+    }
+
+    #[test]
+    fn metadata_and_openat_notifications_compose() {
+        let combined = prepare_seccomp_af_unix_filter()
+            .with_metadata_notifications()
+            .with_openat_notifications();
+        for nr in METADATA_SYSCALLS
+            .iter()
+            .copied()
+            .chain([SYS_OPENAT, SYS_OPENAT2])
+        {
+            assert_eq!(
+                evaluate_static_bpf(combined.filter.as_slice(), nr, [0; 6]),
+                SECCOMP_RET_USER_NOTIF
+            );
+        }
+        assert_eq!(
+            evaluate_static_bpf(combined.filter.as_slice(), libc::SYS_read as i32, [0; 6]),
+            SECCOMP_RET_ALLOW
+        );
     }
 
     #[test]

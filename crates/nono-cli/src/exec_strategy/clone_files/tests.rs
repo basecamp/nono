@@ -68,6 +68,7 @@ fn config(caps: &CapabilitySet, filesystem: bool, proxy: bool) -> ExecConfig<'_>
             proxy_fallback: proxy,
             af_unix_mediation: true,
             proc_comm_notify: filesystem,
+            metadata_mediation: false,
         },
         sandbox_policy: LinuxSandboxPolicy::Auto,
         allowed_env_vars: None,
