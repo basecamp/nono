@@ -308,6 +308,7 @@ mod tests {
             no_proxy: vec!["redis".to_string()],
             upstream_proxy: None,
             upstream_bypass: Vec::new(),
+            resolved_addresses: Default::default(),
             listen_ports: Vec::new(),
             capability_elevation: false,
             #[cfg(target_os = "linux")]
@@ -387,6 +388,7 @@ mod tests {
             no_proxy: vec!["redis".to_string()],
             upstream_proxy: None,
             upstream_bypass: Vec::new(),
+            resolved_addresses: Default::default(),
             listen_ports: Vec::new(),
             capability_elevation: false,
             #[cfg(target_os = "linux")]

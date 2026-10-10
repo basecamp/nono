@@ -537,6 +537,9 @@ pub(crate) struct PreparedSandbox {
     pub(crate) no_proxy: Vec<String>,
     pub(crate) upstream_proxy: Option<String>,
     pub(crate) upstream_bypass: Vec<String>,
+    /// `network.resolved_addresses`: which addresses a proxied host may
+    /// resolve to.
+    pub(crate) resolved_addresses: nono_proxy::config::ResolvedAddressPolicy,
     pub(crate) listen_ports: Vec<u16>,
     pub(crate) capability_elevation: bool,
     #[cfg(target_os = "linux")]
@@ -1532,6 +1535,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
                 no_proxy: Vec::new(),
                 upstream_proxy: None,
                 upstream_bypass: Vec::new(),
+                resolved_addresses: Default::default(),
                 listen_ports: Vec::new(),
                 capability_elevation: false,
                 #[cfg(target_os = "linux")]
@@ -1596,6 +1600,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         no_proxy: profile_no_proxy,
         upstream_proxy: profile_upstream_proxy,
         upstream_bypass: profile_upstream_bypass,
+        resolved_addresses: profile_resolved_addresses,
         listen_ports: profile_listen_ports,
         open_url_origins,
         open_url_allow_localhost,
@@ -1934,6 +1939,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
             no_proxy: profile_no_proxy,
             upstream_proxy: profile_upstream_proxy,
             upstream_bypass: profile_upstream_bypass,
+            resolved_addresses: profile_resolved_addresses,
             listen_ports: profile_listen_ports,
             capability_elevation,
             #[cfg(target_os = "linux")]
@@ -2918,6 +2924,7 @@ mod tests {
             no_proxy: Vec::new(),
             upstream_proxy: None,
             upstream_bypass: Vec::new(),
+            resolved_addresses: Default::default(),
             listen_ports: Vec::new(),
             capability_elevation: false,
             #[cfg(target_os = "linux")]

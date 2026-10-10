@@ -166,6 +166,9 @@ pub(crate) struct ProxyLaunchOptions {
     /// Profile-declared client-side proxy bypass entries for generated
     /// NO_PROXY/no_proxy.
     pub(crate) no_proxy: Vec<String>,
+    /// Profile `network.resolved_addresses`: which addresses a host the proxy
+    /// resolves may connect to. Command-scoped proxies inherit it.
+    pub(crate) resolved_addresses: nono_proxy::config::ResolvedAddressPolicy,
     /// When true, the proxy does not allocate the in-memory network audit
     /// buffer. Set from `--no-audit`. Does not change filter, credentials,
     /// or fail-closed auth.
