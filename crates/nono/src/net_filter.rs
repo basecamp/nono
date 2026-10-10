@@ -13,6 +13,11 @@
 //! - **Link-local IP protection**: Resolved IPs in the link-local range
 //!   (169.254.0.0/16, fe80::/10) are always denied to prevent DNS rebinding
 //!   attacks targeting cloud metadata services.
+//! - **Address classes**: [`address_class`] names the non-public class of a
+//!   resolved IP (loopback, private, shared/CGNAT, link-local, unspecified),
+//!   looking through IPv4-mapped, IPv4-compatible and NAT64 IPv6 forms. The
+//!   filter itself denies only link-local; callers that hold a policy for the
+//!   other classes deny with [`FilterResult::DenyAddressClass`].
 //! - **Wildcard subdomain matching**: `*.googleapis.com` matches
 //!   `storage.googleapis.com` but not `googleapis.com` itself. A `*` may
 //!   also occupy a whole label in a non-leading position, matching exactly
@@ -21,7 +26,8 @@
 //!   matching, so a trailing dot, mixed case, or Unicode/punycode spelling
 //!   can't slip past a deny entry. Unparseable hosts are denied.
 
-use std::net::IpAddr;
+use serde::{Deserialize, Serialize};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// Normalize a hostname for deny/allow-list comparison: strips a trailing
 /// FQDN dot, rejects control characters, and applies IDNA/punycode
@@ -161,6 +167,16 @@ pub enum FilterResult {
         /// The resolved IP that matched the link-local range
         ip: IpAddr,
     },
+    /// Host is denied because a resolved IP is in a non-public address
+    /// class that the caller's policy does not permit for this host
+    DenyAddressClass {
+        /// The hostname that was denied
+        host: String,
+        /// The resolved IP that is in that class
+        ip: IpAddr,
+        /// The IP's class
+        class: AddressClass,
+    },
     /// Host is not in the allowlist (default deny)
     DenyNotAllowed {
         /// The hostname that was not found in any allowlist
@@ -192,6 +208,14 @@ impl FilterResult {
             FilterResult::DenyLinkLocal { ip } => {
                 format!(
                     "resolved IP {} is in the link-local range (cloud metadata protection)",
+                    ip
+                )
+            }
+            FilterResult::DenyAddressClass { host, ip, class } => {
+                format!(
+                    "host {} resolved to {} address {}, which the policy does not permit for it",
+                    sanitize_for_display(host),
+                    class.as_str(),
                     ip
                 )
             }
@@ -235,6 +259,114 @@ fn is_link_local(ip: &IpAddr) -> bool {
             false
         }
     }
+}
+
+/// The class of a non-public IP address.
+///
+/// A resolved address outside every class here is treated as public by
+/// [`address_class`]. The classes are the ranges a host's own network, a VPN
+/// or a tailnet answers on, which an allowlisted *name* should not reach
+/// unless the policy says so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AddressClass {
+    /// 127.0.0.0/8, ::1
+    Loopback,
+    /// 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 (RFC 1918), fc00::/7 (ULA),
+    /// fec0::/10 (deprecated site-local)
+    Private,
+    /// 100.64.0.0/10 (RFC 6598 shared address space: carrier-grade NAT and
+    /// tailnets such as Tailscale)
+    Cgnat,
+    /// 169.254.0.0/16, fe80::/10
+    LinkLocal,
+    /// 0.0.0.0/8, :: (a connect to these reaches the local host on Linux)
+    Unspecified,
+}
+
+impl AddressClass {
+    /// The class's name as written in configuration.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Loopback => "loopback",
+            Self::Private => "private",
+            Self::Cgnat => "cgnat",
+            Self::LinkLocal => "link_local",
+            Self::Unspecified => "unspecified",
+        }
+    }
+}
+
+impl std::fmt::Display for AddressClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The non-public class of `ip`, or `None` for an address outside every class.
+///
+/// IPv6 forms that carry an IPv4 address are classified by that address:
+/// IPv4-mapped (`::ffff:a.b.c.d`), IPv4-compatible (`::a.b.c.d`) and the
+/// NAT64 well-known prefix (`64:ff9b::a.b.c.d`, RFC 6052), so a AAAA answer
+/// cannot reach an IPv4 range the A answer could not.
+#[must_use]
+pub fn address_class(ip: &IpAddr) -> Option<AddressClass> {
+    match ip {
+        IpAddr::V4(v4) => ipv4_address_class(*v4),
+        IpAddr::V6(v6) => ipv6_address_class(v6),
+    }
+}
+
+fn ipv4_address_class(v4: Ipv4Addr) -> Option<AddressClass> {
+    let [a, b, _, _] = v4.octets();
+    match (a, b) {
+        (0, _) => Some(AddressClass::Unspecified),
+        (127, _) => Some(AddressClass::Loopback),
+        (10, _) => Some(AddressClass::Private),
+        (172, 16..=31) => Some(AddressClass::Private),
+        (192, 168) => Some(AddressClass::Private),
+        (100, 64..=127) => Some(AddressClass::Cgnat),
+        (169, 254) => Some(AddressClass::LinkLocal),
+        _ => None,
+    }
+}
+
+fn ipv6_address_class(v6: &Ipv6Addr) -> Option<AddressClass> {
+    if v6.is_unspecified() {
+        return Some(AddressClass::Unspecified);
+    }
+    if v6.is_loopback() {
+        return Some(AddressClass::Loopback);
+    }
+    if let Some(v4) = embedded_ipv4(v6) {
+        return ipv4_address_class(v4);
+    }
+    let first = v6.segments()[0];
+    if (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfec0 {
+        return Some(AddressClass::Private);
+    }
+    if (first & 0xffc0) == 0xfe80 {
+        return Some(AddressClass::LinkLocal);
+    }
+    None
+}
+
+/// The IPv4 address an IPv4-mapped, IPv4-compatible or NAT64 (64:ff9b::/96)
+/// IPv6 address carries.
+fn embedded_ipv4(v6: &Ipv6Addr) -> Option<Ipv4Addr> {
+    if let Some(v4) = v6.to_ipv4_mapped() {
+        return Some(v4);
+    }
+    let s = v6.segments();
+    let o = v6.octets();
+    let low = Ipv4Addr::new(o[12], o[13], o[14], o[15]);
+    // IPv4-compatible (deprecated; :: and ::1 are classified before this) and
+    // the NAT64 well-known prefix.
+    if s[..6] == [0, 0, 0, 0, 0, 0] || s[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
+        return Some(low);
+    }
+    None
 }
 
 /// Hosts that are always denied regardless of allowlist configuration.
@@ -1008,5 +1140,91 @@ mod tests {
             filter.check_deny("xn--zz:443"),
             Some(FilterResult::DenyHost { .. })
         ));
+    }
+
+    #[test]
+    fn test_address_class_ipv4() {
+        let cases: &[(&str, Option<AddressClass>)] = &[
+            ("0.0.0.0", Some(AddressClass::Unspecified)),
+            ("0.1.2.3", Some(AddressClass::Unspecified)),
+            ("127.0.0.1", Some(AddressClass::Loopback)),
+            ("127.255.255.254", Some(AddressClass::Loopback)),
+            ("10.0.0.1", Some(AddressClass::Private)),
+            ("172.16.0.1", Some(AddressClass::Private)),
+            ("172.31.255.255", Some(AddressClass::Private)),
+            ("172.15.255.255", None),
+            ("172.32.0.0", None),
+            ("192.168.0.1", Some(AddressClass::Private)),
+            ("192.169.0.1", None),
+            ("100.64.0.1", Some(AddressClass::Cgnat)),
+            ("100.100.100.100", Some(AddressClass::Cgnat)),
+            ("100.127.255.255", Some(AddressClass::Cgnat)),
+            ("100.63.255.255", None),
+            ("100.128.0.0", None),
+            ("169.254.169.254", Some(AddressClass::LinkLocal)),
+            ("104.18.7.96", None),
+            ("8.8.8.8", None),
+        ];
+        for (ip, class) in cases {
+            let ip: IpAddr = ip.parse().unwrap();
+            assert_eq!(address_class(&ip), *class, "{ip}");
+        }
+    }
+
+    #[test]
+    fn test_address_class_ipv6() {
+        let cases: &[(&str, Option<AddressClass>)] = &[
+            ("::", Some(AddressClass::Unspecified)),
+            ("::1", Some(AddressClass::Loopback)),
+            ("fc00::1", Some(AddressClass::Private)),
+            ("fd7a:115c:a1e0::53", Some(AddressClass::Private)),
+            ("fec0::1", Some(AddressClass::Private)),
+            ("fe80::1", Some(AddressClass::LinkLocal)),
+            ("2606:4700::1111", None),
+            // IPv4-mapped, IPv4-compatible and NAT64 forms: classified by the
+            // IPv4 address they carry.
+            ("::ffff:10.0.0.1", Some(AddressClass::Private)),
+            ("::ffff:127.0.0.1", Some(AddressClass::Loopback)),
+            ("::ffff:100.64.0.1", Some(AddressClass::Cgnat)),
+            ("::ffff:0.0.0.0", Some(AddressClass::Unspecified)),
+            ("::ffff:8.8.8.8", None),
+            ("::10.0.0.1", Some(AddressClass::Private)),
+            ("::127.0.0.2", Some(AddressClass::Loopback)),
+            ("64:ff9b::10.0.0.1", Some(AddressClass::Private)),
+            ("64:ff9b::169.254.169.254", Some(AddressClass::LinkLocal)),
+            ("64:ff9b::8.8.8.8", None),
+        ];
+        for (ip, class) in cases {
+            let ip: IpAddr = ip.parse().unwrap();
+            assert_eq!(address_class(&ip), *class, "{ip}");
+        }
+    }
+
+    #[test]
+    fn test_address_class_names_round_trip() {
+        for class in [
+            AddressClass::Loopback,
+            AddressClass::Private,
+            AddressClass::Cgnat,
+            AddressClass::LinkLocal,
+            AddressClass::Unspecified,
+        ] {
+            let json = serde_json::to_string(&class).unwrap();
+            assert_eq!(json, format!("\"{}\"", class.as_str()));
+            assert_eq!(serde_json::from_str::<AddressClass>(&json).unwrap(), class);
+        }
+    }
+
+    #[test]
+    fn test_deny_address_class_reason_names_class_and_strips_escapes() {
+        let deny = FilterResult::DenyAddressClass {
+            host: "evil\x1b[31m.example".to_string(),
+            ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            class: AddressClass::Private,
+        };
+        let reason = deny.reason();
+        assert!(!deny.is_allowed());
+        assert!(!reason.contains('\x1b'));
+        assert!(reason.contains("private address 10.0.0.1"), "{reason}");
     }
 }
