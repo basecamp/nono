@@ -567,6 +567,9 @@ pub(crate) struct PreparedSandbox {
         std::collections::BTreeMap<String, crate::command_policy::ApprovalBackendConfig>,
     /// Default routing for `network_approval_backends`.
     pub(crate) network_approval_defaults: Option<crate::command_policy::ApprovalDefaultsConfig>,
+    /// `network.resolved_addresses`: which addresses a proxied host may
+    /// resolve to.
+    pub(crate) resolved_addresses: nono_proxy::config::ResolvedAddressPolicy,
     pub(crate) listen_ports: Vec<u16>,
     pub(crate) capability_elevation: bool,
     #[cfg(target_os = "linux")]
@@ -1583,6 +1586,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
                 upstream_bypass: Vec::new(),
                 network_approval_backends: std::collections::BTreeMap::new(),
                 network_approval_defaults: None,
+                resolved_addresses: Default::default(),
                 listen_ports: Vec::new(),
                 capability_elevation: false,
                 #[cfg(target_os = "linux")]
@@ -1654,6 +1658,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         upstream_bypass: profile_upstream_bypass,
         network_approval_backends: profile_network_approval_backends,
         network_approval_defaults: profile_network_approval_defaults,
+        resolved_addresses: profile_resolved_addresses,
         listen_ports: profile_listen_ports,
         open_url_origins,
         open_url_allow_localhost,
@@ -1996,6 +2001,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
             upstream_bypass: profile_upstream_bypass,
             network_approval_backends: profile_network_approval_backends,
             network_approval_defaults: profile_network_approval_defaults,
+            resolved_addresses: profile_resolved_addresses,
             listen_ports: profile_listen_ports,
             capability_elevation,
             #[cfg(target_os = "linux")]
@@ -3056,6 +3062,7 @@ mod tests {
             upstream_bypass: Vec::new(),
             network_approval_backends: std::collections::BTreeMap::new(),
             network_approval_defaults: None,
+            resolved_addresses: Default::default(),
             listen_ports: Vec::new(),
             capability_elevation: false,
             #[cfg(target_os = "linux")]

@@ -47,6 +47,7 @@ pub(crate) struct PreparedProfile {
         std::collections::BTreeMap<String, crate::command_policy::ApprovalBackendConfig>,
     /// Default routing for `network_approval_backends`.
     pub(crate) network_approval_defaults: Option<crate::command_policy::ApprovalDefaultsConfig>,
+    pub(crate) resolved_addresses: nono_proxy::config::ResolvedAddressPolicy,
     pub(crate) listen_ports: Vec<u16>,
     pub(crate) open_url_origins: Vec<String>,
     pub(crate) open_url_allow_localhost: bool,
@@ -901,6 +902,10 @@ fn prepare_profile_with_options(
         network_approval_defaults: loaded_profile
             .as_ref()
             .and_then(|profile| profile.network.approval_defaults.clone()),
+        resolved_addresses: loaded_profile
+            .as_ref()
+            .map(|profile| profile.network.resolved_addresses.clone())
+            .unwrap_or_default(),
         listen_ports: {
             let mut ports = loaded_profile
                 .as_ref()

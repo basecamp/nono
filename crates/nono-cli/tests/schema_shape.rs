@@ -81,7 +81,13 @@ fn test_schema_network_config_matches_rust_model() {
             "upstream_bypass",
             "approval_backends",
             "approval_defaults",
+            "resolved_addresses",
         ],
+    );
+    assert_schema_properties(
+        &schema,
+        "ResolvedAddressesConfig",
+        &["public_only", "exceptions"],
     );
 }
 
