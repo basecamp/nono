@@ -298,8 +298,9 @@ pub async fn handle_connect(
 
     // Connect to the resolved IP directly — NOT re-resolving the hostname.
     // This eliminates the DNS rebinding TOCTOU: the IPs were already checked
-    // against the link-local range (in check_host(), or in resolve_approved_host
-    // for an interactively approved host).
+    // against the link-local range and the resolved-address policy (in
+    // check_host(), or in resolve_approved_host for an interactively approved
+    // host).
     let resolved = &resolved;
     if resolved.is_empty() {
         let reason = "DNS resolution returned no addresses".to_string();
@@ -392,9 +393,10 @@ enum ApprovalOutcome {
 /// cache or an interactive approval prompt.
 ///
 /// Only a plain allowlist miss ([`FilterResult::DenyNotAllowed`]) is eligible.
-/// A metadata / link-local / deny-list denial ([`FilterResult::DenyHost`] /
-/// [`FilterResult::DenyLinkLocal`]) is authoritative and never prompts —
-/// approval can never override an SSRF-guard denial.
+/// A metadata / link-local / deny-list / address-class denial
+/// ([`FilterResult::DenyHost`] / [`FilterResult::DenyLinkLocal`] /
+/// [`FilterResult::DenyAddressClass`]) is authoritative and never prompts —
+/// approval can never override an SSRF-guard or address-policy denial.
 ///
 /// Concurrent first-touch connections to the same host coalesce onto a single
 /// prompt: the first (leader) prompts; the rest (followers) await its decision.
@@ -568,8 +570,17 @@ async fn outcome_from_allow(
         });
     }
     match resolve_approved(filter, host, port).await? {
-        Some(addrs) => Ok(ApprovalOutcome::Approved { addrs, backend }),
-        None => {
+        Ok(addrs) => Ok(ApprovalOutcome::Approved { addrs, backend }),
+        Err(denied @ FilterResult::DenyAddressClass { .. }) => {
+            // The resolved-address policy refused an answer: say which, as an
+            // allowed host's refusal does, not the SSRF guard's wording.
+            warn!("network approval: {host}:{port} approved but refused by the address policy");
+            Ok(ApprovalOutcome::Denied {
+                backend,
+                reason: Some(denied.reason()),
+            })
+        }
+        Err(_) => {
             warn!("network approval: {host}:{port} approved but blocked by SSRF guard");
             Ok(ApprovalOutcome::Denied {
                 backend,
@@ -582,22 +593,24 @@ async fn outcome_from_allow(
     }
 }
 
-/// Resolve an approved host and re-vet the resolved IPs against the SSRF guard.
+/// Resolve an approved host and re-vet the resolved IPs against the SSRF guard
+/// and the resolved-address policy.
 ///
-/// Returns `Ok(Some(addrs))` when the addresses pass the guard (possibly empty,
-/// which the caller surfaces as a 502 upstream failure), or `Ok(None)` when a
-/// resolved IP is in a denied metadata / link-local range — approval never
-/// overrides that guard.
+/// Returns `Ok(Ok(addrs))` when the addresses pass (possibly empty, which the
+/// caller surfaces as a 502 upstream failure), or `Ok(Err(result))` with the
+/// denial when a resolved IP is in a denied metadata / link-local range or an
+/// address class the policy refuses for the host — approval never overrides
+/// either.
 async fn resolve_approved(
     filter: &ProxyFilter,
     host: &str,
     port: u16,
-) -> Result<Option<Vec<SocketAddr>>> {
+) -> Result<std::result::Result<Vec<SocketAddr>, FilterResult>> {
     let check = filter.resolve_approved_host(host, port).await?;
     if check.result.is_allowed() {
-        Ok(Some(check.resolved_addrs))
+        Ok(Ok(check.resolved_addrs))
     } else {
-        Ok(None)
+        Ok(Err(check.result))
     }
 }
 
