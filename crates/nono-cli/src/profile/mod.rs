@@ -2157,6 +2157,32 @@ impl LinuxAfUnixMediation {
     }
 }
 
+/// Linux file mode and timestamp mediation mode.
+///
+/// Landlock does not mediate `chmod(2)`, `utimensat(2)` or their relatives,
+/// so with the default `off` a sandboxed process can change the mode bits and
+/// timestamps of any file it can name, granted or not. `write_grants` routes
+/// those calls to the supervisor, which allows them only when the target lies
+/// within a write grant or is named through a descriptor the process holds
+/// open for writing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LinuxMetadataMediation {
+    /// Leave mode and timestamp changes to Landlock, which does not mediate them.
+    #[default]
+    Off,
+    /// Allow mode and timestamp changes only within write grants.
+    WriteGrants,
+}
+
+impl LinuxMetadataMediation {
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    #[must_use]
+    pub fn is_write_grants(self) -> bool {
+        matches!(self, LinuxMetadataMediation::WriteGrants)
+    }
+}
+
 /// Diagnostic output controls.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2345,6 +2371,9 @@ pub struct LinuxConfig {
     /// Opt-in pathname AF_UNIX mediation mode.
     #[serde(default)]
     pub af_unix_mediation: Option<LinuxAfUnixMediation>,
+    /// Opt-in file mode and timestamp mediation mode.
+    #[serde(default)]
+    pub metadata_mediation: Option<LinuxMetadataMediation>,
     /// Which sandboxing mechanism to use. Defaults to `auto`.
     #[serde(default)]
     pub sandbox_policy: Option<LinuxSandboxPolicy>,
@@ -3978,6 +4007,10 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
                 .linux
                 .af_unix_mediation
                 .or(base.linux.af_unix_mediation),
+            metadata_mediation: child
+                .linux
+                .metadata_mediation
+                .or(base.linux.metadata_mediation),
             sandbox_policy: child.linux.sandbox_policy.or(base.linux.sandbox_policy),
         },
         diagnostics: DiagnosticsConfig {
@@ -7216,6 +7249,44 @@ mod tests {
         assert_eq!(
             profile.linux.af_unix_mediation,
             Some(LinuxAfUnixMediation::Pathname)
+        );
+    }
+
+    #[test]
+    fn test_profile_parses_linux_metadata_mediation() {
+        let profile: Profile = serde_json::from_str(
+            r#"{
+            "meta": {"name": "metadata-mediation"},
+            "linux": {"metadata_mediation": "write_grants"}
+        }"#,
+        )
+        .expect("profile with linux.metadata_mediation parses");
+        assert_eq!(
+            profile.linux.metadata_mediation,
+            Some(LinuxMetadataMediation::WriteGrants)
+        );
+        assert!(LinuxMetadataMediation::WriteGrants.is_write_grants());
+        assert!(!LinuxMetadataMediation::default().is_write_grants());
+    }
+
+    #[test]
+    fn test_merge_profiles_inherits_linux_metadata_mediation() {
+        let mut base = base_profile();
+        base.linux.metadata_mediation = Some(LinuxMetadataMediation::WriteGrants);
+        let merged = merge_profiles(base, child_profile());
+        assert_eq!(
+            merged.linux.metadata_mediation,
+            Some(LinuxMetadataMediation::WriteGrants)
+        );
+
+        let mut base = base_profile();
+        base.linux.metadata_mediation = Some(LinuxMetadataMediation::WriteGrants);
+        let mut child = child_profile();
+        child.linux.metadata_mediation = Some(LinuxMetadataMediation::Off);
+        let merged = merge_profiles(base, child);
+        assert_eq!(
+            merged.linux.metadata_mediation,
+            Some(LinuxMetadataMediation::Off)
         );
     }
 

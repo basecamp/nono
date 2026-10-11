@@ -235,6 +235,10 @@ pub struct SeccompPolicy {
     /// Intercept openat/openat2 so the supervisor can inject a writable fd for
     /// NVIDIA driver thread-name writes to `/proc/<tgid>/task/<tid>/comm`.
     pub proc_comm_notify: bool,
+    /// Intercept the chmod and utime syscall families, which Landlock does not
+    /// mediate, and allow them only on write-granted targets.
+    /// Corresponds to the profile's `linux.metadata_mediation = "write_grants"`.
+    pub metadata_mediation: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -249,10 +253,17 @@ impl SeccompPolicy {
         self.proxy_fallback || self.af_unix_mediation
     }
 
+    /// Whether the child takes the `CLONE_FILES` bootstrap, which installs one
+    /// combined notification listener (network, file metadata, and openat
+    /// when also requested) before Landlock.
+    pub fn needs_listener_bootstrap(self) -> bool {
+        self.needs_network_notify() || self.metadata_mediation
+    }
+
     /// Whether the child must remain dumpable for the supervisor to read
     /// syscall arguments through procfs during notification mediation.
     pub fn child_requires_dumpable(self) -> bool {
-        self.needs_openat_notify() || self.needs_network_notify()
+        self.needs_openat_notify() || self.needs_listener_bootstrap()
     }
 }
 
@@ -608,7 +619,7 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
     let socket_pair = if needs_child_ipc {
         let pair = SupervisorSocket::pair()?;
         #[cfg(target_os = "linux")]
-        let pair = if config.seccomp_policy.needs_network_notify() {
+        let pair = if config.seccomp_policy.needs_listener_bootstrap() {
             (
                 clone_files::promote_supervisor_socket(pair.0)?,
                 clone_files::promote_supervisor_socket(pair.1)?,
@@ -944,10 +955,10 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
         None
     };
     #[cfg(target_os = "linux")]
-    let mut clone_bootstrap = if config.seccomp_policy.needs_network_notify() {
+    let mut clone_bootstrap = if config.seccomp_policy.needs_listener_bootstrap() {
         if !supervisor.is_some_and(|sup| sup.seccomp_policy == config.seccomp_policy) {
             return Err(NonoError::SandboxInit(
-                "Network notifications require a supervisor with matching notification policy"
+                "Notification listeners require a supervisor with matching notification policy"
                     .into(),
             ));
         }
@@ -4633,6 +4644,7 @@ mod tests {
                 proxy_fallback: false,
                 af_unix_mediation: false,
                 proc_comm_notify: false,
+                metadata_mediation: false,
             }
             .child_requires_dumpable()
         );
@@ -4642,6 +4654,7 @@ mod tests {
                 proxy_fallback: false,
                 af_unix_mediation: false,
                 proc_comm_notify: false,
+                metadata_mediation: false,
             }
             .child_requires_dumpable()
         );
@@ -4651,6 +4664,7 @@ mod tests {
                 proxy_fallback: true,
                 af_unix_mediation: false,
                 proc_comm_notify: false,
+                metadata_mediation: false,
             }
             .child_requires_dumpable()
         );
@@ -4660,6 +4674,7 @@ mod tests {
                 proxy_fallback: true,
                 af_unix_mediation: false,
                 proc_comm_notify: false,
+                metadata_mediation: false,
             }
             .child_requires_dumpable()
         );
@@ -4669,8 +4684,33 @@ mod tests {
                 proxy_fallback: false,
                 af_unix_mediation: false,
                 proc_comm_notify: true,
+                metadata_mediation: false,
             }
             .child_requires_dumpable()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_linux_metadata_mediation_takes_the_listener_bootstrap() {
+        let policy = SeccompPolicy {
+            capability_elevation: false,
+            proxy_fallback: false,
+            af_unix_mediation: false,
+            proc_comm_notify: false,
+            metadata_mediation: true,
+        };
+
+        assert!(!policy.needs_network_notify());
+        assert!(!policy.needs_openat_notify());
+        assert!(policy.needs_listener_bootstrap());
+        assert!(policy.child_requires_dumpable());
+        assert!(
+            !SeccompPolicy {
+                metadata_mediation: false,
+                ..policy
+            }
+            .needs_listener_bootstrap()
         );
     }
 
@@ -4682,6 +4722,7 @@ mod tests {
             proxy_fallback: true,
             af_unix_mediation: false,
             proc_comm_notify: false,
+            metadata_mediation: false,
         };
 
         assert!(policy.needs_openat_notify());
@@ -5293,6 +5334,7 @@ mod tests {
                 proxy_fallback: true,
                 af_unix_mediation: false,
                 proc_comm_notify: false,
+                metadata_mediation: false,
             },
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             tool_sandbox_runtime: None,
@@ -5424,6 +5466,7 @@ mod tests {
                 proxy_fallback: true,
                 af_unix_mediation: false,
                 proc_comm_notify: false,
+                metadata_mediation: false,
             },
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             tool_sandbox_runtime: None,
@@ -5521,6 +5564,7 @@ mod tests {
                 proxy_fallback: true,
                 af_unix_mediation: false,
                 proc_comm_notify: false,
+                metadata_mediation: false,
             },
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             tool_sandbox_runtime: None,
@@ -5571,6 +5615,7 @@ mod tests {
                 proxy_fallback: true,
                 af_unix_mediation: false,
                 proc_comm_notify: false,
+                metadata_mediation: false,
             },
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             tool_sandbox_runtime: None,
@@ -5628,6 +5673,7 @@ mod tests {
                 proxy_fallback: false,
                 af_unix_mediation: false,
                 proc_comm_notify: false,
+                metadata_mediation: false,
             },
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             tool_sandbox_runtime: None,
@@ -5701,6 +5747,7 @@ mod tests {
                 proxy_fallback: true,
                 af_unix_mediation: false,
                 proc_comm_notify: false,
+                metadata_mediation: false,
             },
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             tool_sandbox_runtime: None,
@@ -5735,6 +5782,7 @@ mod tests {
                 proxy_fallback: true,
                 af_unix_mediation: false,
                 proc_comm_notify: false,
+                metadata_mediation: false,
             },
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             tool_sandbox_runtime: None,
@@ -5788,6 +5836,7 @@ mod tests {
                 proxy_fallback: true,
                 af_unix_mediation: false,
                 proc_comm_notify: false,
+                metadata_mediation: false,
             },
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             tool_sandbox_runtime: None,
@@ -5946,6 +5995,7 @@ mod tests {
                 proxy_fallback: true,
                 af_unix_mediation: false,
                 proc_comm_notify: false,
+                metadata_mediation: false,
             },
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             tool_sandbox_runtime: None,
@@ -6008,6 +6058,7 @@ mod tests {
                 proxy_fallback: true,
                 af_unix_mediation: false,
                 proc_comm_notify: false,
+                metadata_mediation: false,
             },
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             tool_sandbox_runtime: None,
@@ -6059,6 +6110,7 @@ mod tests {
                 proxy_fallback: true,
                 af_unix_mediation: false,
                 proc_comm_notify: false,
+                metadata_mediation: false,
             },
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             tool_sandbox_runtime: None,
@@ -6129,6 +6181,7 @@ mod tests {
                 proxy_fallback: true,
                 af_unix_mediation: false,
                 proc_comm_notify: false,
+                metadata_mediation: false,
             },
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             tool_sandbox_runtime: None,

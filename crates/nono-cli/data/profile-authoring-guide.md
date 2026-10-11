@@ -1139,6 +1139,24 @@ With no `filesystem.unix_socket` entries, every AF_UNIX pathname connect and bin
 
 `commands.deny` is deprecated startup-only gating — it blocks the command from launching but does not enforce socket access and should not be relied on as enforcement. It remains visible in `nono profile show` under the commands section for compatibility.
 
+### Confining mode and timestamp changes (Linux)
+
+Landlock does not mediate `chmod` or `utimensat` and their relatives, so by
+default a sandboxed process can change the mode bits and timestamps of any file
+it can name, even one it may not read. To allow those changes only within write
+grants (or through a descriptor the process holds open for writing):
+
+```json
+{
+  "linux": { "metadata_mediation": "write_grants" }
+}
+```
+
+Each such call then takes a supervisor round trip. `flock` is not affected: a
+process can lock exactly the files it may open, which Landlock already decides.
+macOS needs no setting: Seatbelt's `file-write*` rules already cover mode and
+timestamp changes.
+
 ### Allowing parent-of-protected-root grants (macOS only)
 
 By default, granting a parent directory of a protected root (for example

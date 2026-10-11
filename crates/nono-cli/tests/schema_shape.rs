@@ -1105,7 +1105,24 @@ fn test_schema_linux_config_matches_rust_model() {
     assert_schema_properties(
         &schema,
         "LinuxConfig",
-        &["af_unix_mediation", "sandbox_policy"],
+        &["af_unix_mediation", "metadata_mediation", "sandbox_policy"],
+    );
+}
+
+#[test]
+fn test_schema_validates_linux_metadata_mediation() {
+    let schema = load_schema();
+    let validator = jsonschema::validator_for(&schema).expect("schema compiles");
+    for mode in ["off", "write_grants"] {
+        let profile = json!({ "linux": { "metadata_mediation": mode } });
+        validator
+            .validate(&profile)
+            .unwrap_or_else(|e| panic!("metadata_mediation {mode} should validate: {e}"));
+    }
+    let profile = json!({ "linux": { "metadata_mediation": "write" } });
+    assert!(
+        validator.validate(&profile).is_err(),
+        "an unknown metadata_mediation mode must not validate"
     );
 }
 
