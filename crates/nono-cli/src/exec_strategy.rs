@@ -2887,6 +2887,7 @@ fn run_supervisor_loop(
 ) -> Result<SupervisorLoopResult> {
     let mut network_throttle =
         supervisor_linux::NetworkDenialThrottle::new(config.network_denial_audit);
+    let mut rate_limited_audit = supervisor_linux::RateLimitedCapabilityAudit::new();
     let result = run_supervisor_loop_inner(
         child,
         sock,
@@ -2900,11 +2901,13 @@ fn run_supervisor_loop(
         url_listener,
         killed_by_timeout,
         &mut network_throttle,
+        &mut rate_limited_audit,
     );
     // The loop has several exits (orphan reaping, startup timeout, errors), so
     // report denials that were enforced but not individually recorded here,
     // where every exit passes, rather than at any one of them.
     supervisor_linux::flush_suppressed_network_denials(config, &mut network_throttle);
+    supervisor_linux::flush_suppressed_rate_limited_capabilities(config, &mut rate_limited_audit);
     result
 }
 
@@ -2923,6 +2926,7 @@ fn run_supervisor_loop_inner(
     url_listener: Option<&SupervisorListener>,
     killed_by_timeout: &mut bool,
     network_throttle: &mut supervisor_linux::NetworkDenialThrottle,
+    rate_limited_audit: &mut supervisor_linux::RateLimitedCapabilityAudit,
 ) -> Result<SupervisorLoopResult> {
     struct LoopTimer {
         start: Instant,
@@ -3107,6 +3111,7 @@ fn run_supervisor_loop_inner(
                         initial_caps,
                         supervisor_linux::SeccompNotificationState {
                             rate_limiter: &mut rate_limiter,
+                            rate_limited_audit: &mut *rate_limited_audit,
                             denials: &mut denials.fs,
                             trust_interceptor: trust_interceptor.as_mut(),
                             pty: pty.as_deref_mut(),
@@ -3126,6 +3131,7 @@ fn run_supervisor_loop_inner(
                         initial_caps,
                         supervisor_linux::SeccompNotificationState {
                             rate_limiter: &mut rate_limiter,
+                            rate_limited_audit: &mut *rate_limited_audit,
                             denials: &mut denials.fs,
                             trust_interceptor: trust_interceptor.as_mut(),
                             pty: pty.as_deref_mut(),

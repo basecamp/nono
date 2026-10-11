@@ -116,6 +116,19 @@ fn supervise(
     port: u16,
     bind: u16,
 ) -> Result<i32> {
+    let mut limiter = supervisor_linux::RateLimiter::new(10000, 10000);
+    supervise_with(bootstrap, caps, policy, port, bind, &mut limiter, None)
+}
+
+fn supervise_with(
+    bootstrap: &Bootstrap,
+    caps: &CapabilitySet,
+    policy: SeccompPolicy,
+    port: u16,
+    bind: u16,
+    limiter: &mut supervisor_linux::RateLimiter,
+    audit_recorder: Option<std::sync::Arc<Mutex<crate::audit_integrity::AuditRecorder>>>,
+) -> Result<i32> {
     let scrub = nono::ScrubPolicy::secure_default();
     let config = SupervisorConfig {
         protected_roots: &[],
@@ -126,7 +139,7 @@ fn supervise(
         caps,
         open_url_origins: &[],
         open_url_allow_localhost: false,
-        audit_recorder: None,
+        audit_recorder,
         network_audit_events: None,
         proxy_handle: None,
         redaction_policy: &scrub,
@@ -151,10 +164,10 @@ fn supervise(
             is_file: cap.is_file,
         })
         .collect();
-    let mut limiter = supervisor_linux::RateLimiter::new(10000, 10000);
     let mut network_throttle = supervisor_linux::NetworkDenialThrottle::new(
         crate::profile::NetworkDenialAuditLimits::default(),
     );
+    let mut rate_limited_audit = supervisor_linux::RateLimitedCapabilityAudit::new();
     let mut denials = vec![];
     let mut ipc_denials = vec![];
     let deadline = Instant::now() + Duration::from_secs(20);
@@ -189,7 +202,8 @@ fn supervise(
                 &config,
                 &initial,
                 supervisor_linux::SeccompNotificationState {
-                    rate_limiter: &mut limiter,
+                    rate_limiter: &mut *limiter,
+                    rate_limited_audit: &mut rate_limited_audit,
                     denials: &mut denials,
                     trust_interceptor: None,
                     pty: None,
@@ -335,6 +349,76 @@ else: raise AssertionError('parent procfs accidentally granted')
                 "fd leak after {abi:?}, filesystem={filesystem}"
             );
         }
+        Ok(())
+    })
+}
+
+/// Capability requests the approval limiter refuses never reach the backend,
+/// so the limiter is the only thing that decided them. They must still leave
+/// an audit record, like every request the backend decides.
+#[test]
+fn rate_limited_capability_requests_are_audited() -> Result<()> {
+    isolated("rate_limited_capability_requests_are_audited", || {
+        let _lock = lock_listener_ownership()?;
+        let proxy = std::net::TcpListener::bind("127.0.0.1:0").map_err(NonoError::Io)?;
+        let spare = std::net::TcpListener::bind("127.0.0.1:0").map_err(NonoError::Io)?;
+        let port = proxy.local_addr().map_err(NonoError::Io)?.port();
+        let bind = spare.local_addr().map_err(NonoError::Io)?.port();
+        drop(spare);
+        let dir = tempfile::tempdir().map_err(NonoError::Io)?;
+        let secret = dir.path().join("secret");
+        std::fs::write(&secret, "must stay inaccessible").map_err(NonoError::Io)?;
+        let audit_dir = tempfile::tempdir().map_err(NonoError::Io)?;
+        let recorder = crate::audit_integrity::AuditRecorder::new(audit_dir.path().to_path_buf())?;
+        let caps = capabilities(port, bind)?;
+        let config = config(&caps, true, false);
+        const ATTEMPTS: usize = 6;
+        let script = format!(
+            r#"
+for _ in range({ATTEMPTS}):
+    try: open({secret:?})
+    except PermissionError: pass
+    else: raise AssertionError('filesystem escaped')
+"#,
+            secret = secret.to_string_lossy(),
+        );
+        // One token, never refilled: at most one request reaches the backend
+        // and every later one is refused by the limiter.
+        let mut limiter = supervisor_linux::RateLimiter::new(0, 1);
+        let bootstrap = run(
+            &config,
+            &script,
+            landlock::ABI::V4,
+            Fault::Fragmented,
+            None,
+            None,
+            None,
+        )?;
+        assert_eq!(
+            supervise_with(
+                &bootstrap,
+                &caps,
+                config.seccomp_policy,
+                port,
+                bind,
+                &mut limiter,
+                Some(std::sync::Arc::new(Mutex::new(recorder))),
+            )?,
+            0
+        );
+        drop(bootstrap);
+        let events = std::fs::read_to_string(audit_dir.path().join("audit-events.ndjson"))
+            .map_err(NonoError::Io)?;
+        let needle = format!("{:?}", secret.to_string_lossy());
+        let audited = events
+            .lines()
+            .filter(|line| line.contains(r#""type":"capability_decision""#))
+            .filter(|line| line.contains(&needle))
+            .count();
+        assert_eq!(
+            audited, ATTEMPTS,
+            "every refused request for the secret must be audited:\n{events}"
+        );
         Ok(())
     })
 }
