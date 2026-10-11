@@ -128,6 +128,28 @@ fn env_non_empty(key: &str) -> bool {
     std::env::var_os(key).is_some_and(|value| !value.is_empty())
 }
 
+/// Environment nono sets to point Claude Code's config at `claude_dir`.
+///
+/// Claude Code derives its macOS Keychain service name from whether
+/// `CLAUDE_CONFIG_DIR` is set, not from its value, so setting it alone makes
+/// Claude look up a hashed service the host login never wrote and report
+/// "Not logged in". An empty `CLAUDE_SECURESTORAGE_CONFIG_DIR` keeps the
+/// default service name. A value the user exported themselves is left alone.
+#[cfg(unix)]
+fn claude_config_dir_set_vars(
+    claude_dir: &Path,
+    user_securestorage_dir: bool,
+) -> Vec<(String, String)> {
+    let mut vars = vec![(
+        "CLAUDE_CONFIG_DIR".to_string(),
+        claude_dir.to_string_lossy().into_owned(),
+    )];
+    if !user_securestorage_dir {
+        vars.push(("CLAUDE_SECURESTORAGE_CONFIG_DIR".to_string(), String::new()));
+    }
+    vars
+}
+
 // One-time migration onto canonical ~/.claude/.claude.json (what Claude Code
 // actually reads/writes once CLAUDE_CONFIG_DIR is set). No-op forever after
 // canonical exists. Priority, first match wins:
@@ -1703,10 +1725,12 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
                 claude_dir.join(".claude.json"),
             );
             migrate_claude_json(&legacy_json, &redirected_json, &claude_dir);
-            profile_set_vars.get_or_insert_with(Vec::new).push((
-                "CLAUDE_CONFIG_DIR".to_string(),
-                claude_dir.to_string_lossy().into_owned(),
-            ));
+            profile_set_vars
+                .get_or_insert_with(Vec::new)
+                .extend(claude_config_dir_set_vars(
+                    &claude_dir,
+                    std::env::var_os("CLAUDE_SECURESTORAGE_CONFIG_DIR").is_some(),
+                ));
         }
     }
 
@@ -1975,6 +1999,39 @@ mod tests {
     #[cfg(target_os = "macos")]
     use std::fs;
     use tempfile::tempdir;
+
+    // Claude Code picks its macOS Keychain service name from whether
+    // CLAUDE_CONFIG_DIR is set at all. Setting it without an empty
+    // CLAUDE_SECURESTORAGE_CONFIG_DIR sends it to a hashed service name the
+    // host login never wrote, so it reports "Not logged in" (#1950).
+    #[test]
+    #[cfg(unix)]
+    fn claude_config_dir_set_vars_keep_default_keychain_service() {
+        let vars = claude_config_dir_set_vars(Path::new("/home/u/.claude"), false);
+        assert_eq!(
+            vars,
+            vec![
+                (
+                    "CLAUDE_CONFIG_DIR".to_string(),
+                    "/home/u/.claude".to_string()
+                ),
+                ("CLAUDE_SECURESTORAGE_CONFIG_DIR".to_string(), String::new()),
+            ]
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn claude_config_dir_set_vars_leave_user_securestorage_dir_alone() {
+        let vars = claude_config_dir_set_vars(Path::new("/home/u/.claude"), true);
+        assert_eq!(
+            vars,
+            vec![(
+                "CLAUDE_CONFIG_DIR".to_string(),
+                "/home/u/.claude".to_string()
+            )]
+        );
+    }
 
     #[test]
     #[cfg(unix)]
