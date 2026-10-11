@@ -40,6 +40,7 @@ pub(crate) struct PreparedProfile {
     pub(crate) no_proxy: Vec<String>,
     pub(crate) upstream_proxy: Option<String>,
     pub(crate) upstream_bypass: Vec<String>,
+    pub(crate) resolved_addresses: nono_proxy::config::ResolvedAddressPolicy,
     pub(crate) listen_ports: Vec<u16>,
     pub(crate) open_url_origins: Vec<String>,
     pub(crate) open_url_allow_localhost: bool,
@@ -888,6 +889,10 @@ fn prepare_profile_with_options(
         upstream_bypass: loaded_profile
             .as_ref()
             .map(|profile| profile.network.upstream_bypass.clone())
+            .unwrap_or_default(),
+        resolved_addresses: loaded_profile
+            .as_ref()
+            .map(|profile| profile.network.resolved_addresses.clone())
             .unwrap_or_default(),
         listen_ports: {
             let mut ports = loaded_profile
