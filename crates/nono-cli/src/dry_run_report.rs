@@ -48,7 +48,7 @@ pub(crate) const OUT_OF_SCOPE: &[&str] = &[
 /// Seatbelt rules (`raw_rules`), which the capability list cannot show.
 pub(crate) fn dry_run_report(
     plan: &LaunchPlan,
-    children: &[DryRunChild],
+    mediation: &crate::execution_runtime::DryRunMediation,
     raw_rules: &[String],
     workdir: &Path,
 ) -> Result<Value> {
@@ -91,8 +91,21 @@ pub(crate) fn dry_run_report(
         );
     }
     incomplete.extend(seatbelt_widenings(&caps, raw_rules));
+    // (The rules command mediation's runtime adds to the session's set at
+    // launch: an allow among them widens it too.)
+    let runtime_allows = mediation
+        .session_rules
+        .iter()
+        .filter(|rule| rule.contains("(allow"))
+        .count();
+    if runtime_allows > 0 {
+        incomplete.push(format!(
+            "{runtime_allows} Seatbelt allow rule(s) command mediation adds to the session at launch"
+        ));
+    }
     let limits = caps.resource_limits();
-    let commands = children
+    let commands = mediation
+        .children
         .iter()
         .map(|child| child_value(child, &workdir, &caps))
         .collect::<Result<Vec<_>>>()?;
@@ -170,7 +183,7 @@ fn seatbelt_widenings(caps: &CapabilitySet, raw_rules: &[String]) -> Vec<String>
     let generated = caps
         .platform_rules()
         .iter()
-        .filter(|rule| !raw_rules.contains(rule) && rule.trim_start().starts_with("(allow"))
+        .filter(|rule| !raw_rules.contains(rule) && rule.contains("(allow"))
         .count();
     if generated > 0 {
         out.push(format!(
@@ -356,6 +369,31 @@ mod tests {
         use std::os::unix::ffi::OsStrExt;
         let path = Path::new(std::ffi::OsStr::from_bytes(b"/a/\xff\nb"));
         assert_eq!(path_value(path), json!({ "hex": "2f612fff0a62" }));
+    }
+
+    #[test]
+    fn seatbelt_allows_beyond_the_list_are_named() -> Result<()> {
+        let mut caps = CapabilitySet::new();
+        caps.add_platform_rule("(deny file-read* (subpath \"/a\"))".to_string())?;
+        assert!(
+            seatbelt_widenings(&caps, &[]).is_empty(),
+            "a deny only narrows"
+        );
+        caps.add_platform_rule(
+            "(deny file-read* (subpath \"/b\")) (allow file-read* (subpath \"/c\"))".to_string(),
+        )?;
+        assert_eq!(
+            seatbelt_widenings(&caps, &[]).len(),
+            1,
+            "an allow anywhere in a rule widens"
+        );
+        let unapplied = vec!["(allow file-read* (subpath \"/d\"))".to_string()];
+        assert_eq!(
+            seatbelt_widenings(&caps, &unapplied).len(),
+            1,
+            "a raw rule the set doesn't apply counts for nothing"
+        );
+        Ok(())
     }
 
     #[test]

@@ -200,6 +200,16 @@ fn recommended_pack_profile(program: &Path) -> Option<(&'static str, &'static [&
     }
 }
 
+/// What command mediation adds to a run, for `nono run --dry-run --json`.
+#[derive(Default)]
+pub(crate) struct DryRunMediation {
+    /// Each sandbox a brokered command can run under, as the launch builds it.
+    pub(crate) children: Vec<crate::tool_sandbox::DryRunChild>,
+    /// The platform rules the runtime adds to the session's own set
+    /// (`grant_outer_caps`; on macOS, Seatbelt rules).
+    pub(crate) session_rules: Vec<String>,
+}
+
 /// Each sandbox the plan's brokered commands can run under, built by the
 /// command-mediation runtime `execute_sandboxed` prepares (the same
 /// `PreparedToolSandboxRuntime::prepare`, with the plan's capability set, deny
@@ -209,14 +219,14 @@ fn recommended_pack_profile(program: &Path) -> Option<(&'static str, &'static [&
 /// would serve gets a stand-in loopback address; its ports and trust bundle
 /// (nono's own, and network, out of the report's contract) are not modeled. The
 /// runtime's directory is removed before this returns.
-pub(crate) fn dry_run_children(plan: &LaunchPlan) -> Result<Vec<crate::tool_sandbox::DryRunChild>> {
+pub(crate) fn dry_run_children(plan: &LaunchPlan) -> Result<DryRunMediation> {
     let flags = &plan.flags;
     let Some(command_policies) = flags
         .command_policies
         .as_ref()
         .filter(|config| config.is_active())
     else {
-        return Ok(Vec::new());
+        return Ok(DryRunMediation::default());
     };
     validate_command_policy_execution_support()?;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -271,13 +281,26 @@ pub(crate) fn dry_run_children(plan: &LaunchPlan) -> Result<Vec<crate::tool_sand
             },
         )?;
         let children = runtime.dry_run_children(&requested_workdir);
+        // (What the runtime adds to the session's own set, as the launch adds
+        // it: only its platform rules are kept, which the report weighs.)
+        let mut granted = caps.clone();
+        let granted = runtime.grant_outer_caps(&mut granted).map(|()| granted);
         runtime.cleanup_runtime_dir();
-        Ok(children)
+        let session_rules = granted?
+            .platform_rules()
+            .iter()
+            .filter(|rule| !caps.platform_rules().contains(rule))
+            .cloned()
+            .collect();
+        Ok(DryRunMediation {
+            children,
+            session_rules,
+        })
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = command_policies;
-        Ok(Vec::new())
+        Ok(DryRunMediation::default())
     }
 }
 
