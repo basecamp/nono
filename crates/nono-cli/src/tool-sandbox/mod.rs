@@ -28,16 +28,28 @@ pub(crate) fn maybe_run_internal_tool_sandbox_entrypoint() -> bool {
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub(crate) fn record_main_start() {}
 
-/// What a command sandbox's policy grants, as the launch resolves it
-/// (`resolve_policy_grants` in each platform module).
-pub(crate) struct PolicyGrants {
-    /// The filesystem and Unix-socket capabilities the policy adds.
+/// One sandbox a brokered command can run under, as the launch builds it
+/// (`build_child_launch_spec`, the code a run uses) for a run of the command
+/// from the working directory: `PreparedToolSandboxRuntime::dry_run_children`.
+pub(crate) struct DryRunChild {
+    pub(crate) command: String,
+    /// `session`, or the command whose run selects this sandbox.
+    pub(crate) caller: String,
+    /// The intercept rule whose launch this is, if any.
+    pub(crate) intercept: Option<usize>,
+    /// The command sandbox the launch selected.
+    pub(crate) sandbox: crate::command_policy::CommandSandboxConfig,
+    /// What the launch builds, or why it would not launch from there.
+    pub(crate) launch: std::result::Result<DryRunLaunch, String>,
+}
+
+/// The child's launch, as the child itself applies it: its capability set
+/// read back from the launch spec, the binary it runs, and (Linux) its
+/// execute allowlist.
+pub(crate) struct DryRunLaunch {
+    pub(crate) executable: std::path::PathBuf,
     pub(crate) caps: nono::CapabilitySet,
-    /// The `exec_paths` the launch allows (existing ones only).
     pub(crate) exec_paths: Vec<std::path::PathBuf>,
-    /// Every path the policy declares, expanded as the launch expands it before
-    /// it checks the path exists.
-    pub(crate) declared: Vec<DeclaredGrant>,
 }
 
 /// One path a command sandbox's policy declares.
@@ -58,13 +70,12 @@ pub(crate) struct DeclaredGrant {
 
 /// No command mediation on this platform: a command sandbox cannot be resolved.
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-pub(crate) fn resolve_policy_grants(
+pub(crate) fn declared_policy_paths(
     _policy: &crate::command_policy::CommandSandboxConfig,
     _policy_root: &std::path::Path,
     _cwd: &std::path::Path,
     _outer_caps: &nono::CapabilitySet,
-    _deny_paths: &[std::path::PathBuf],
-) -> nono::Result<PolicyGrants> {
+) -> nono::Result<Vec<DeclaredGrant>> {
     Err(nono::NonoError::UnsupportedPlatform(
         "command sandboxes are not mediated on this platform".to_string(),
     ))
@@ -685,8 +696,8 @@ mod linux;
 
 #[cfg(target_os = "linux")]
 pub(crate) use linux::{
-    PreparedToolSandboxRuntime, TOOL_SANDBOX_PARENT_MONOTONIC_ENV, log_main_total,
-    maybe_run_internal_tool_sandbox_entrypoint, record_main_start, resolve_policy_grants,
+    PreparedToolSandboxRuntime, TOOL_SANDBOX_PARENT_MONOTONIC_ENV, declared_policy_paths,
+    log_main_total, maybe_run_internal_tool_sandbox_entrypoint, record_main_start,
 };
 
 #[cfg(target_os = "macos")]
@@ -695,8 +706,8 @@ mod macos;
 
 #[cfg(target_os = "macos")]
 pub(crate) use macos::{
-    PreparedToolSandboxRuntime, log_main_total, maybe_run_internal_tool_sandbox_entrypoint,
-    record_main_start, resolve_policy_grants, resume_mediated_children,
+    PreparedToolSandboxRuntime, declared_policy_paths, log_main_total,
+    maybe_run_internal_tool_sandbox_entrypoint, record_main_start, resume_mediated_children,
     signal_active_children_in_pgroup, signal_relay_write_fd, stop_active_children_in_pgroup,
     stop_signal_relay,
 };

@@ -3,49 +3,54 @@
 //! The text dry run is written for people. A program that needs to decide on
 //! the same answer (a launcher checking that a sandbox keeps away from some
 //! directory, say) would otherwise have to parse it, and a path can hold any
-//! byte the text framing uses. This report carries the same resolution as
-//! JSON on stdout: every filesystem and Unix-socket capability the run would
-//! apply (globs expanded, variables filled, symlinks followed, policy groups
-//! and user flags included), the effective network mode, the resource limits,
-//! and each brokered command's sandbox, resolved by the code that builds it at
-//! launch.
+//! byte the text framing uses.
 //!
-//! What it cannot model is named in `incomplete` (raw macOS Seatbelt rules,
-//! a credential it cannot resolve): a program that decides on the report
-//! treats a nonempty `incomplete` as "cannot be shown". Not listed at all: what
-//! nono adds for itself once it runs (its capability state file, the
-//! command-mediation shims and sockets under its runtime directory), what a
-//! brokered command's launch derives from the binary it runs rather than from
-//! its policy (the interpreter, the ELF dependency closure, an `exec`
-//! intercept's helper), and instruction files the trust scan verifies.
+//! The report is read from the launch's own plan, never from a resolver of its
+//! own: the run's capability set as `prepare_run_launch_plan` builds it (the
+//! code `nono run` uses: globs expanded, variables filled, symlinks followed,
+//! policy groups and user flags included), its network decision and resource
+//! limits, and each brokered command's sandbox as `build_child_launch_spec`
+//! builds it, read back from the launch spec the child applies.
+//!
+//! Its contract is that capability set. What else a run does is out of it and
+//! named in `out_of_scope`. What would widen filesystem access beyond the set
+//! (capability elevation, a Seatbelt allow rule) is named in `incomplete`, so a
+//! program that decides on the report fails closed when it is non-empty.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use nono::{
     AccessMode, CapabilitySet, CapabilitySource, FsCapability, Result, UnixSocketCapability,
 };
 use serde_json::{Value, json};
 
-use crate::cli::SandboxArgs;
-use crate::command_policy::{
-    CommandCredentialGrantConfig, CommandCredentialType, CommandPoliciesConfig,
-    CommandSandboxConfig, InterceptActionConfig,
-};
-use crate::sandbox_prepare::PreparedSandbox;
+use crate::launch_runtime::{LaunchPlan, NetworkIntent};
+use crate::tool_sandbox::DryRunChild;
 
 /// The report's format version: a new field is added without a change; a
 /// field changed or removed gets a new version.
 pub(crate) const DRY_RUN_REPORT_VERSION: u32 = 1;
 
-/// The report for `prepared`, as `nono run` would apply it from `workdir`.
-/// `raw_platform_rules`: how many raw Seatbelt rules the profile adds
-/// (`unsafe_macos_seatbelt_rules`), which the report cannot model.
+/// What a run does that the report does not cover: out of its contract.
+pub(crate) const OUT_OF_SCOPE: &[&str] = &[
+    "brokered commands' network policy (each command's proxy, ports and domains)",
+    "network enforcement left to the deployment (linux.sandbox_policy = external)",
+    "resolution of the program through PATH (program is as given)",
+    "session hooks, which run on the host outside the sandbox",
+    "environment credentials injected into the session or a command",
+    "URL opening delegated to the host browser (open_urls)",
+    "signal, process-information and IPC scope",
+    "nono's own per-launch files (its capability state file, command-mediation shims and sockets, the proxy's CA bundle)",
+];
+
+/// The report of `plan`, a run of `program` from `workdir`, with `children`
+/// (each brokered sandbox, as the launch builds it) and the profile's raw
+/// Seatbelt rules (`raw_rules`), which the capability list cannot show.
 pub(crate) fn dry_run_report(
-    args: &SandboxArgs,
-    prepared: &PreparedSandbox,
-    program: &std::ffi::OsStr,
+    plan: &LaunchPlan,
+    children: &[DryRunChild],
+    raw_rules: &[String],
     workdir: &Path,
-    raw_platform_rules: usize,
 ) -> Result<Value> {
     let workdir =
         workdir
@@ -54,43 +59,39 @@ pub(crate) fn dry_run_report(
                 path: workdir.to_path_buf(),
                 source,
             })?;
-    // The child's own view: on Linux the launch widens a read grant of
-    // `/proc/self` to `/proc` (every descendant reads its own entries).
+    // The child's own view: the exec widens a read grant of `/proc/self` to
+    // `/proc` (every descendant reads its own entries), the call it makes.
     #[cfg(target_os = "linux")]
     let caps = {
-        let mut caps = prepared.caps.clone();
+        let mut caps = plan.caps.clone();
         caps.widen_procfs_self_to_proc();
         caps
     };
     #[cfg(not(target_os = "linux"))]
-    let caps = prepared.caps.clone();
+    let caps = plan.caps.clone();
     let mut incomplete: Vec<String> = Vec::new();
-    // (Only the profile's raw rules: the rules nono generates itself, its
-    // protected-root denies among them, are part of the resolution reported.)
-    if raw_platform_rules > 0 {
-        incomplete.push(format!(
-            "{raw_platform_rules} raw Seatbelt rule(s) (unsafe_macos_seatbelt_rules) the report cannot model"
-        ));
+    #[cfg(target_os = "linux")]
+    if plan.flags.capability_elevation || caps.extensions_enabled() {
+        incomplete.push(
+            "capability elevation: the supervisor can grant paths beyond this list at runtime"
+                .to_string(),
+        );
     }
+    incomplete.extend(seatbelt_widenings(&caps, raw_rules));
     let limits = caps.resource_limits();
-    let commands = match prepared.command_policies.as_ref() {
-        Some(config) if config.is_active() => command_reports(
-            config,
-            prepared.resolved_command_binaries.as_ref(),
-            &workdir,
-            &caps,
-            &prepared.deny_paths,
-        )?,
-        _ => Vec::new(),
-    };
+    let commands = children
+        .iter()
+        .map(|child| child_value(child, &workdir, &caps))
+        .collect::<Result<Vec<_>>>()?;
     Ok(json!({
         "version": DRY_RUN_REPORT_VERSION,
-        "program": path_value(Path::new(program)),
+        "program": path_value(Path::new(&plan.program)),
         "workdir": path_value(&workdir),
         "incomplete": incomplete,
+        "out_of_scope": OUT_OF_SCOPE,
         "filesystem": caps.fs_capabilities().iter().map(fs_value).collect::<Vec<_>>(),
         "unix_sockets": caps.unix_socket_capabilities().iter().map(socket_value).collect::<Vec<_>>(),
-        "network": network_value(args, prepared)?,
+        "network": { "mode": network_mode(&plan.flags.network, &caps) },
         "resources": {
             "memory_bytes": limits.and_then(|l| l.memory_bytes),
             "max_processes": limits.and_then(|l| l.max_processes),
@@ -99,262 +100,96 @@ pub(crate) fn dry_run_report(
     }))
 }
 
-/// The network mode the run applies, decided as the launch decides it
-/// (`prepare_proxy_launch_options`, which builds the proxy's settings without
-/// starting it): blocked, filtered through the proxy, or allowed.
-fn network_value(args: &SandboxArgs, prepared: &PreparedSandbox) -> Result<Value> {
-    let intent = crate::proxy_runtime::prepare_proxy_launch_options(
-        args,
-        prepared,
-        true,
-        "dry-run".to_string(),
-    )?;
-    // With no proxy and no block decided, the launch keeps the prepared
-    // capability set's own mode (a manifest's `"mode": "blocked"`, say).
-    let mode = match intent {
-        crate::launch_runtime::NetworkIntent::BlockAll => "blocked",
-        ref intent if intent.is_proxy_active() => "proxy",
-        _ => match prepared.caps.network_mode() {
+/// The network mode the plan decided: blocked, through the proxy, or open
+/// (with no proxy or block decided, the capability set's own mode).
+fn network_mode(intent: &NetworkIntent, caps: &CapabilitySet) -> &'static str {
+    match intent {
+        NetworkIntent::BlockAll => "blocked",
+        intent if intent.is_proxy_active() => "proxy",
+        _ => match caps.network_mode() {
             nono::NetworkMode::Blocked => "blocked",
             nono::NetworkMode::ProxyOnly { .. } => "proxy",
             nono::NetworkMode::AllowAll => "allowed",
         },
-    };
-    Ok(json!({ "mode": mode, "blocked": mode != "allowed" }))
+    }
 }
 
-/// Each sandbox a brokered command can run under, as the runtime selects it:
-/// its session sandbox (`from.session`, else the top-level `sandbox`), each
-/// `from.<caller>` edge whose caller is a command that lists it in `can_use`,
-/// and each intercept rule's override when the command can run at all. An
-/// explicit deny runs nothing and is not listed.
-fn command_reports(
-    config: &CommandPoliciesConfig,
-    binaries: Option<&crate::command_policy::ResolvedCommandBinaries>,
-    workdir: &Path,
-    outer_caps: &CapabilitySet,
-    deny_paths: &[PathBuf],
-) -> Result<Vec<Value>> {
+/// The Seatbelt rules that can grant beyond the capability list: the
+/// profile's raw rules, whatever they say, and every other `allow` rule the
+/// preparation generated (a keychain grant, say). Deny rules only narrow.
+fn seatbelt_widenings(caps: &CapabilitySet, raw_rules: &[String]) -> Vec<String> {
     let mut out = Vec::new();
-    for (name, command) in &config.commands {
-        let ctx = CommandContext {
-            config,
-            name,
-            executable: binaries
-                .and_then(|b| b.commands.get(name))
-                .map(|b| b.canonical_path.clone()),
-            workdir,
-            outer_caps,
-            deny_paths,
-        };
-        let session = match command.from.get("session") {
-            Some(from) => from.sandbox(),
-            None => command.sandbox.as_ref(),
-        };
-        // Each sandbox a run of the command selects, with the caller that
-        // selects it.
-        let mut selected: Vec<(&str, &CommandSandboxConfig)> = Vec::new();
-        if let Some(sandbox) = session {
-            selected.push(("session", sandbox));
-            out.push(ctx.value(Some("session"), None, sandbox, None)?);
-        }
-        for (caller, from) in &command.from {
-            if caller == "session" {
-                continue;
-            }
-            let admitted = config
-                .commands
-                .get(caller)
-                .is_some_and(|c| c.can_use.iter().any(|n| n == name));
-            if let (true, Some(sandbox)) = (admitted, from.sandbox()) {
-                selected.push((caller.as_str(), sandbox));
-                out.push(ctx.value(Some(caller), None, sandbox, None)?);
-            }
-        }
-        // (An intercept rule applies to a run of the command, which only a
-        // session or admitted caller makes.) A `respond` rule launches nothing.
-        // A rule with a sandbox of its own runs under it, whoever called; an
-        // `exec` rule without one runs its helper under each sandbox the
-        // callers select; any other rule without one runs the command as
-        // already listed.
-        if !selected.is_empty() {
-            for (index, rule) in command.intercept.iter().enumerate() {
-                let helper = match &rule.action {
-                    InterceptActionConfig::Respond { .. } => continue,
-                    InterceptActionConfig::Exec { command: argv } => {
-                        argv.first().map(String::as_str)
-                    }
-                    _ => None,
-                };
-                match (rule.sandbox.as_ref(), helper) {
-                    (Some(sandbox), _) => {
-                        out.push(ctx.value(None, Some(index), sandbox, helper)?)
-                    }
-                    (None, Some(_)) => {
-                        for (caller, sandbox) in &selected {
-                            out.push(ctx.value(Some(caller), Some(index), sandbox, helper)?);
-                        }
-                    }
-                    (None, None) => {}
-                }
-            }
+    if !raw_rules.is_empty() {
+        out.push(format!(
+            "{} raw Seatbelt rule(s) (unsafe_macos_seatbelt_rules) the capability list cannot show",
+            raw_rules.len()
+        ));
+    }
+    let generated = caps
+        .platform_rules()
+        .iter()
+        .filter(|rule| !raw_rules.contains(rule) && rule.trim_start().starts_with("(allow"))
+        .count();
+    if generated > 0 {
+        out.push(format!(
+            "{generated} generated Seatbelt allow rule(s) that grant beyond the capability list"
+        ));
+    }
+    out
+}
+
+/// One brokered sandbox: what its launch builds (filesystem, sockets, the
+/// binary it runs, its execute allowlist), what would widen it, and every path
+/// its policy declares, which a later run resolves again.
+fn child_value(child: &DryRunChild, workdir: &Path, outer_caps: &CapabilitySet) -> Result<Value> {
+    let declared =
+        crate::tool_sandbox::declared_policy_paths(&child.sandbox, workdir, workdir, outer_caps)?;
+    let mut cwd_dependent: Vec<&String> = Vec::new();
+    for d in declared.iter().filter(|d| d.cwd_dependent) {
+        if !cwd_dependent.contains(&&d.entry) {
+            cwd_dependent.push(&d.entry);
         }
     }
-    Ok(out)
-}
-
-struct CommandContext<'a> {
-    config: &'a CommandPoliciesConfig,
-    name: &'a str,
-    executable: Option<PathBuf>,
-    workdir: &'a Path,
-    outer_caps: &'a CapabilitySet,
-    deny_paths: &'a [PathBuf],
-}
-
-impl CommandContext<'_> {
-    /// `helper`: an `exec` intercept's helper, as written, which the launch runs
-    /// in place of the command's own executable.
-    fn value(
-        &self,
-        caller: Option<&str>,
-        intercept: Option<usize>,
-        sandbox: &CommandSandboxConfig,
-        helper: Option<&str>,
-    ) -> Result<Value> {
-        // Resolved as a run of the command from the working directory would be.
-        let grants = crate::tool_sandbox::resolve_policy_grants(
-            sandbox,
-            self.workdir,
-            self.workdir,
-            self.outer_caps,
-            self.deny_paths,
-        )?;
-        let mut caps = grants.caps;
-        let mut incomplete: Vec<String> = Vec::new();
-        let executable = match helper {
-            None => self.executable.clone(),
-            Some(raw) => match crate::policy::expand_env_vars_strict(raw)
-                .map_err(|e| e.to_string())
-                .and_then(|p| PathBuf::from(p).canonicalize().map_err(|e| e.to_string()))
-            {
-                Ok(path) => Some(path),
-                Err(reason) => {
-                    incomplete.push(format!("exec helper '{raw}': {reason}"));
-                    None
-                }
-            },
-        };
-        if !sandbox.unsafe_macos_seatbelt_rules.is_empty() {
-            incomplete.push(format!(
-                "{} raw Seatbelt rule(s) (unsafe_macos_seatbelt_rules) the report cannot model",
-                sandbox.unsafe_macos_seatbelt_rules.len()
-            ));
-        }
-        // The credentials its launch hands it as paths: a raw file to read, a
-        // local socket to connect to.
-        for handle in credential_names(sandbox) {
-            let Some(credential) = self.config.credentials.get(handle) else {
-                incomplete.push(format!("credential '{handle}' is not defined"));
-                continue;
-            };
-            match credential_path(credential) {
-                // A path that isn't the kind the credential says (a regular
-                // file named as a socket) leaves the credential unavailable
-                // at launch; it is named here rather than failing the report.
-                Ok(Some((path, CommandCredentialType::LocalSocket))) => {
-                    match UnixSocketCapability::new_file(&path, nono::UnixSocketMode::Connect)
-                        .and_then(|socket| {
-                            FsCapability::new_file(&path, AccessMode::Read).map(|f| (socket, f))
-                        }) {
-                        Ok((socket, file)) => {
-                            caps.add_unix_socket(socket);
-                            caps.add_fs(file);
-                        }
-                        Err(e) => incomplete.push(format!("credential '{handle}': {e}")),
-                    }
-                }
-                // (The launch reads a raw-file credential only from a regular
-                // file: a device, a FIFO or a socket leaves it unavailable.)
-                Ok(Some((path, _))) if !path.is_file() => incomplete.push(format!(
-                    "credential '{handle}': {} is not a regular file",
-                    path.display()
-                )),
-                Ok(Some((path, _))) => match FsCapability::new_file(&path, AccessMode::Read) {
-                    Ok(file) => caps.add_fs(file),
-                    Err(e) => incomplete.push(format!("credential '{handle}': {e}")),
-                },
-                Ok(None) => {}
-                Err(reason) => incomplete.push(format!("credential '{handle}': {reason}")),
-            }
-        }
-        // The entries whose meaning depends on where the command runs: a
-        // dynamic `@` token, or an entry still relative once its variables are
-        // filled, resolve against its live working directory.
-        let mut cwd_dependent: Vec<&String> = Vec::new();
-        for d in grants.declared.iter().filter(|d| d.cwd_dependent) {
-            if !cwd_dependent.contains(&&d.entry) {
-                cwd_dependent.push(&d.entry);
-            }
-        }
-        Ok(json!({
-            "command": self.name,
-            "caller": caller,
-            "intercept": intercept,
-            "executable": executable.as_deref().map(path_value),
-            "incomplete": incomplete,
-            "filesystem": caps.fs_capabilities().iter().map(fs_value).collect::<Vec<_>>(),
-            "unix_sockets": caps.unix_socket_capabilities().iter().map(socket_value).collect::<Vec<_>>(),
-            "exec_paths": grants.exec_paths.iter().map(|p| path_value(p)).collect::<Vec<_>>(),
-            "declared": grants.declared.iter().map(|d| json!({
+    let declared: Vec<Value> = declared
+        .iter()
+        .map(|d| {
+            json!({
                 "field": d.field,
                 "entry": d.entry,
                 "expanded": d.expanded.as_deref().map(path_value),
-            })).collect::<Vec<_>>(),
-            "cwd_dependent": cwd_dependent,
-        }))
+            })
+        })
+        .collect();
+    let mut value = json!({
+        "command": child.command,
+        "caller": child.caller,
+        "intercept": child.intercept,
+        "declared": declared,
+        "cwd_dependent": cwd_dependent,
+    });
+    let launch = match &child.launch {
+        Ok(launch) => {
+            let raw = &child.sandbox.unsafe_macos_seatbelt_rules;
+            json!({
+                "executable": path_value(&launch.executable),
+                "incomplete": seatbelt_widenings(&launch.caps, raw),
+                "filesystem": launch.caps.fs_capabilities().iter().map(fs_value).collect::<Vec<_>>(),
+                "unix_sockets": launch.caps.unix_socket_capabilities().iter().map(socket_value).collect::<Vec<_>>(),
+                "exec_paths": launch.exec_paths.iter().map(|p| path_value(p)).collect::<Vec<_>>(),
+            })
+        }
+        Err(reason) => json!({
+            "executable": null,
+            "incomplete": [format!("its launch from the working directory is not built: {reason}")],
+            "filesystem": [],
+            "unix_sockets": [],
+            "exec_paths": [],
+        }),
+    };
+    if let (Some(object), Some(launch)) = (value.as_object_mut(), launch.as_object()) {
+        object.extend(launch.clone());
     }
-}
-
-/// The credential handles a command sandbox uses (`use_credentials`, then
-/// `credentials`), as the launch reads them.
-fn credential_names(sandbox: &CommandSandboxConfig) -> Vec<&str> {
-    let mut names: Vec<&str> = sandbox.use_credentials.iter().map(String::as_str).collect();
-    names.extend(
-        sandbox
-            .credentials
-            .iter()
-            .map(|credential| match credential {
-                CommandCredentialGrantConfig::Name(name) => name.as_str(),
-                CommandCredentialGrantConfig::Policy(policy) => policy.name.as_str(),
-            }),
-    );
-    names
-}
-
-/// A raw-file or local-socket credential's canonical path, as the launch
-/// resolves it; none for a proxied or ambient one, which hands the command no
-/// path. An error when the launch could not resolve it either.
-fn credential_path(
-    credential: &crate::command_policy::CommandCredentialConfig,
-) -> std::result::Result<Option<(PathBuf, CommandCredentialType)>, String> {
-    let kind = credential.credential_type;
-    let template = match kind {
-        CommandCredentialType::RawFile | CommandCredentialType::LocalSocket => {
-            credential.path.as_deref().ok_or("no path")?
-        }
-        CommandCredentialType::Proxy | CommandCredentialType::Ambient => return Ok(None),
-    };
-    let expanded = match kind {
-        CommandCredentialType::LocalSocket => {
-            crate::policy::expand_env_vars_strict(template).map_err(|e| e.to_string())?
-        }
-        _ => template.to_string(),
-    };
-    let path = PathBuf::from(expanded)
-        .canonicalize()
-        .map_err(|e| e.to_string())?;
-    Ok(Some((path, kind)))
+    Ok(value)
 }
 
 fn fs_value(cap: &FsCapability) -> Value {

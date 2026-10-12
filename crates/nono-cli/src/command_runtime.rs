@@ -207,20 +207,19 @@ pub(crate) fn run_sandbox(mut run_args: RunArgs, silent: bool) -> Result<()> {
     }
 
     if args.dry_run && run_args.json {
-        // The same preparation as the text dry run, reported as data on stdout;
-        // nothing else is printed there.
-        let prepared = prepare_sandbox(&args, true)?;
-        validate_proxy_conflicts(&args, &prepared)?;
-        let workdir = crate::launch_runtime::resolve_requested_workdir(args.workdir.as_ref());
-        let raw_platform_rules = loaded_profile
+        // The launch's own plan, built as `run` builds it, reported as data on
+        // stdout; nothing else is printed there, and nothing is launched.
+        let raw_rules = loaded_profile
             .as_ref()
-            .map_or(0, |(_, profile)| profile.unsafe_macos_seatbelt_rules.len());
+            .map(|(_, profile)| profile.unsafe_macos_seatbelt_rules.clone())
+            .unwrap_or_default();
+        let plan = prepare_run_launch_plan(run_args, program, cmd_args, true)?;
+        let children = crate::execution_runtime::dry_run_children(&plan)?;
         let report = crate::dry_run_report::dry_run_report(
-            &args,
-            &prepared,
-            &program,
-            &workdir,
-            raw_platform_rules,
+            &plan,
+            &children,
+            &raw_rules,
+            &plan.flags.workdir,
         )?;
         let text = serde_json::to_string_pretty(&report)
             .map_err(|e| NonoError::ConfigParse(format!("dry-run report: {e}")))?;

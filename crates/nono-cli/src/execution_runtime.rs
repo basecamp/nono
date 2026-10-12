@@ -200,6 +200,84 @@ fn recommended_pack_profile(program: &Path) -> Option<&'static str> {
     }
 }
 
+/// Each sandbox the plan's brokered commands can run under, built by the
+/// command-mediation runtime `execute_sandboxed` prepares (the same
+/// `PreparedToolSandboxRuntime::prepare`, with the plan's capability set, deny
+/// paths and command policies), for a run from the plan's working directory;
+/// for `nono run --dry-run --json`. No proxy is started: the command-scoped
+/// credential routes the plan's proxy would carry are named, its ports and
+/// trust bundle (nono's own, out of the report's contract) are not. The
+/// runtime's directory is removed before this returns.
+pub(crate) fn dry_run_children(plan: &LaunchPlan) -> Result<Vec<crate::tool_sandbox::DryRunChild>> {
+    let flags = &plan.flags;
+    let Some(command_policies) = flags
+        .command_policies
+        .as_ref()
+        .filter(|config| config.is_active())
+    else {
+        return Ok(Vec::new());
+    };
+    validate_command_policy_execution_support()?;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let caps = &plan.caps;
+        let requested_workdir =
+            flags
+                .workdir
+                .canonicalize()
+                .map_err(|e| NonoError::PathCanonicalization {
+                    path: flags.workdir.to_path_buf(),
+                    source: e,
+                })?;
+        let proxy_credentials: std::collections::BTreeSet<String> = flags
+            .network
+            .proxy_options()
+            .filter(|proxy| proxy.is_active())
+            .map(|proxy| {
+                proxy
+                    .tool_sandbox_proxy_credentials
+                    .iter()
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        #[cfg(target_os = "linux")]
+        let resolved_program = exec_strategy::resolve_program(&plan.program)?;
+        let runtime = crate::tool_sandbox::PreparedToolSandboxRuntime::prepare(
+            crate::tool_sandbox::ToolSandboxPrepare {
+                config: command_policies,
+                #[cfg(target_os = "linux")]
+                initial_program: &resolved_program,
+                resolved_command_binaries: flags.resolved_command_binaries.as_ref(),
+                audit_context: crate::tool_sandbox::ToolSandboxAuditContext::new(
+                    flags.profile_display_name.clone(),
+                    flags.redaction_policy.clone(),
+                ),
+                allowed_commands: caps.allowed_commands(),
+                blocked_commands: caps.blocked_commands(),
+                outer_caps: caps,
+                deny_paths: &plan.deny_paths,
+                #[cfg(target_os = "macos")]
+                bypass_protection_paths: &flags.bypass_protection_paths,
+                policy_root: &requested_workdir,
+                proxy_credentials: &proxy_credentials,
+                reserved_proxy_ports: &std::collections::BTreeSet::new(),
+                scoped_proxy_env_vars: &std::collections::BTreeMap::new(),
+                proxy_trust_bundle_paths: &[],
+                shared_broker: None,
+            },
+        )?;
+        let children = runtime.dry_run_children(&requested_workdir);
+        runtime.cleanup_runtime_dir();
+        Ok(children)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = command_policies;
+        Ok(Vec::new())
+    }
+}
+
 pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
     let LaunchPlan {
         program,
