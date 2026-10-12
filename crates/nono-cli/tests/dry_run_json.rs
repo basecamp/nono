@@ -513,3 +513,24 @@ fn a_credential_the_launch_cannot_resolve_fails_the_dry_run_as_the_run() {
         .exec(Argv::new("/bin/true"))
         .assert_failure("an unresolvable credential stops the dry run, as it stops the run");
 }
+
+/// A brokered command whose sandbox goes through a proxy of its own is built
+/// as a run builds it: the dry run models the scoped proxy the run would
+/// start (its network is out of the report's contract).
+#[test]
+fn a_command_with_a_proxy_of_its_own_is_reported() {
+    let t = nono_test!("dry-run-json-scoped-proxy");
+    let report = report(
+        &t,
+        r#"{"meta":{"name":"t"},"network":{"allow_domain":["example.com"]},"command_policies":{"commands":{"probe":{"executable":"/bin/true","sandbox":{"network":{"allow_domain":["example.org"]}}}}}}"#,
+        |run| run.allow_cwd(),
+    );
+    let probe = report["commands"]
+        .as_array()
+        .expect("commands")
+        .iter()
+        .find(|c| c["command"] == "probe" && c["intercept"].is_null())
+        .unwrap_or_else(|| panic!("probe listed: {report}"));
+    assert_eq!(probe["incomplete"], serde_json::json!([]), "{probe}");
+    assert_eq!(probe["executable"], canon(Path::new("/bin/true")).as_str());
+}

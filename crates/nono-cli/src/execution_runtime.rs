@@ -205,8 +205,9 @@ fn recommended_pack_profile(program: &Path) -> Option<(&'static str, &'static [&
 /// `PreparedToolSandboxRuntime::prepare`, with the plan's capability set, deny
 /// paths and command policies), for a run from the plan's working directory;
 /// for `nono run --dry-run --json`. No proxy is started: the command-scoped
-/// credential routes the plan's proxy would carry are named, its ports and
-/// trust bundle (nono's own, out of the report's contract) are not. The
+/// credential routes the plan's proxy would carry are named, and each scope it
+/// would serve gets a stand-in loopback address; its ports and trust bundle
+/// (nono's own, and network, out of the report's contract) are not modeled. The
 /// runtime's directory is removed before this returns.
 pub(crate) fn dry_run_children(plan: &LaunchPlan) -> Result<Vec<crate::tool_sandbox::DryRunChild>> {
     let flags = &plan.flags;
@@ -241,6 +242,8 @@ pub(crate) fn dry_run_children(plan: &LaunchPlan) -> Result<Vec<crate::tool_sand
                     .collect()
             })
             .unwrap_or_default();
+        let scoped_proxy_env_vars =
+            crate::proxy_runtime::dry_run_scoped_proxy_env_vars(&flags.network);
         #[cfg(target_os = "linux")]
         let resolved_program = exec_strategy::resolve_program(&plan.program)?;
         let runtime = crate::tool_sandbox::PreparedToolSandboxRuntime::prepare(
@@ -262,7 +265,7 @@ pub(crate) fn dry_run_children(plan: &LaunchPlan) -> Result<Vec<crate::tool_sand
                 policy_root: &requested_workdir,
                 proxy_credentials: &proxy_credentials,
                 reserved_proxy_ports: &std::collections::BTreeSet::new(),
-                scoped_proxy_env_vars: &std::collections::BTreeMap::new(),
+                scoped_proxy_env_vars: &scoped_proxy_env_vars,
                 proxy_trust_bundle_paths: &[],
                 shared_broker: None,
             },
