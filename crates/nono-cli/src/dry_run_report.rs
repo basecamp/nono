@@ -127,6 +127,7 @@ pub(crate) fn dry_run_report(
         // (Each as declared: a dry run reads no credential source.)
         "credentials": {
             "env": plan.loaded_secrets.iter().map(|secret| secret.env_var.clone()).collect::<Vec<_>>(),
+            "proxy": proxy_credential_names(&plan.flags.network),
             "commands": mediation.credentials.iter().map(|c| json!({
                 "name": c.name,
                 "type": c.kind,
@@ -142,6 +143,26 @@ pub(crate) fn dry_run_report(
         },
         "commands": commands,
     }))
+}
+
+/// The credential routes the session's proxy would carry, by name (a
+/// `--credential` service, a profile's custom credential), as declared.
+fn proxy_credential_names(intent: &NetworkIntent) -> Vec<String> {
+    let mut names: Vec<String> = intent
+        .proxy_options()
+        .and_then(|proxy| proxy.credentials.as_ref())
+        .map(|credentials| {
+            credentials
+                .credentials
+                .iter()
+                .cloned()
+                .chain(credentials.custom_credentials.keys().cloned())
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names.dedup();
+    names
 }
 
 /// A session grant as the child gets it. One the launch remaps to the child's

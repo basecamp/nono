@@ -1981,7 +1981,7 @@ fn load_supervisor_credential_source(
     outer_caps: &CapabilitySet,
 ) -> Result<String> {
     // (A dry run reads no source: the route is planned as declared.)
-    if crate::credential_runtime::credential_sources_skipped() {
+    if crate::credential_runtime::plan_only() {
         return Ok(String::new());
     }
     match source {
