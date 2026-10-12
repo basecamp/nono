@@ -3254,6 +3254,13 @@ fn load_registry_profile(name_or_path: &str, cli_extends: &[String]) -> Result<P
     // Check if pack is already installed
     if !install_dir.join("package.json").exists() {
         eprintln!("Profile '{}' not found locally.", package_ref.key());
+        // (A JSON dry run only plans: it pulls nothing.)
+        if crate::credential_runtime::plan_only() {
+            return Err(NonoError::ProfileNotFound(format!(
+                "pack '{}' is not installed, and a dry run doesn't pull it",
+                package_ref.key()
+            )));
+        }
 
         // Auto-pull from registry
         crate::package_cmd::run_pull(
