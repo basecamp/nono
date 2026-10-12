@@ -1335,15 +1335,7 @@ pub fn print_update_notification(info: &crate::update_check::UpdateInfo, silent:
 pub fn prompt_cwd_sharing(cwd: &Path, access: &AccessMode) -> Result<bool> {
     let t = theme::current();
     let stdin = std::io::stdin();
-    // (A JSON dry run only plans and asks nothing: as on a non-interactive
-    // stdin, the working directory is shared only with --allow-cwd.)
-    if crate::credential_runtime::plan_only() && stdin.is_terminal() {
-        crate::credential_runtime::note_undecided(format!(
-            "the working directory ({}) is shared only if the person confirms at launch",
-            cwd.display()
-        ));
-    }
-    if !stdin.is_terminal() || crate::credential_runtime::plan_only() {
+    if !stdin.is_terminal() {
         eprintln!(
             "  {}",
             fg(

@@ -1829,6 +1829,13 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
             Some(DetachedCwdPromptResponse::Deny)
         ) {
             info!("Detached launch declined CWD sharing. Continuing without automatic CWD access.");
+        } else if crate::credential_runtime::plan_only() {
+            // (A JSON dry run asks nothing: it plans without the working
+            // directory, which a run shares only if the person confirms.)
+            crate::credential_runtime::note_undecided(format!(
+                "the working directory ({}) is shared only if the person confirms at launch (or with --allow-cwd)",
+                request.cwd_canonical.display()
+            ));
         } else if missing_cwd_prompt_must_fail(silent, detached_launch, detached_prompt_response) {
             return Err(NonoError::CwdPromptRequired);
         } else {
