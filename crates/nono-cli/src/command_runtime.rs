@@ -212,7 +212,16 @@ pub(crate) fn run_sandbox(mut run_args: RunArgs, silent: bool) -> Result<()> {
         let prepared = prepare_sandbox(&args, true)?;
         validate_proxy_conflicts(&args, &prepared)?;
         let workdir = crate::launch_runtime::resolve_requested_workdir(args.workdir.as_ref());
-        let report = crate::dry_run_report::dry_run_report(&args, &prepared, &program, &workdir)?;
+        let raw_platform_rules = loaded_profile
+            .as_ref()
+            .map_or(0, |(_, profile)| profile.unsafe_macos_seatbelt_rules.len());
+        let report = crate::dry_run_report::dry_run_report(
+            &args,
+            &prepared,
+            &program,
+            &workdir,
+            raw_platform_rules,
+        )?;
         let text = serde_json::to_string_pretty(&report)
             .map_err(|e| NonoError::ConfigParse(format!("dry-run report: {e}")))?;
         println!("{text}");
