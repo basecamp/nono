@@ -414,6 +414,11 @@ pub(super) fn load_supervisor_credential_source(
     source: &crate::command_policy::AmbientCredentialSourceConfig,
     outer_caps: &nono::CapabilitySet,
 ) -> nono::Result<Vec<u8>> {
+    if crate::credential_runtime::credential_sources_skipped() {
+        return Err(nono::NonoError::SandboxInit(
+            "a dry run reads no credential source".to_string(),
+        ));
+    }
     match source {
         crate::command_policy::AmbientCredentialSourceConfig::Keystore { key } => {
             let secret = nono::keystore::load_secret_by_ref(

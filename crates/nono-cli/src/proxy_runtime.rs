@@ -2001,6 +2001,10 @@ fn load_supervisor_credential_source(
     source: &crate::command_policy::AmbientCredentialSourceConfig,
     outer_caps: &CapabilitySet,
 ) -> Result<String> {
+    // (A dry run reads no source: the route is planned as declared.)
+    if crate::credential_runtime::credential_sources_skipped() {
+        return Ok(String::new());
+    }
     match source {
         crate::command_policy::AmbientCredentialSourceConfig::Keystore { key } => {
             nono::keystore::load_secret_by_ref(

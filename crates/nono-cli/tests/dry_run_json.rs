@@ -502,22 +502,116 @@ fn capability_elevation_makes_the_report_incomplete() {
     );
 }
 
-/// A credential the launch cannot resolve stops the run; the dry run stops
-/// with it rather than report a run that never starts.
+/// A credential that doesn't resolve as declared (a raw file not there) is
+/// listed from its declared path, named in `incomplete` so a consumer fails
+/// closed, and the rest of the report is still built.
 #[test]
-fn a_credential_the_launch_cannot_resolve_fails_the_dry_run_as_the_run() {
+fn a_credential_that_does_not_resolve_is_reported_from_its_declared_path() {
     let t = nono_test!("dry-run-json-credential");
-    let profile = t.write_profile(
-        "dry-run-json",
-        r#"{"meta":{"name":"t"},"command_policies":{"credentials":{"tok":{"type":"raw-file","path":"/nonexistent-7096/token"}},"commands":{"probe":{"executable":"/bin/true","sandbox":{"use_credentials":["tok"]}}}}}"#,
+    let report = report(
+        &t,
+        r#"{"meta":{"name":"t"},"command_policies":{"credentials":{"tok":{"type":"raw-file","path":"/nonexistent-7096/token"}},"commands":{"probe":{"executable":"/bin/true","sandbox":{"use_credentials":["tok"]}},"plain":{"executable":"/bin/echo","sandbox":{}}}}}"#,
+        |run| run.allow_cwd(),
     );
-    t.run()
-        .profile(&profile)
+    let tok = &report["credentials"]["commands"][0];
+    assert_eq!(tok["name"], "tok", "{report}");
+    assert_eq!(tok["type"], "raw-file");
+    assert_eq!(tok["path"], "/nonexistent-7096/token");
+    assert!(tok["resolved"].is_null());
+    assert!(tok["unresolved"].is_string(), "{tok}");
+    assert!(
+        report["incomplete"]
+            .as_array()
+            .expect("incomplete")
+            .iter()
+            .any(|i| i
+                .as_str()
+                .is_some_and(|i| i.starts_with("credential 'tok'"))),
+        "{report}"
+    );
+    let commands = report["commands"].as_array().expect("commands");
+    assert!(
+        commands
+            .iter()
+            .any(|c| c["command"] == "plain" && c["incomplete"] == serde_json::json!([])),
+        "the rest is built: {report}"
+    );
+}
+
+/// A dry run reads no credential source: a command-backed credential's
+/// command, which would leave a marker if it ran, doesn't run, and the report
+/// is otherwise the set the run applies (the run itself then runs it).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_dry_run_runs_no_credential_command() {
+    let t = nono_test!("dry-run-json-credential-command");
+    let marker = t.root().join("credential-command-ran");
+    let json = format!(
+        r#"{{"meta":{{"name":"t"}},"workdir":{{"access":"readwrite"}},"command_policies":{{"credentials":{{"tok":{{"type":"proxy","upstream":"https://api.example.com","env_var":"TOK","source":{{"type":"command","command":"/bin/sh","args":["-c","touch {marker}; echo t"]}}}}}},"commands":{{"probe":{{"executable":"/bin/true","sandbox":{{"credentials":[{{"name":"tok","endpoint_policy":{{"default":"allow"}}}}]}}}}}}}}}}"#,
+        marker = marker.display()
+    );
+    let report = report(&t, &json, |run| run.allow_cwd());
+    assert!(!marker.exists(), "the dry run ran the credential command");
+    assert_eq!(report["incomplete"], serde_json::json!([]), "{report}");
+    assert!(
+        report["commands"]
+            .as_array()
+            .expect("commands")
+            .iter()
+            .any(|c| c["command"] == "probe" && c["incomplete"] == serde_json::json!([])),
+        "the command is built as declared: {report}"
+    );
+    let profile = t.write_profile("dry-run-json", &json);
+    let state = run_capability_state(&t, &profile);
+    assert!(
+        marker.exists(),
+        "the run itself runs it (the profile is live)"
+    );
+    assert_eq!(
+        fs_set(&report["filesystem"]),
+        fs_set(&state["fs"]),
+        "otherwise the report is the set the run applies"
+    );
+}
+
+/// The capability state a real run of `profile` writes for itself
+/// (`$NONO_CAP_FILE`), read by the sandboxed shell.
+#[cfg(target_os = "linux")]
+fn run_capability_state(t: &NonoTest, profile: &nono_test_support::Profile) -> Value {
+    let completed = t
+        .run()
+        .profile(profile)
         .workdir(t.workspace())
         .allow_cwd()
-        .dry_run_json()
-        .exec(Argv::new("/bin/true"))
-        .assert_failure("an unresolvable credential stops the dry run, as it stops the run");
+        .exec(Argv::new("/bin/sh").arg("-c").arg(
+            "while IFS= read -r l || [ -n \"$l\" ]; do printf '%s\\n' \"$l\"; done < \"$NONO_CAP_FILE\"",
+        ))
+        .assert_success("the run applies the profile");
+    serde_json::from_str(completed.stdout().trim())
+        .unwrap_or_else(|e| panic!("the capability state is JSON ({e}): {}", completed.stdout()))
+}
+
+/// Path and access of each entry; /proc and what the launch remaps to the
+/// child's own process aside (the state names the run's process, the report
+/// the child's self-relative spelling).
+#[cfg(target_os = "linux")]
+fn fs_set(entries: &Value) -> Vec<(String, String)> {
+    let mut set: Vec<(String, String)> = entries
+        .as_array()
+        .expect("an array")
+        .iter()
+        .filter(|e| e["process_relative"] != true)
+        .map(|e| {
+            (
+                e["path"].as_str().expect("a path").to_string(),
+                e["access"].as_str().expect("an access").to_string(),
+            )
+        })
+        .filter(|(path, _)| !path.starts_with("/proc"))
+        .collect();
+    set.sort();
+    set.dedup();
+    set
 }
 
 /// A brokered command whose sandbox goes through a proxy of its own is built

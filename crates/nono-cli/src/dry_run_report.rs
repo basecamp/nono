@@ -51,6 +51,7 @@ pub(crate) const OUT_OF_SCOPE: &[&str] = &[
 pub(crate) fn dry_run_report(
     plan: &LaunchPlan,
     mediation: &crate::execution_runtime::DryRunMediation,
+    undecided: &[String],
     raw_rules: &[String],
     workdir: &Path,
 ) -> Result<Value> {
@@ -84,7 +85,10 @@ pub(crate) fn dry_run_report(
     } else {
         crate::execution_runtime::execution_start_dir(&workdir, &plan.caps)?
     };
-    let mut incomplete: Vec<String> = Vec::new();
+    let mut incomplete: Vec<String> = undecided.to_vec();
+    incomplete.extend(mediation.unresolved.iter().map(|(name, reason)| {
+        format!("credential '{name}' doesn't resolve as declared: {reason}")
+    }));
     #[cfg(target_os = "linux")]
     if plan.flags.capability_elevation || caps.extensions_enabled() {
         incomplete.push(
@@ -120,6 +124,17 @@ pub(crate) fn dry_run_report(
         "filesystem": caps.fs_capabilities().iter().map(session_fs_value).collect::<Vec<_>>(),
         "unix_sockets": caps.unix_socket_capabilities().iter().map(socket_value).collect::<Vec<_>>(),
         "metadata_paths": metadata_paths(&caps),
+        // (Each as declared: a dry run reads no credential source.)
+        "credentials": {
+            "env": plan.loaded_secrets.iter().map(|secret| secret.env_var.clone()).collect::<Vec<_>>(),
+            "commands": mediation.credentials.iter().map(|c| json!({
+                "name": c.name,
+                "type": c.kind,
+                "path": c.declared,
+                "resolved": c.resolved.as_deref().map(path_value),
+                "unresolved": c.unresolved,
+            })).collect::<Vec<_>>(),
+        },
         "network": network_value(&plan.flags.network, &caps),
         "resources": {
             "memory_bytes": limits.and_then(|l| l.memory_bytes),
