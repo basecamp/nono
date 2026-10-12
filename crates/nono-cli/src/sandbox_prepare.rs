@@ -762,7 +762,9 @@ fn finalize_prepared_sandbox(
     reject_cgroup_writable_grants_under_resource_limit(&prepared.caps)?;
 
     output::print_skipped_requested_paths(&collect_missing_cli_requested_paths(args), silent);
-    let proxy_pending = proxy_pending(args, &prepared);
+    let proxy_intent = has_proxy_intent(args, &prepared);
+    let block_wins = args.block_net || (prepared.profile_network_block && !proxy_intent);
+    let proxy_pending = !block_wins && !args.allow_net && proxy_intent;
     output::print_capabilities(
         &prepared.caps,
         blocked_grants,
@@ -907,15 +909,6 @@ fn reject_cgroup_writable_grants_under_resource_limit(caps: &CapabilitySet) -> R
 }
 
 /// Returns true if any CLI flag or profile field requires the proxy to run.
-/// Whether the run starts its proxy (and so applies `ProxyOnly`), as the text
-/// summary decides it: proxy intent, and neither a network block nor
-/// `--allow-net` winning over it.
-pub(crate) fn proxy_pending(args: &SandboxArgs, prepared: &PreparedSandbox) -> bool {
-    let proxy_intent = has_proxy_intent(args, prepared);
-    let block_wins = args.block_net || (prepared.profile_network_block && !proxy_intent);
-    !block_wins && !args.allow_net && proxy_intent
-}
-
 pub(crate) fn has_proxy_intent(args: &SandboxArgs, prepared: &PreparedSandbox) -> bool {
     args.has_proxy_flags()
         || !prepared.credentials.is_empty()

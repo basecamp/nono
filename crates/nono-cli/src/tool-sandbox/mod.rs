@@ -47,8 +47,10 @@ pub(crate) struct DeclaredGrant {
     /// The entry as written.
     pub(crate) entry: String,
     /// The entry expanded (dynamic tokens and variables filled, a relative entry
-    /// joined to the command's working directory), no link followed.
-    pub(crate) expanded: std::path::PathBuf,
+    /// joined to the command's working directory), no link followed; none when a
+    /// dynamic token expands to nothing from this working directory (it may
+    /// expand to something where the command runs).
+    pub(crate) expanded: Option<std::path::PathBuf>,
 }
 
 /// No command mediation on this platform: a command sandbox cannot be resolved.

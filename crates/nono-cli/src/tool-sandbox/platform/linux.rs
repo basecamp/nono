@@ -4033,13 +4033,20 @@ pub(crate) fn resolve_policy_grants(
         ("exec_paths", &policy.exec_paths),
     ] {
         for entry in entries {
-            for expanded in
-                expand_dynamic_tokens(std::slice::from_ref(entry), Some(&cwd), outer_caps)?
-            {
+            let expansions =
+                expand_dynamic_tokens(std::slice::from_ref(entry), Some(&cwd), outer_caps)?;
+            if expansions.is_empty() {
                 declared.push(super::DeclaredGrant {
                     field,
                     entry: entry.clone(),
-                    expanded: resolve_policy_path(&expanded, policy_root, &cwd)?,
+                    expanded: None,
+                });
+            }
+            for expanded in expansions {
+                declared.push(super::DeclaredGrant {
+                    field,
+                    entry: entry.clone(),
+                    expanded: Some(resolve_policy_path(&expanded, policy_root, &cwd)?),
                 });
             }
         }

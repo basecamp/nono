@@ -105,7 +105,8 @@ fn reports_each_brokered_command_sandbox_resolved() {
                 "from": {{
                   "session": {{"sandbox": {{"fs_read": ["{ws}/data-link", ".", "{ws}/not-yet"], "exec_paths": ["{ws}/helpers"], "use_credentials": ["tok"]}}}},
                   "caller": {{"sandbox": {{"fs_read": ["{ws}/from-caller"]}}}},
-                  "stranger": {{"sandbox": {{"fs_read": ["{ws}/other"]}}}}
+                  "stranger": {{"sandbox": {{"fs_read": ["{ws}/other"]}}}},
+                  "nocan": {{"sandbox": {{"fs_read": ["{ws}/other"]}}}}
                 }},
                 "intercept": [{{"args": ["x"], "sandbox": {{"fs_read": ["{ws}/intercepted"]}}}}]
               }},
@@ -114,9 +115,14 @@ fn reports_each_brokered_command_sandbox_resolved() {
                 "can_use": ["probe"],
                 "sandbox": {{"fs_write": ["{ws}/other"]}}
               }},
+              "nocan": {{
+                "executable": "/bin/echo",
+                "sandbox": {{"fs_read": ["{ws}/other"]}}
+              }},
               "denied": {{
                 "executable": "/bin/echo",
-                "from": {{"session": "deny"}}
+                "from": {{"session": "deny"}},
+                "intercept": [{{"args": ["y"], "sandbox": {{"fs_read": ["{ws}/intercepted"]}}}}]
               }}
             }}
           }}
@@ -187,12 +193,16 @@ fn reports_each_brokered_command_sandbox_resolved() {
         "{from_caller}"
     );
     assert!(
+        find("probe", "nocan").is_none(),
+        "an edge from a command that does not list probe in can_use never runs, and is not listed: {report}"
+    );
+    assert!(
         find("probe", "stranger").is_none(),
         "an edge from a caller that is no command listing probe in can_use never runs, and is not listed: {report}"
     );
     assert!(
         !commands.iter().any(|c| c["command"] == "denied"),
-        "an explicit session deny, with no admitted caller, runs nothing and is not listed: {report}"
+        "an explicit session deny, with no admitted caller, runs nothing, its intercept override neither, and is not listed: {report}"
     );
     let intercept = commands
         .iter()
@@ -232,6 +242,16 @@ fn reports_the_network_mode_the_run_applies() {
     let open = report(&t, r#"{"meta":{"name":"t"}}"#, |run| run);
     assert_eq!(
         open["network"],
+        serde_json::json!({"mode": "allowed", "blocked": false})
+    );
+    // A credential route defined but not enabled starts no proxy.
+    let defined_only = report(
+        &t,
+        r#"{"meta":{"name":"t"},"network":{"custom_credentials":{"x":{"upstream":"https://example.com","credential_key":"env://ASN_UNSET_TOKEN"}}}}"#,
+        |run| run,
+    );
+    assert_eq!(
+        defined_only["network"],
         serde_json::json!({"mode": "allowed", "blocked": false})
     );
 }

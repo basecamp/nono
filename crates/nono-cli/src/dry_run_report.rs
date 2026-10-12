@@ -14,15 +14,15 @@
 //! a credential it cannot resolve): a program that decides on the report
 //! treats a nonempty `incomplete` as "cannot be shown". Not listed at all: what
 //! nono adds for itself once it runs (its capability state file, the
-//! command-mediation shims and sockets under its runtime directory, a brokered
-//! command's runtime baseline of system libraries), and instruction files the
-//! trust scan verifies.
+//! command-mediation shims and sockets under its runtime directory), what a
+//! brokered command's launch derives from the binary it runs rather than from
+//! its policy (the interpreter, the ELF dependency closure, an `exec`
+//! intercept's helper), and instruction files the trust scan verifies.
 
 use std::path::{Path, PathBuf};
 
 use nono::{
-    AccessMode, CapabilitySet, CapabilitySource, FsCapability, NetworkMode, Result,
-    UnixSocketCapability,
+    AccessMode, CapabilitySet, CapabilitySource, FsCapability, Result, UnixSocketCapability,
 };
 use serde_json::{Value, json};
 
@@ -38,11 +38,14 @@ use crate::sandbox_prepare::PreparedSandbox;
 pub(crate) const DRY_RUN_REPORT_VERSION: u32 = 1;
 
 /// The report for `prepared`, as `nono run` would apply it from `workdir`.
+/// `raw_platform_rules`: how many raw Seatbelt rules the profile adds
+/// (`unsafe_macos_seatbelt_rules`), which the report cannot model.
 pub(crate) fn dry_run_report(
     args: &SandboxArgs,
     prepared: &PreparedSandbox,
     program: &std::ffi::OsStr,
     workdir: &Path,
+    raw_platform_rules: usize,
 ) -> Result<Value> {
     let workdir =
         workdir
@@ -62,10 +65,11 @@ pub(crate) fn dry_run_report(
     #[cfg(not(target_os = "linux"))]
     let caps = prepared.caps.clone();
     let mut incomplete: Vec<String> = Vec::new();
-    if !caps.platform_rules().is_empty() {
+    // (Only the profile's raw rules: the rules nono generates itself, its
+    // protected-root denies among them, are part of the resolution reported.)
+    if raw_platform_rules > 0 {
         incomplete.push(format!(
-            "{} raw platform rule(s) (unsafe_macos_seatbelt_rules) the report cannot model",
-            caps.platform_rules().len()
+            "{raw_platform_rules} raw Seatbelt rule(s) (unsafe_macos_seatbelt_rules) the report cannot model"
         ));
     }
     let limits = caps.resource_limits();
@@ -86,7 +90,7 @@ pub(crate) fn dry_run_report(
         "incomplete": incomplete,
         "filesystem": caps.fs_capabilities().iter().map(fs_value).collect::<Vec<_>>(),
         "unix_sockets": caps.unix_socket_capabilities().iter().map(socket_value).collect::<Vec<_>>(),
-        "network": network_value(args, prepared, &caps),
+        "network": network_value(args, prepared)?,
         "resources": {
             "memory_bytes": limits.and_then(|l| l.memory_bytes),
             "max_processes": limits.and_then(|l| l.max_processes),
@@ -95,21 +99,22 @@ pub(crate) fn dry_run_report(
     }))
 }
 
-/// The network mode the run applies: the proxy, when the run starts one, is
-/// decided after preparation (`proxy_runtime`), as the text summary decides it.
-fn network_value(args: &SandboxArgs, prepared: &PreparedSandbox, caps: &CapabilitySet) -> Value {
-    let mode = match caps.network_mode() {
-        NetworkMode::Blocked => "blocked",
-        NetworkMode::ProxyOnly { .. } => "proxy",
-        NetworkMode::AllowAll => {
-            if crate::sandbox_prepare::proxy_pending(args, prepared) {
-                "proxy"
-            } else {
-                "allowed"
-            }
-        }
+/// The network mode the run applies, decided as the launch decides it
+/// (`prepare_proxy_launch_options`, which builds the proxy's settings without
+/// starting it): blocked, filtered through the proxy, or allowed.
+fn network_value(args: &SandboxArgs, prepared: &PreparedSandbox) -> Result<Value> {
+    let intent = crate::proxy_runtime::prepare_proxy_launch_options(
+        args,
+        prepared,
+        true,
+        "dry-run".to_string(),
+    )?;
+    let mode = match intent {
+        crate::launch_runtime::NetworkIntent::BlockAll => "blocked",
+        ref intent if intent.is_proxy_active() => "proxy",
+        _ => "allowed",
     };
-    json!({ "mode": mode, "blocked": mode != "allowed" })
+    Ok(json!({ "mode": mode, "blocked": mode != "allowed" }))
 }
 
 /// Each sandbox a brokered command can run under, as the runtime selects it:
@@ -158,6 +163,8 @@ fn command_reports(
                 out.push(ctx.value(Some(caller), None, sandbox)?);
             }
         }
+        // (An intercept rule's override applies to a run of the command, which
+        // only a session or admitted caller makes.)
         if reachable {
             for (index, rule) in command.intercept.iter().enumerate() {
                 if let Some(sandbox) = rule.sandbox.as_ref() {
@@ -226,10 +233,14 @@ impl CommandContext<'_> {
         // The entries whose meaning depends on where the command runs: a
         // relative path, or a dynamic `@` token, resolve against its live
         // working directory.
-        let cwd_dependent: Vec<&String> = grants
-            .declared
+        let cwd_dependent: Vec<&String> = sandbox
+            .fs_read
             .iter()
-            .map(|d| &d.entry)
+            .chain(&sandbox.fs_read_file)
+            .chain(&sandbox.fs_write)
+            .chain(&sandbox.fs_write_file)
+            .chain(&sandbox.unix_socket_bind)
+            .chain(&sandbox.exec_paths)
             .filter(|entry| {
                 !(entry.starts_with('/') || entry.starts_with('$') || entry.starts_with('~'))
             })
@@ -246,7 +257,7 @@ impl CommandContext<'_> {
             "declared": grants.declared.iter().map(|d| json!({
                 "field": d.field,
                 "entry": d.entry,
-                "expanded": path_value(&d.expanded),
+                "expanded": d.expanded.as_deref().map(path_value),
             })).collect::<Vec<_>>(),
             "cwd_dependent": cwd_dependent,
         }))
