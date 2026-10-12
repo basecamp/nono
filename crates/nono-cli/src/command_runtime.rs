@@ -228,7 +228,7 @@ pub(crate) fn run_sandbox(mut run_args: RunArgs, silent: bool) -> Result<()> {
 
     if args.dry_run && run_args.json {
         // The launch's own plan, built as `run` builds it, reported as data on
-        // stdout; nothing else is printed there, and nothing is launched.
+        // stdout; nothing else is printed there, and the program isn't launched.
         let raw_rules = loaded_profile
             .as_ref()
             .map(|(_, profile)| profile.unsafe_macos_seatbelt_rules.clone())
