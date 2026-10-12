@@ -843,3 +843,32 @@ fn a_process_relative_brokered_grant_is_named() {
         "{probe}"
     );
 }
+
+/// A dry run pulls nothing: a registry profile that isn't installed stops it,
+/// with no request made.
+#[test]
+fn a_dry_run_pulls_no_profile() {
+    let t = nono_test!("dry-run-json-no-pull");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_nono"))
+        .env_clear()
+        .env("HOME", t.home())
+        .env("PATH", "/usr/bin:/bin")
+        .env("NONO_REGISTRY_URL", "http://127.0.0.1:9")
+        .args([
+            "run",
+            "--profile",
+            "nono-dry-run-test/not-installed",
+            "--dry-run",
+            "--json",
+            "--",
+            "/bin/true",
+        ])
+        .output()
+        .expect("run nono");
+    assert!(
+        !out.status.success(),
+        "an uninstalled profile stops the dry run"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("a dry run doesn't pull it"), "{stderr}");
+}

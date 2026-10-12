@@ -3148,6 +3148,13 @@ fn ensure_pack_profile_available(name: &str) -> Result<PathBuf> {
     if let Some((profile_path, _)) = find_installed_package_profile(name) {
         return Ok(profile_path);
     }
+    // (A JSON dry run only plans: it pulls nothing.)
+    if crate::credential_runtime::plan_only() {
+        return Err(NonoError::ProfileNotFound(format!(
+            "pack '{}' is not installed, and a dry run doesn't pull it",
+            package_ref.key()
+        )));
+    }
     if !missing_package_prompt_enabled() {
         return Err(NonoError::ProfileNotFound(package_ref.key()));
     }
