@@ -28,6 +28,29 @@ pub(crate) fn maybe_run_internal_tool_sandbox_entrypoint() -> bool {
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub(crate) fn record_main_start() {}
 
+/// What a command sandbox's policy grants, as the launch resolves it
+/// (`resolve_policy_grants` in each platform module).
+pub(crate) struct PolicyGrants {
+    /// The filesystem and Unix-socket capabilities the policy adds.
+    pub(crate) caps: nono::CapabilitySet,
+    /// The `exec_paths` the launch allows (existing ones only).
+    pub(crate) exec_paths: Vec<std::path::PathBuf>,
+    /// Every path the policy declares, expanded as the launch expands it before
+    /// it checks the path exists.
+    pub(crate) declared: Vec<DeclaredGrant>,
+}
+
+/// One path a command sandbox's policy declares.
+pub(crate) struct DeclaredGrant {
+    /// The policy field: `fs_read`, `fs_write`, `exec_paths`, ...
+    pub(crate) field: &'static str,
+    /// The entry as written.
+    pub(crate) entry: String,
+    /// The entry expanded (dynamic tokens and variables filled, a relative entry
+    /// joined to the command's working directory), no link followed.
+    pub(crate) expanded: std::path::PathBuf,
+}
+
 /// No command mediation on this platform: a command sandbox cannot be resolved.
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub(crate) fn resolve_policy_grants(
@@ -36,7 +59,7 @@ pub(crate) fn resolve_policy_grants(
     _cwd: &std::path::Path,
     _outer_caps: &nono::CapabilitySet,
     _deny_paths: &[std::path::PathBuf],
-) -> nono::Result<(nono::CapabilitySet, Vec<std::path::PathBuf>)> {
+) -> nono::Result<PolicyGrants> {
     Err(nono::NonoError::UnsupportedPlatform(
         "command sandboxes are not mediated on this platform".to_string(),
     ))

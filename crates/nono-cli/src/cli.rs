@@ -1986,7 +1986,12 @@ pub struct RunArgs {
     /// With --dry-run: print what the run would apply as JSON on stdout (every
     /// filesystem and Unix-socket capability resolved, resource limits, and each
     /// brokered command's sandbox) instead of the text summary.
-    #[arg(long, requires = "dry_run", help_heading = "OPTIONS")]
+    #[arg(
+        long,
+        requires = "dry_run",
+        conflicts_with = "detached",
+        help_heading = "OPTIONS"
+    )]
     pub json: bool,
 
     /// Kill the process if it has not entered alt-screen mode after this many seconds.

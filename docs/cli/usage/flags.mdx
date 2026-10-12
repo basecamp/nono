@@ -1277,7 +1277,7 @@ nono run --dry-run -v --profile nolabs-ai/claude -- claude
 
 #### `--json` (with `--dry-run`)
 
-`nono run --dry-run --json` prints what the run would apply as one JSON document on stdout, for a program to check rather than a person to read. It is the same resolution the text summary shows: globs expanded, variables filled, symlinks followed, policy groups and command-line flags included. It also covers the resource limits and each brokered command's sandbox, resolved by the code that builds it at launch, for a command run from the working directory.
+`nono run --dry-run --json` prints what the run would apply as one JSON document on stdout, for a program to check rather than a person to read. It uses the same resolution as the text summary: globs expanded, variables filled, symlinks followed, policy groups and command-line flags included. It also reports the network mode, the resource limits, and each brokered command's sandbox. Those sandboxes are resolved by the code that builds them at launch, for a command run from the working directory. `--json` needs `--dry-run` and can't be combined with `--detached`.
 
 ```bash
 nono run --profile my-agent --workdir . --allow-cwd --dry-run --json -- my-agent
@@ -1288,27 +1288,39 @@ nono run --profile my-agent --workdir . --allow-cwd --dry-run --json -- my-agent
   "version": 1,
   "program": "/usr/local/bin/my-agent",
   "workdir": "/Users/luke/project",
+  "incomplete": [],
   "filesystem": [
     {"path": "/Users/luke/project", "original": "/Users/luke/project", "access": "readwrite", "kind": "directory", "source": "user"},
     {"path": "/Users/luke/.cache/tool", "original": "/Users/luke/cache-link", "access": "read", "kind": "directory", "source": "profile"}
   ],
   "unix_sockets": [],
-  "network": {"blocked": false},
+  "network": {"mode": "proxy", "blocked": true},
   "resources": {"memory_bytes": null, "max_processes": null},
   "commands": [
-    {"command": "git", "caller": "session", "intercept": null,
+    {"command": "git", "caller": "session", "intercept": null, "executable": "/usr/bin/git", "incomplete": [],
      "filesystem": [{"path": "/Users/luke/project", "original": "/Users/luke/project", "access": "readwrite", "kind": "directory", "source": "user"}],
-     "unix_sockets": [], "exec_paths": ["/usr/lib/git-core"], "cwd_dependent": []}
+     "unix_sockets": [], "exec_paths": ["/usr/lib/git-core"],
+     "declared": [{"field": "fs_write", "entry": "$WORKDIR", "expanded": "/Users/luke/project"}],
+     "cwd_dependent": []}
   ]
 }
 ```
 
-- `path` is where a grant leads, and `original` is how it was written once variables are filled. A path that is not UTF-8 is `{"hex": "..."}`, its bytes, never something close to it.
-- `source` is `user`, `profile`, `system` or `group` (with `group` naming the group).
-- `commands` lists every sandbox a brokered command can run under: its session sandbox, each other caller's `from` edge (`caller`), and each intercept rule's override (`intercept`, the rule's index). An explicit deny runs nothing and is not listed. `cwd_dependent` holds the entries written relative to the command's working directory (a relative path, a `.`, an `@` token): those resolve against wherever the command runs.
-- `exec_paths` is empty on macOS, where the launch does not use it.
-- Not listed: what nono adds for itself once it runs (its capability state file, the command-mediation shims and sockets in its runtime directory), and instruction files the trust scan verifies.
-- `version` changes only when a field changes or goes; a new field is added without one.
+- **Paths.** `path` is where a grant leads, and `original` is how it was written once variables are filled. A path that is not UTF-8 is reported as `{"hex": "..."}` (its bytes), so it is never approximated.
+- **Sources.** `source` is `user`, `profile`, `system` or `group`; a group grant also has a `group` field naming it.
+- **Network.** `network.mode` is `blocked`, `proxy` (the run starts its proxy and allows nothing else) or `allowed`.
+- **Commands.** `commands` lists every sandbox a brokered command can run under, as the runtime selects it:
+  - its session sandbox;
+  - each `from.<caller>` edge whose caller is a command that lists it in `can_use` (`caller`);
+  - each intercept rule's override (`intercept`, the rule's index).
+
+  An explicit deny runs nothing and isn't listed. Each entry's `filesystem` includes the credential paths its launch hands it (a raw file, a local socket).
+- **Declared paths.** `declared` lists every path a command's policy declares, as the launch expands it before checking that it exists. A path that isn't there yet, which a later run would grant once it is, is still reported.
+- **Working-directory entries.** `cwd_dependent` holds the entries written relative to the command's working directory (a relative path, `.`, an `@` token), which resolve wherever the command runs.
+- **macOS.** `exec_paths` is empty there, because the launch doesn't use it.
+- **`incomplete`.** It names what the report can't model: raw `unsafe_macos_seatbelt_rules`, at the top level or per command, and a credential path it can't resolve. A program that decides on the report should treat a non-empty `incomplete` as "can't be shown".
+- **Not listed.** What nono adds for itself once it runs: its capability state file, the command-mediation shims and sockets in its runtime directory, and a brokered command's runtime baseline of system libraries. Instruction files the trust scan verifies aren't listed either. On Linux a read grant of `/proc/self` is reported as `/proc`, as the child gets it. Other `/proc/<pid>` entries name the dry run's own process.
+- **Versioning.** `version` changes only when a field changes or is removed; new fields are added without a version change.
 
 #### `--verbose`, `-v`
 
