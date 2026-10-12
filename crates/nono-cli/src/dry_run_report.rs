@@ -115,8 +115,9 @@ pub(crate) fn dry_run_report(
         "workdir": path_value(&start_dir),
         "incomplete": incomplete,
         "out_of_scope": OUT_OF_SCOPE,
-        "filesystem": caps.fs_capabilities().iter().map(fs_value).collect::<Vec<_>>(),
+        "filesystem": caps.fs_capabilities().iter().map(session_fs_value).collect::<Vec<_>>(),
         "unix_sockets": caps.unix_socket_capabilities().iter().map(socket_value).collect::<Vec<_>>(),
+        "metadata_paths": metadata_paths(&caps),
         "network": network_value(&plan.flags.network, &caps),
         "resources": {
             "memory_bytes": limits.and_then(|l| l.memory_bytes),
@@ -124,6 +125,45 @@ pub(crate) fn dry_run_report(
         },
         "commands": commands,
     }))
+}
+
+/// A session grant as the child gets it. One the launch remaps to the child's
+/// own process after it forks (`remap_procfs_self_references`: `/proc/self/...`,
+/// `/proc/thread-self/...`, `/dev/fd`, `/dev/std*`) is reported in that
+/// self-relative spelling, marked `process_relative`, not as the dry run's own
+/// process.
+fn session_fs_value(cap: &FsCapability) -> Value {
+    let mut probe = CapabilitySet::new();
+    probe.add_fs(cap.clone());
+    probe.remap_procfs_self_references(0, None);
+    let remapped = probe
+        .fs_capabilities()
+        .first()
+        .is_some_and(|after| after.resolved != cap.resolved);
+    let mut value = fs_value(cap);
+    if remapped && cap.resolved != Path::new("/proc") {
+        if let Some(object) = value.as_object_mut() {
+            object.insert("path".to_string(), path_value(&cap.original));
+            object.insert("process_relative".to_string(), json!(true));
+        }
+    }
+    value
+}
+
+/// The directories whose metadata the run lets the sandbox read beyond the
+/// list (macOS: each `$PATH` directory, its children, ancestors and symlink
+/// hops, as `file-read-metadata` only). Linux grants none.
+#[cfg(target_os = "macos")]
+fn metadata_paths(caps: &CapabilitySet) -> Vec<Value> {
+    caps.path_metadata_dirs()
+        .iter()
+        .map(|p| path_value(p))
+        .collect()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn metadata_paths(_caps: &CapabilitySet) -> Vec<Value> {
+    Vec::new()
 }
 
 /// The plan's network: its mode, and the port exceptions the capability set

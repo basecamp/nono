@@ -1295,6 +1295,7 @@ nono run --profile my-agent --workdir . --allow-cwd --dry-run --json -- my-agent
     {"path": "/Users/luke/.cache/tool", "original": "/Users/luke/cache-link", "access": "read", "kind": "directory", "source": "profile"}
   ],
   "unix_sockets": [],
+  "metadata_paths": ["/usr/local/bin", "/usr/bin"],
   "network": {"mode": "proxy", "connect_ports": [], "bind_ports": [], "localhost_ports": [], "localhost_port_ranges": []},
   "resources": {"memory_bytes": null, "max_processes": null},
   "commands": [
@@ -1315,7 +1316,8 @@ nono run --profile my-agent --workdir . --allow-cwd --dry-run --json -- my-agent
 - **Network.** `network.mode` is `blocked`, `proxy` (the run routes egress through its proxy) or `allowed`, as the plan decides it, with the port exceptions the capability set carries beside it: `connect_ports` and `bind_ports` (the proxy's bind ports included), `localhost_ports` and `localhost_port_ranges` (`[low, high]`). How the mode is enforced is out of the contract (above).
 - **Commands.** `commands` lists every sandbox a brokered command can run under (it may list one the runtime never reaches, never leave one out), each built by the launch's `build_child_launch_spec` and read back from the launch spec the child applies: under the session (`caller: "session"`) and under each command whose `can_use` names it (`caller` names it), and for each intercept rule that launches something (`intercept`, the rule's index): under its own sandbox override, or for an `exec` rule, its helper (`executable`) under the selected sandbox. A caller the policy denies, a `respond` rule, and the command itself when a catch-all rule intercepts every run, run nothing and aren't listed; a policy the runtime refuses (resources it can't enforce) is listed with the reason in `incomplete`. A brokered interpreter run with a script argument also reads the session's own read grant that covers the script, which `filesystem` already lists. `exec_paths` is the launch's execute allowlist (Linux): the binary, its interpreter and ELF closure, the shims, and the policy's `exec_paths`.
 - **Declared paths.** A brokered command resolves its policy again each time it runs, so `declared` lists every path its policy declares, as the launch expands it before checking that it exists: a path that isn't there yet, which a later run would grant once it is, is still reported, and a dynamic `@` token that expands to nothing from the working directory is listed with `"expanded": null`. `cwd_dependent` holds the entries whose grant depends on the command's working directory: an `@` token, and an entry still relative once its variables are filled (`.`, `data`, `$UID/data`).
-- **`/proc`.** On Linux a read grant of `/proc/self` is reported as `/proc`, as the exec widens it for the child. Other `/proc/<pid>` entries name the dry run's own process.
+- **`/proc`.** On Linux a read grant of `/proc/self` is reported as `/proc`, as the exec widens it for the child. A grant the launch remaps to the child's own process after it forks (`/proc/self/...`, `/proc/thread-self/...`, `/dev/fd`, `/dev/std*`) is reported in that self-relative spelling with `"process_relative": true`.
+- **`metadata_paths`.** On macOS, the `$PATH` directories whose metadata the sandbox can read beyond `filesystem` (each directory, its children, ancestors and symlink hops, metadata only). Empty on Linux.
 - **Versioning.** `version` changes only when a field changes or is removed; new fields are added without a version change.
 
 #### `--verbose`, `-v`
