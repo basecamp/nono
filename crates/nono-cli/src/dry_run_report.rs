@@ -141,11 +141,12 @@ fn session_fs_value(cap: &FsCapability) -> Value {
         .first()
         .is_some_and(|after| after.resolved != cap.resolved);
     let mut value = fs_value(cap);
-    if remapped && cap.resolved != Path::new("/proc") {
-        if let Some(object) = value.as_object_mut() {
-            object.insert("path".to_string(), path_value(&cap.original));
-            object.insert("process_relative".to_string(), json!(true));
-        }
+    if remapped
+        && cap.resolved != Path::new("/proc")
+        && let Some(object) = value.as_object_mut()
+    {
+        object.insert("path".to_string(), path_value(&cap.original));
+        object.insert("process_relative".to_string(), json!(true));
     }
     value
 }
