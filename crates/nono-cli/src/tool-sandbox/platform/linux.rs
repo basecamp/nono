@@ -3997,9 +3997,12 @@ fn add_chaining_control_caps(caps: &mut CapabilitySet, state: &ToolSandboxState)
 
 /// The grants a command's sandbox policy gives it when the command runs from
 /// `cwd`: the filesystem and Unix-socket capabilities `build_child_caps`
-/// derives from the policy, and the `exec_paths` its launch spec allows. The
-/// runtime parts of a child's capabilities (its binary, runtime baseline,
-/// shims, credentials, proxy) are not policy and are not included. Used by
+/// derives from the policy, and the `exec_paths` its launch spec allows; and every path the policy declares, as
+/// the launch expands it before checking that it exists (dynamic tokens and
+/// variables filled, relative entries joined to `cwd`, no link followed), so a
+/// declared path that is absent today is still reported. The runtime parts of
+/// a child's capabilities (its binary, runtime baseline, shims, credentials,
+/// proxy) are not policy and are not included. Used by
 /// `nono run --dry-run --json` to report each brokered command's sandbox
 /// resolved by the same code that builds it at launch.
 pub(crate) fn resolve_policy_grants(
@@ -4008,7 +4011,8 @@ pub(crate) fn resolve_policy_grants(
     cwd: &Path,
     outer_caps: &CapabilitySet,
     deny_paths: &[PathBuf],
-) -> Result<(CapabilitySet, Vec<PathBuf>)> {
+) -> Result<super::PolicyGrants> {
+    use super::dynamic_providers::expand_dynamic_tokens;
     let cwd = cwd
         .canonicalize()
         .map_err(|source| NonoError::PathCanonicalization {
@@ -4019,7 +4023,32 @@ pub(crate) fn resolve_policy_grants(
     add_policy_fs(&mut caps, policy, policy_root, &cwd, outer_caps, deny_paths)?;
     add_policy_unix_sockets(&mut caps, policy, policy_root, &cwd, outer_caps, deny_paths)?;
     let exec_paths = resolve_exec_paths(&policy.exec_paths, policy_root, &cwd, outer_caps)?;
-    Ok((caps, exec_paths))
+    let mut declared = Vec::new();
+    for (field, entries) in [
+        ("fs_read", &policy.fs_read),
+        ("fs_read_file", &policy.fs_read_file),
+        ("fs_write", &policy.fs_write),
+        ("fs_write_file", &policy.fs_write_file),
+        ("unix_socket_bind", &policy.unix_socket_bind),
+        ("exec_paths", &policy.exec_paths),
+    ] {
+        for entry in entries {
+            for expanded in
+                expand_dynamic_tokens(std::slice::from_ref(entry), Some(&cwd), outer_caps)?
+            {
+                declared.push(super::DeclaredGrant {
+                    field,
+                    entry: entry.clone(),
+                    expanded: resolve_policy_path(&expanded, policy_root, &cwd)?,
+                });
+            }
+        }
+    }
+    Ok(super::PolicyGrants {
+        caps,
+        exec_paths,
+        declared,
+    })
 }
 
 fn add_policy_fs(

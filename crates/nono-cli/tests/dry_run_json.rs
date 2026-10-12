@@ -88,22 +88,24 @@ fn reports_resolved_session_grants_and_resources() {
 fn reports_each_brokered_command_sandbox_resolved() {
     let t = nono_test!("dry-run-json-commands");
     let ws = t.workspace().to_path_buf();
-    for dir in ["data", "helpers", "intercepted", "other"] {
+    for dir in ["data", "helpers", "intercepted", "other", "from-caller"] {
         fs::create_dir_all(ws.join(dir)).expect("create dir");
     }
     symlink(ws.join("data"), ws.join("data-link")).expect("symlink");
+    fs::write(ws.join("token"), "t").expect("write token");
     let json = format!(
         r#"{{
           "meta": {{"name": "t"}},
           "workdir": {{"access": "readwrite"}},
           "command_policies": {{
+            "credentials": {{"tok": {{"type": "raw-file", "path": "{ws}/token"}}}},
             "commands": {{
               "probe": {{
                 "executable": "/bin/true",
-                "can_use": [],
                 "from": {{
-                  "session": {{"sandbox": {{"fs_read": ["{ws}/data-link", "."], "exec_paths": ["{ws}/helpers"]}}}},
-                  "other": "deny"
+                  "session": {{"sandbox": {{"fs_read": ["{ws}/data-link", ".", "{ws}/not-yet"], "exec_paths": ["{ws}/helpers"], "use_credentials": ["tok"]}}}},
+                  "caller": {{"sandbox": {{"fs_read": ["{ws}/from-caller"]}}}},
+                  "stranger": {{"sandbox": {{"fs_read": ["{ws}/other"]}}}}
                 }},
                 "intercept": [{{"args": ["x"], "sandbox": {{"fs_read": ["{ws}/intercepted"]}}}}]
               }},
@@ -111,6 +113,10 @@ fn reports_each_brokered_command_sandbox_resolved() {
                 "executable": "/bin/echo",
                 "can_use": ["probe"],
                 "sandbox": {{"fs_write": ["{ws}/other"]}}
+              }},
+              "denied": {{
+                "executable": "/bin/echo",
+                "from": {{"session": "deny"}}
               }}
             }}
           }}
@@ -119,50 +125,82 @@ fn reports_each_brokered_command_sandbox_resolved() {
     );
     let report = report(&t, &json, |run| run.allow_cwd());
     let commands = report["commands"].as_array().expect("commands is an array");
-    let probe_session = commands
-        .iter()
-        .find(|c| c["command"] == "probe" && c["caller"] == "session")
+    let find = |command: &str, caller: &str| {
+        commands
+            .iter()
+            .find(|c| c["command"] == command && c["caller"] == caller)
+    };
+    let has_path = |entry: &Value, path: &Path| {
+        entry["filesystem"]
+            .as_array()
+            .expect("filesystem")
+            .iter()
+            .any(|e| e["path"] == canon(path).as_str())
+    };
+    let probe = find("probe", "session")
         .unwrap_or_else(|| panic!("probe's session sandbox listed: {report}"));
-    let fs = probe_session["filesystem"].as_array().expect("filesystem");
-    let data = fs
+    let data = probe["filesystem"]
+        .as_array()
+        .expect("filesystem")
         .iter()
         .find(|e| e["path"] == canon(&ws.join("data")).as_str())
-        .unwrap_or_else(|| panic!("the symlinked grant resolves to its target: {probe_session}"));
+        .unwrap_or_else(|| panic!("the symlinked grant resolves to its target: {probe}"));
     assert_eq!(
         data["original"],
         ws.join("data-link").to_str().expect("utf-8")
     );
     assert!(
-        fs.iter().any(|e| e["path"] == canon(&ws).as_str()),
-        "'.' resolves against the working directory: {probe_session}"
+        has_path(probe, &ws),
+        "'.' resolves against the working directory: {probe}"
     );
+    assert!(
+        has_path(probe, &ws.join("token")),
+        "the raw-file credential is a read grant: {probe}"
+    );
+    assert_eq!(probe["executable"], canon(Path::new("/bin/true")).as_str());
+    #[cfg(target_os = "linux")]
     assert_eq!(
-        probe_session["exec_paths"],
+        probe["exec_paths"],
         serde_json::json!([ws.join("helpers").to_str().expect("utf-8")])
     );
-    assert_eq!(probe_session["cwd_dependent"], serde_json::json!(["."]));
+    #[cfg(target_os = "macos")]
+    assert_eq!(
+        probe["exec_paths"],
+        serde_json::json!([]),
+        "macOS launches use no exec_paths"
+    );
+    assert_eq!(probe["cwd_dependent"], serde_json::json!(["."]));
     assert!(
-        !commands
+        probe["declared"]
+            .as_array()
+            .expect("declared")
             .iter()
-            .any(|c| c["command"] == "probe" && c["caller"] == "other"),
-        "an explicit deny runs nothing and is not listed: {report}"
+            .any(|d| d["field"] == "fs_read"
+                && d["expanded"] == ws.join("not-yet").to_str().expect("utf-8")),
+        "a declared path that is not there yet is still reported: {probe}"
+    );
+    assert_eq!(probe["incomplete"], serde_json::json!([]));
+    let from_caller = find("probe", "caller")
+        .unwrap_or_else(|| panic!("an admitted caller's edge is listed: {report}"));
+    assert!(
+        has_path(from_caller, &ws.join("from-caller")),
+        "{from_caller}"
+    );
+    assert!(
+        find("probe", "stranger").is_none(),
+        "an edge from a caller that is no command listing probe in can_use never runs, and is not listed: {report}"
+    );
+    assert!(
+        !commands.iter().any(|c| c["command"] == "denied"),
+        "an explicit session deny, with no admitted caller, runs nothing and is not listed: {report}"
     );
     let intercept = commands
         .iter()
         .find(|c| c["command"] == "probe" && c["intercept"] == 0)
         .unwrap_or_else(|| panic!("the intercept rule's sandbox listed: {report}"));
     assert!(intercept["caller"].is_null());
-    assert!(
-        intercept["filesystem"]
-            .as_array()
-            .expect("fs")
-            .iter()
-            .any(|e| e["path"] == canon(&ws.join("intercepted")).as_str()),
-        "{intercept}"
-    );
-    let caller = commands
-        .iter()
-        .find(|c| c["command"] == "caller" && c["caller"] == "session")
+    assert!(has_path(intercept, &ws.join("intercepted")), "{intercept}");
+    let caller = find("caller", "session")
         .unwrap_or_else(|| panic!("a top-level sandbox is the session's: {report}"));
     assert!(
         caller["filesystem"]
@@ -175,6 +213,45 @@ fn reports_each_brokered_command_sandbox_resolved() {
 }
 
 #[test]
+fn reports_the_network_mode_the_run_applies() {
+    let t = nono_test!("dry-run-json-network");
+    let proxied = report(
+        &t,
+        r#"{"meta":{"name":"t"},"network":{"allow_domain":["example.com"]}}"#,
+        |run| run,
+    );
+    assert_eq!(
+        proxied["network"],
+        serde_json::json!({"mode": "proxy", "blocked": true})
+    );
+    let blocked = report(&t, r#"{"meta":{"name":"t"}}"#, |run| run.block_net());
+    assert_eq!(
+        blocked["network"],
+        serde_json::json!({"mode": "blocked", "blocked": true})
+    );
+    let open = report(&t, r#"{"meta":{"name":"t"}}"#, |run| run);
+    assert_eq!(
+        open["network"],
+        serde_json::json!({"mode": "allowed", "blocked": false})
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn reports_proc_self_as_the_launch_widens_it() {
+    let t = nono_test!("dry-run-json-proc");
+    let report = report(
+        &t,
+        r#"{"meta":{"name":"t"},"filesystem":{"read":["/proc/self"]}}"#,
+        |run| run,
+    );
+    assert!(
+        fs_entry(&report, "/proc").is_some(),
+        "a read grant of /proc/self is /proc in the child: {report}"
+    );
+}
+
+#[test]
 fn json_requires_dry_run() {
     // (--json alone, without --dry-run, is refused by the argument parser.)
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_nono"))
@@ -183,4 +260,18 @@ fn json_requires_dry_run() {
         .expect("run nono");
     assert!(!out.status.success(), "--json without --dry-run is refused");
     assert!(String::from_utf8_lossy(&out.stderr).contains("--dry-run"));
+    // Nor with --detached, whose launch discards stdout.
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_nono"))
+        .args([
+            "run",
+            "--dry-run",
+            "--json",
+            "--detached",
+            "--",
+            "/bin/true",
+        ])
+        .output()
+        .expect("run nono");
+    assert!(!out.status.success(), "--json with --detached is refused");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--detached"));
 }
