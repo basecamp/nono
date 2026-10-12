@@ -909,3 +909,93 @@ fn a_dry_run_pulls_no_profile() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("a dry run doesn't pull it"), "{stderr}");
 }
+
+/// A dry run doesn't build the session's execute allowlist (the ELF closure
+/// over every executable on PATH, nearly all of its cost), and the report
+/// doesn't depend on it: built anyway, it is the same report, the runtime
+/// directory's per-run name aside.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_report_does_not_depend_on_the_execute_allowlist() {
+    let t = nono_test!("dry-run-json-exec-gate");
+    let ws = t.workspace().to_path_buf();
+    fs::create_dir_all(ws.join("data")).expect("create data");
+    symlink(ws.join("data"), ws.join("data-link")).expect("symlink");
+    let json = format!(
+        r#"{{"meta":{{"name":"t"}},"workdir":{{"access":"readwrite"}},"command_policies":{{"commands":{{"probe":{{"executable":"/bin/cat","sandbox":{{"fs_read":["{ws}/data-link"]}}}}}}}}}}"#,
+        ws = ws.display()
+    );
+    let profile = t.write_profile("dry-run-json", &json);
+    let dry_run = |build: bool| {
+        let run = t
+            .run()
+            .profile(&profile)
+            .workdir(t.workspace())
+            .allow_cwd()
+            .env("TOOL_SANDBOX_PROFILE_HOTPATH", "1");
+        let run = if build {
+            run.env("NONO_DRY_RUN_BUILD_EXEC_GATE", "1")
+        } else {
+            run
+        };
+        let started = std::time::Instant::now();
+        let completed = run
+            .dry_run_json()
+            .exec(Argv::new("/bin/true"))
+            .assert_success("--dry-run --json exits 0");
+        let elapsed = started.elapsed();
+        let paths = completed
+            .stderr()
+            .lines()
+            .find(|l| l.contains("prepare:build_outer_exec_files"))
+            .and_then(|l| {
+                l.rsplit_once('(')
+                    .map(|(_, n)| n.trim_end_matches(" paths)").to_string())
+            })
+            .and_then(|n| n.parse::<usize>().ok())
+            .unwrap_or_else(|| panic!("the runtime says what it built: {}", completed.stderr()));
+        let report: Value = serde_json::from_str(&completed.stdout()).expect("one JSON document");
+        (report, paths, elapsed)
+    };
+    let (skipped, skipped_paths, skipped_time) = dry_run(false);
+    let (built, built_paths, built_time) = dry_run(true);
+    eprintln!(
+        "execute allowlist: skipped {skipped_time:?} (0 paths), built {built_time:?} ({built_paths} paths)"
+    );
+    assert_eq!(skipped_paths, 0, "a dry run builds no execute allowlist");
+    assert!(built_paths > 0, "built on request, it isn't empty");
+    // (The runtime directory a dry run prepares has a per-run name.)
+    let runtime = runtime_dirs(&skipped.to_string());
+    let normalize = |report: &Value| {
+        let text = report.to_string();
+        let mut text = text.clone();
+        for dir in runtime_dirs(&text) {
+            text = text.replace(&dir, "<runtime>");
+        }
+        text
+    };
+    assert!(
+        !runtime.is_empty(),
+        "the brokered sandbox names the runtime directory"
+    );
+    assert_eq!(
+        normalize(&skipped),
+        normalize(&built),
+        "the report is the same either way"
+    );
+}
+
+/// Each `/…/nono-tool-sandbox-…` runtime directory a report names.
+#[cfg(target_os = "linux")]
+fn runtime_dirs(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for (at, _) in text.match_indices("nono-tool-sandbox-") {
+        let start = text[..at].rfind('"').map_or(0, |q| q + 1);
+        let end = text[at..].find('/').map_or(text.len(), |e| at + e);
+        let dir = text[start..end].to_string();
+        if !out.contains(&dir) {
+            out.push(dir);
+        }
+    }
+    out
+}

@@ -124,7 +124,10 @@ struct ToolSandboxState {
     plan: ResolvedToolSandboxPlan,
     shims_by_command: BTreeMap<String, ShimIdentity>,
     credential_handles: BTreeMap<String, ResolvedCredential>,
-    allowed_outer_exec_files: Vec<PathBuf>,
+    /// The session's execute allowlist (the outer exec gate). `None` in a
+    /// plan-only run (`nono run --dry-run --json`), which applies no gate and
+    /// does not build it.
+    allowed_outer_exec_files: Option<Vec<PathBuf>>,
     landlock_abi: nono::DetectedAbi,
     baseline_cache: BaselineCache,
     proxy_trust_bundle_paths: Vec<PathBuf>,
@@ -361,17 +364,27 @@ impl PreparedToolSandboxRuntime {
         // canonicalized / resolved / read / stat'd once per launch, not per batch.
         reset_elf_resolution_cache();
         let start_outer_exec = std::time::Instant::now();
-        let allowed_outer_exec_files = build_outer_exec_files(
-            shims_by_command.values().chain(url_open_shim.iter()),
-            &plan,
-            &shim_source,
-            outer_caps,
-            Some(initial_program),
-        )?;
+        // (A plan-only run applies no execute gate: the ELF closure over every
+        // executable on PATH, nearly all of its cost, is not built. Only the
+        // test that shows the report doesn't depend on it asks for it anyway,
+        // with NONO_DRY_RUN_BUILD_EXEC_GATE=1.)
+        let allowed_outer_exec_files = if crate::credential_runtime::plan_only()
+            && std::env::var_os("NONO_DRY_RUN_BUILD_EXEC_GATE").is_none()
+        {
+            None
+        } else {
+            Some(build_outer_exec_files(
+                shims_by_command.values().chain(url_open_shim.iter()),
+                &plan,
+                &shim_source,
+                outer_caps,
+                Some(initial_program),
+            )?)
+        };
         tool_sandbox_profile_log!(
             "prepare:build_outer_exec_files: {:?} ({} paths)",
             start_outer_exec.elapsed(),
-            allowed_outer_exec_files.len()
+            allowed_outer_exec_files.as_ref().map_or(0, Vec::len)
         );
 
         let start_baseline_cache = std::time::Instant::now();
@@ -495,7 +508,7 @@ impl PreparedToolSandboxRuntime {
 
     pub(crate) fn prepare_outer_exec_gate(&self) -> Result<OwnedFd> {
         let ruleset = prepare_outer_exec_gate(
-            &self.inner.allowed_outer_exec_files,
+            self.outer_exec_files()?,
             &self.inner.plan.outer_exec_writable_dirs,
             self.inner.landlock_abi,
         )?;
@@ -504,9 +517,22 @@ impl PreparedToolSandboxRuntime {
         })
     }
 
+    /// The session's execute allowlist; an error in a plan-only run, which
+    /// builds none (it never applies the gate).
+    fn outer_exec_files(&self) -> Result<&[PathBuf]> {
+        self.inner
+            .allowed_outer_exec_files
+            .as_deref()
+            .ok_or_else(|| {
+                NonoError::SandboxInit(
+                    "command-mediation execute gate is not built in a plan-only run".to_string(),
+                )
+            })
+    }
+
     pub(crate) fn apply_outer_exec_gate(&self) -> Result<()> {
         apply_outer_exec_gate(
-            &self.inner.allowed_outer_exec_files,
+            self.outer_exec_files()?,
             &self.inner.plan.outer_exec_writable_dirs,
             self.inner.landlock_abi,
         )
@@ -6706,7 +6732,7 @@ mod tests {
             },
             shims_by_command: BTreeMap::from([("git".to_string(), shim.clone())]),
             credential_handles: BTreeMap::new(),
-            allowed_outer_exec_files: Vec::new(),
+            allowed_outer_exec_files: Some(Vec::new()),
             landlock_abi: nono::DetectedAbi::new(landlock::ABI::V3),
             baseline_cache: BaselineCache {
                 closures: BTreeMap::from([(shim.path, Vec::new())]),

@@ -42,6 +42,7 @@ pub(crate) const OUT_OF_SCOPE: &[&str] = &[
     "signal, process-information and IPC scope",
     "a brokered command allowed to run directly (allow_direct_exec_bypass), which then runs under the session's own sandbox, as filesystem lists it",
     "what the supervisor runs or sends on the host for the run (credential source commands, a daemon_pid_source helper, an approval webhook)",
+    "the execute allowlist: not computed in a dry run (the session's execute gate, an ELF closure over the executables on PATH; on macOS its process-exec rule)",
     "how Unix-socket grants are enforced (with linux.af_unix_mediation off, the default, AF_UNIX is not mediated; abstract and unnamed sockets are never path grants)",
     "nono's own per-launch files (its capability state file, command-mediation shims and sockets, the proxy's CA bundle)",
 ];
@@ -106,12 +107,22 @@ pub(crate) fn dry_run_report(
     }
     incomplete.extend(seatbelt_widenings(&caps, raw_rules));
     // (The rules command mediation's runtime adds to the session's set at
-    // launch: an allow among them widens it too.)
-    let runtime_allows = mediation
-        .session_rules
-        .iter()
-        .filter(|rule| seatbelt_allows(rule))
-        .count();
+    // launch, on macOS: its execute gate's `(allow process-exec*)`, which is
+    // the execute allowlist, out of the contract; metadata reads of the
+    // working directory's ancestors, listed in `metadata_paths`; any other
+    // allow widens the set.)
+    let mut runtime_metadata: Vec<Value> = Vec::new();
+    let mut runtime_allows = 0;
+    for rule in &mediation.session_rules {
+        if rule.trim() == "(allow process-exec*)" {
+            continue;
+        }
+        if let Some(path) = metadata_literal(rule) {
+            runtime_metadata.push(json!(path));
+        } else if seatbelt_allows(rule) {
+            runtime_allows += 1;
+        }
+    }
     if runtime_allows > 0 {
         incomplete.push(format!(
             "{runtime_allows} Seatbelt allow rule(s) command mediation adds to the session at launch"
@@ -131,7 +142,7 @@ pub(crate) fn dry_run_report(
         "out_of_scope": OUT_OF_SCOPE,
         "filesystem": caps.fs_capabilities().iter().map(session_fs_value).collect::<Vec<_>>(),
         "unix_sockets": caps.unix_socket_capabilities().iter().map(socket_value).collect::<Vec<_>>(),
-        "metadata_paths": metadata_paths(&caps),
+        "metadata_paths": metadata_paths(&caps).into_iter().chain(runtime_metadata).collect::<Vec<_>>(),
         // (Each as declared: a dry run reads no credential source.)
         "credentials": {
             "env": plan.loaded_secrets.iter().map(|secret| secret.env_var.clone()).collect::<Vec<_>>(),
@@ -258,6 +269,25 @@ fn network_mode(intent: &NetworkIntent, caps: &CapabilitySet) -> &'static str {
             nono::NetworkMode::AllowAll => "allowed",
         },
     }
+}
+
+/// The path of a generated `(allow file-read-metadata (literal "PATH"))`
+/// rule, unescaped as `escape_seatbelt_path` escapes it; none for any other.
+fn metadata_literal(rule: &str) -> Option<String> {
+    let inner = rule
+        .trim()
+        .strip_prefix("(allow file-read-metadata (literal \"")?
+        .strip_suffix("\"))")?;
+    let mut out = String::new();
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => out.push(chars.next()?),
+            '"' => return None,
+            c => out.push(c),
+        }
+    }
+    Some(out)
 }
 
 /// Whether a Seatbelt rule may hold an `allow` form: any `allow` in it at all,
@@ -524,6 +554,15 @@ mod tests {
         assert!(
             seatbelt_allows("(; note\n allow file-read* (subpath \"/f\"))"),
             "however commented"
+        );
+        assert_eq!(
+            metadata_literal(r#"(allow file-read-metadata (literal "/a/b \"c\""))"#).as_deref(),
+            Some(r#"/a/b "c""#),
+            "a generated metadata rule's path, unescaped"
+        );
+        assert_eq!(
+            metadata_literal(r#"(allow file-read* (literal "/x"))"#),
+            None
         );
         Ok(())
     }
