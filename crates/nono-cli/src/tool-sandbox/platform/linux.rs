@@ -4128,14 +4128,18 @@ impl PreparedToolSandboxRuntime {
                     .intercept
                     .iter()
                     .find(|rule| rule.args.as_ref().is_some_and(Vec::is_empty));
-                let base_runs = catch_all.is_none_or(|rule| {
-                    rule.sandbox.is_none()
-                        && !matches!(
-                            rule.action,
-                            crate::command_policy::InterceptActionConfig::Respond { .. }
-                                | crate::command_policy::InterceptActionConfig::Exec { .. }
-                        )
-                });
+                // (The command runs as it is when no rule matches, which only a
+                // catch-all prevents, or when a matching rule, catch-all or
+                // not, launches it with no sandbox of its own and no helper.)
+                let base_runs = catch_all.is_none()
+                    || command.intercept.iter().any(|rule| {
+                        rule.sandbox.is_none()
+                            && !matches!(
+                                rule.action,
+                                crate::command_policy::InterceptActionConfig::Respond { .. }
+                                    | crate::command_policy::InterceptActionConfig::Exec { .. }
+                            )
+                    });
                 let scope = scoped_proxy_key(name, caller, None);
                 let context = ChildLaunchContext {
                     caller,
