@@ -98,7 +98,10 @@ fn reports_each_brokered_command_sandbox_resolved() {
           "meta": {{"name": "t"}},
           "workdir": {{"access": "readwrite"}},
           "command_policies": {{
-            "credentials": {{"tok": {{"type": "raw-file", "path": "{ws}/token"}}}},
+            "credentials": {{
+              "tok": {{"type": "raw-file", "path": "{ws}/token"}},
+              "sock": {{"type": "local-socket", "path": "{ws}/token"}}
+            }},
             "commands": {{
               "probe": {{
                 "executable": "/bin/true",
@@ -121,7 +124,7 @@ fn reports_each_brokered_command_sandbox_resolved() {
               }},
               "nocan": {{
                 "executable": "/bin/echo",
-                "sandbox": {{"fs_read": ["{ws}/other"]}}
+                "sandbox": {{"fs_read": ["{ws}/other"], "use_credentials": ["sock"]}}
               }},
               "denied": {{
                 "executable": "/bin/echo",
@@ -190,6 +193,18 @@ fn reports_each_brokered_command_sandbox_resolved() {
         "a declared path that is not there yet is still reported: {probe}"
     );
     assert_eq!(probe["incomplete"], serde_json::json!([]));
+    let nocan = find("nocan", "session")
+        .unwrap_or_else(|| panic!("nocan's top-level sandbox is the session's: {report}"));
+    assert!(
+        nocan["incomplete"]
+            .as_array()
+            .expect("incomplete")
+            .iter()
+            .any(|i| i
+                .as_str()
+                .is_some_and(|i| i.starts_with("credential 'sock'"))),
+        "a socket credential naming a regular file is incomplete, not an error: {nocan}"
+    );
     let from_caller = find("probe", "caller")
         .unwrap_or_else(|| panic!("an admitted caller's edge is listed: {report}"));
     assert!(
