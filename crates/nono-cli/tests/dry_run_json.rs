@@ -534,3 +534,43 @@ fn a_command_with_a_proxy_of_its_own_is_reported() {
     assert_eq!(probe["incomplete"], serde_json::json!([]), "{probe}");
     assert_eq!(probe["executable"], canon(Path::new("/bin/true")).as_str());
 }
+
+/// What the runtime launches for a command, and nothing it doesn't: a
+/// catch-all intercept rule (last, by validation) matches every run, so the
+/// command itself never runs; a policy the runtime refuses (resources it cannot
+/// enforce) launches nothing, and says so.
+#[test]
+fn only_what_the_runtime_launches_is_reported() {
+    let t = nono_test!("dry-run-json-reachable");
+    let report = report(
+        &t,
+        r#"{"meta":{"name":"t"},"command_policies":{"commands":{
+          "caught":{"executable":"/bin/true","sandbox":{},"intercept":[
+            {"args":["x"],"sandbox":{}},
+            {"args":[],"action":{"type":"respond","stdout":"no"}}]},
+          "limited":{"executable":"/bin/echo","sandbox":{"resources":{}}}}}}"#,
+        |run| run.allow_cwd(),
+    );
+    let commands = report["commands"].as_array().expect("commands");
+    let caught: Vec<&Value> = commands
+        .iter()
+        .filter(|c| c["command"] == "caught")
+        .collect();
+    assert_eq!(
+        caught.len(),
+        1,
+        "only the rule before the catch-all launches: {report}"
+    );
+    assert_eq!(caught[0]["intercept"], 0);
+    let limited = commands
+        .iter()
+        .find(|c| c["command"] == "limited")
+        .unwrap_or_else(|| panic!("the refused policy is listed: {report}"));
+    assert!(
+        limited["incomplete"]
+            .as_array()
+            .is_some_and(|i| !i.is_empty()),
+        "with the reason its launch is not built: {limited}"
+    );
+    assert_eq!(limited["filesystem"], serde_json::json!([]));
+}
