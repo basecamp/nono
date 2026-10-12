@@ -438,7 +438,8 @@ pub(crate) fn load_secret(service: &str, account: &str) -> Result<Zeroizing<Stri
             "verifying an instruction file needs trust key '{account}' from the keystore, which a dry run doesn't read"
         ));
         return Err(nono::NonoError::KeystoreAccess(format!(
-            "a dry run doesn't read the keystore ('{account}')"
+            "{} ('{account}')",
+            crate::credential_runtime::PLAN_ONLY_KEYSTORE
         )));
     }
     TrustKeyStore::selected().load(service, account)

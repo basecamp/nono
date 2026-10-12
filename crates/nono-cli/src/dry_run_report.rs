@@ -90,6 +90,13 @@ pub(crate) fn dry_run_report(
     incomplete.extend(mediation.unresolved.iter().map(|(name, reason)| {
         format!("credential '{name}' doesn't resolve as declared: {reason}")
     }));
+    // (Resource limits are applied on Linux only: a macOS run refuses them.)
+    #[cfg(not(target_os = "linux"))]
+    if caps.resource_limits().is_some() {
+        incomplete.push(
+            "resource limits, which this platform's run refuses rather than apply".to_string(),
+        );
+    }
     #[cfg(target_os = "linux")]
     if plan.flags.capability_elevation || caps.extensions_enabled() {
         incomplete.push(
