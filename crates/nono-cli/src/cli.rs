@@ -1989,7 +1989,7 @@ pub struct RunArgs {
     #[arg(
         long,
         requires = "dry_run",
-        conflicts_with = "detached",
+        conflicts_with_all = ["detached", "remote"],
         help_heading = "OPTIONS"
     )]
     pub json: bool,

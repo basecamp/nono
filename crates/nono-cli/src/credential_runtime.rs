@@ -63,6 +63,10 @@ pub(crate) fn undecided() -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// What a plan-only run says when it declines to read the keystore, so a
+/// verification that failed only for that is told apart.
+pub(crate) const PLAN_ONLY_KEYSTORE: &str = "a dry run doesn't read the keystore";
+
 pub(crate) fn plan_only() -> bool {
     PLAN_ONLY.load(std::sync::atomic::Ordering::SeqCst)
 }

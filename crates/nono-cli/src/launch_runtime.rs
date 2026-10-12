@@ -566,7 +566,21 @@ fn prepare_trust_launch_options(
             result.results.len()
         );
     }
-    if !result.should_proceed() {
+    // (A plan-only run that declined to read a trust key from the keystore
+    // leaves those files unverified and ungranted, named in `incomplete`; any
+    // other failure stops it as it stops a run.)
+    let undecided_by_plan = result
+        .results
+        .iter()
+        .filter(|r| {
+            matches!(&r.outcome, nono::trust::VerificationOutcome::InvalidSignature { detail }
+                if detail.contains(crate::credential_runtime::PLAN_ONLY_KEYSTORE))
+        })
+        .count();
+    let only_undecided = crate::credential_runtime::plan_only()
+        && undecided_by_plan > 0
+        && usize::try_from(result.blocked).is_ok_and(|blocked| blocked <= undecided_by_plan);
+    if !result.should_proceed() && !only_undecided {
         return Err(NonoError::TrustVerification {
             path: String::new(),
             reason: "instruction files failed trust verification".to_string(),
