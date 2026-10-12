@@ -40,6 +40,7 @@ pub(crate) const OUT_OF_SCOPE: &[&str] = &[
     "environment credentials injected into the session or a command",
     "URL opening delegated to the host browser (open_urls)",
     "signal, process-information and IPC scope",
+    "a brokered command allowed to run directly (allow_direct_exec_bypass), which then runs under the session's own sandbox, as filesystem lists it",
     "nono's own per-launch files (its capability state file, command-mediation shims and sockets, the proxy's CA bundle)",
 ];
 
@@ -182,6 +183,9 @@ fn network_value(intent: &NetworkIntent, caps: &CapabilitySet) -> Value {
         "connect_ports": caps.tcp_connect_ports(),
         "bind_ports": bind_ports,
         "localhost_ports": caps.localhost_ports(),
+        // (macOS: a restricted mode still lets the sandbox reach the host's
+        // resolver, unless the profile blocks it. Linux grants nothing by it.)
+        "resolver": cfg!(target_os = "macos") && caps.dns_enabled() && network_mode(intent, caps) != "allowed",
         "localhost_port_ranges": caps
             .localhost_port_ranges()
             .iter()
