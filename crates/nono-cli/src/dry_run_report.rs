@@ -161,8 +161,20 @@ fn seatbelt_widenings(caps: &CapabilitySet, raw_rules: &[String]) -> Vec<String>
 /// binary it runs, its execute allowlist), what would widen it, and every path
 /// its policy declares, which a later run resolves again.
 fn child_value(child: &DryRunChild, workdir: &Path, outer_caps: &CapabilitySet) -> Result<Value> {
-    let declared =
-        crate::tool_sandbox::declared_policy_paths(&child.sandbox, workdir, workdir, outer_caps)?;
+    // (A declared path the launch expands only when the command runs: an
+    // expansion that fails here is named on this entry, not the whole report.)
+    let (declared, declared_error) = match crate::tool_sandbox::declared_policy_paths(
+        &child.sandbox,
+        workdir,
+        workdir,
+        outer_caps,
+    ) {
+        Ok(declared) => (declared, None),
+        Err(err) => (
+            Vec::new(),
+            Some(format!("its declared paths do not expand: {err}")),
+        ),
+    };
     let mut cwd_dependent: Vec<&String> = Vec::new();
     for d in declared.iter().filter(|d| d.cwd_dependent) {
         if !cwd_dependent.contains(&&d.entry) {
@@ -208,6 +220,12 @@ fn child_value(child: &DryRunChild, workdir: &Path, outer_caps: &CapabilitySet) 
     };
     if let (Some(object), Some(launch)) = (value.as_object_mut(), launch.as_object()) {
         object.extend(launch.clone());
+    }
+    if let (Some(reason), Some(list)) = (
+        declared_error,
+        value.get_mut("incomplete").and_then(Value::as_array_mut),
+    ) {
+        list.push(json!(reason));
     }
     Ok(value)
 }

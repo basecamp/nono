@@ -562,6 +562,8 @@ fn only_what_the_runtime_launches_is_reported() {
             {"args":["b"],"sandbox":{}}]},
           "passed":{"executable":"/bin/true","sandbox":{},"intercept":[
             {"args":[],"action":{"type":"passthrough"}}]},
+          "gated":{"executable":"/bin/true","from":{"session":{"sandbox":{},"invocation_policy":{"default":"deny"}}}},
+          "tokened":{"executable":"/bin/true","sandbox":{"fs_read":["@git:nonsense"]}},
           "limited":{"executable":"/bin/echo","sandbox":{"resources":{}}}}}}"#,
         |run| run.allow_cwd(),
     );
@@ -591,6 +593,22 @@ fn only_what_the_runtime_launches_is_reported() {
         ordered,
         vec![&serde_json::json!(0), &serde_json::json!(2)],
         "a rule an earlier one already matches never runs; one it doesn't match does: {report}"
+    );
+    assert!(
+        !commands.iter().any(|c| c["command"] == "gated"),
+        "an invocation policy that refuses every run launches nothing: {report}"
+    );
+    let tokened = commands
+        .iter()
+        .find(|c| c["command"] == "tokened")
+        .unwrap_or_else(|| {
+            panic!("a declared path that does not expand is named on its entry: {report}")
+        });
+    assert!(
+        tokened["incomplete"]
+            .as_array()
+            .is_some_and(|i| !i.is_empty()),
+        "{tokened}"
     );
     let limited = commands
         .iter()

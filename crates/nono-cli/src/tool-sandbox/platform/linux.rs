@@ -4069,6 +4069,19 @@ impl PreparedToolSandboxRuntime {
                 let Ok(policy) = select_effective_policy(config, name, caller) else {
                     continue;
                 };
+                // (An invocation policy that denies by default and allows or
+                // approves nothing refuses every run, before any launch.)
+                if select_invocation_policy(config, name, caller).is_some_and(|invocation| {
+                    matches!(
+                        invocation.default,
+                        crate::command_policy::PolicyDecisionConfig::Decision(
+                            crate::command_policy::PolicyDecision::Deny
+                        )
+                    ) && invocation.allow.is_empty()
+                        && invocation.approve.is_empty()
+                }) {
+                    continue;
+                }
                 let request = ToolSandboxShimRequest {
                     command: name.clone(),
                     argv: vec![name.as_bytes().to_vec()],
