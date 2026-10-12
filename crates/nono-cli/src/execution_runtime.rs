@@ -208,6 +208,11 @@ pub(crate) struct DryRunMediation {
     /// The platform rules the runtime adds to the session's own set
     /// (`grant_outer_caps`; on macOS, Seatbelt rules).
     pub(crate) session_rules: Vec<String>,
+    /// Each command-policy credential, as declared and as it resolves.
+    pub(crate) credentials: Vec<crate::tool_sandbox::DryRunCredential>,
+    /// The credentials that don't resolve as declared, and why: left out of
+    /// the runtime the dry run prepares, so the rest is still built.
+    pub(crate) unresolved: Vec<(String, String)>,
 }
 
 /// Each sandbox the plan's brokered commands can run under, built by the
@@ -254,11 +259,27 @@ pub(crate) fn dry_run_children(plan: &LaunchPlan) -> Result<DryRunMediation> {
             .unwrap_or_default();
         let scoped_proxy_env_vars =
             crate::proxy_runtime::dry_run_scoped_proxy_env_vars(&flags.network);
+        // (A credential the launch can't resolve as declared would stop the
+        // run; the dry run names it and builds the rest without it. A raw-file
+        // credential must resolve; a local socket may be unavailable.)
+        let credentials =
+            crate::tool_sandbox::dry_run_credentials(command_policies, &proxy_credentials);
+        let unresolved: Vec<(String, String)> = credentials
+            .iter()
+            .filter_map(|c| c.unresolved.clone().map(|reason| (c.name.clone(), reason)))
+            .collect();
+        let mut buildable = command_policies.clone();
+        for credential in credentials
+            .iter()
+            .filter(|c| c.unresolved.is_some() && c.kind != "local-socket")
+        {
+            buildable.credentials.remove(&credential.name);
+        }
         #[cfg(target_os = "linux")]
         let resolved_program = exec_strategy::resolve_program(&plan.program)?;
         let runtime = crate::tool_sandbox::PreparedToolSandboxRuntime::prepare(
             crate::tool_sandbox::ToolSandboxPrepare {
-                config: command_policies,
+                config: &buildable,
                 #[cfg(target_os = "linux")]
                 initial_program: &resolved_program,
                 resolved_command_binaries: flags.resolved_command_binaries.as_ref(),
@@ -295,6 +316,8 @@ pub(crate) fn dry_run_children(plan: &LaunchPlan) -> Result<DryRunMediation> {
         Ok(DryRunMediation {
             children,
             session_rules,
+            credentials,
+            unresolved,
         })
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
