@@ -69,6 +69,19 @@ pub(crate) fn dry_run_report(
     };
     #[cfg(not(target_os = "linux"))]
     let caps = plan.caps.clone();
+    // Where the program starts, as `execute_sandboxed` decides it: the
+    // working directory with command mediation, else that directory when the
+    // capability set covers it, else `/`.
+    let mediated = plan
+        .flags
+        .command_policies
+        .as_ref()
+        .is_some_and(crate::command_policy::CommandPoliciesConfig::is_active);
+    let start_dir = if mediated {
+        workdir.clone()
+    } else {
+        crate::execution_runtime::execution_start_dir(&workdir, &plan.caps)?
+    };
     let mut incomplete: Vec<String> = Vec::new();
     #[cfg(target_os = "linux")]
     if plan.flags.capability_elevation || caps.extensions_enabled() {
@@ -86,7 +99,7 @@ pub(crate) fn dry_run_report(
     Ok(json!({
         "version": DRY_RUN_REPORT_VERSION,
         "program": path_value(Path::new(&plan.program)),
-        "workdir": path_value(&workdir),
+        "workdir": path_value(&start_dir),
         "incomplete": incomplete,
         "out_of_scope": OUT_OF_SCOPE,
         "filesystem": caps.fs_capabilities().iter().map(fs_value).collect::<Vec<_>>(),
@@ -115,14 +128,20 @@ fn network_mode(intent: &NetworkIntent, caps: &CapabilitySet) -> &'static str {
 }
 
 /// The Seatbelt rules that can grant beyond the capability list: the
-/// profile's raw rules, whatever they say, and every other `allow` rule the
-/// preparation generated (a keychain grant, say). Deny rules only narrow.
+/// profile's raw rules the set applies, whatever they say, and every other
+/// `allow` rule the preparation generated (a keychain grant, say). Deny rules
+/// only narrow.
 fn seatbelt_widenings(caps: &CapabilitySet, raw_rules: &[String]) -> Vec<String> {
     let mut out = Vec::new();
-    if !raw_rules.is_empty() {
+    // (Only the raw rules the prepared set still applies: none on Linux, and
+    // none a trust policy stripped.)
+    let applied_raw = raw_rules
+        .iter()
+        .filter(|rule| caps.platform_rules().contains(rule))
+        .count();
+    if applied_raw > 0 {
         out.push(format!(
-            "{} raw Seatbelt rule(s) (unsafe_macos_seatbelt_rules) the capability list cannot show",
-            raw_rules.len()
+            "{applied_raw} raw Seatbelt rule(s) (unsafe_macos_seatbelt_rules) the capability list cannot show"
         ));
     }
     let generated = caps
@@ -173,8 +192,9 @@ fn child_value(child: &DryRunChild, workdir: &Path, outer_caps: &CapabilitySet) 
             json!({
                 "executable": path_value(&launch.executable),
                 "incomplete": seatbelt_widenings(&launch.caps, raw),
-                "filesystem": launch.caps.fs_capabilities().iter().map(fs_value).collect::<Vec<_>>(),
-                "unix_sockets": launch.caps.unix_socket_capabilities().iter().map(socket_value).collect::<Vec<_>>(),
+                // (No `source`: the launch spec a child applies carries none.)
+                "filesystem": launch.caps.fs_capabilities().iter().map(|c| without_source(fs_value(c))).collect::<Vec<_>>(),
+                "unix_sockets": launch.caps.unix_socket_capabilities().iter().map(|c| without_source(socket_value(c))).collect::<Vec<_>>(),
                 "exec_paths": launch.exec_paths.iter().map(|p| path_value(p)).collect::<Vec<_>>(),
             })
         }
@@ -218,6 +238,14 @@ fn socket_value(cap: &UnixSocketCapability) -> Value {
         },
     });
     add_source(&mut value, &cap.source);
+    value
+}
+
+fn without_source(mut value: Value) -> Value {
+    if let Some(object) = value.as_object_mut() {
+        object.remove("source");
+        object.remove("group");
+    }
     value
 }
 

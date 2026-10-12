@@ -193,6 +193,14 @@ fn reports_each_brokered_command_sandbox_resolved() {
     );
     assert_eq!(probe["incomplete"], serde_json::json!([]));
     assert!(
+        probe["filesystem"]
+            .as_array()
+            .expect("filesystem")
+            .iter()
+            .all(|e| e.get("source").is_none()),
+        "a brokered entry claims no provenance its launch spec does not carry: {probe}"
+    );
+    assert!(
         find("nocan", "session").is_some(),
         "nocan's top-level sandbox is the session's: {report}"
     );
@@ -573,4 +581,21 @@ fn only_what_the_runtime_launches_is_reported() {
         "with the reason its launch is not built: {limited}"
     );
     assert_eq!(limited["filesystem"], serde_json::json!([]));
+}
+
+/// What the run itself does decides the report: raw Seatbelt rules the Linux
+/// launch never applies leave it complete, and with no brokered command and a
+/// working directory the capability set doesn't cover, the program starts in
+/// `/`, as the launch starts it.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_report_follows_the_launch_on_this_platform() {
+    let t = nono_test!("dry-run-json-platform");
+    let report = report(
+        &t,
+        r#"{"meta":{"name":"t"},"workdir":{"access":"none"},"unsafe_macos_seatbelt_rules":["(allow file-read* (subpath \"/opt\"))"]}"#,
+        |run| run,
+    );
+    assert_eq!(report["incomplete"], serde_json::json!([]), "{report}");
+    assert_eq!(report["workdir"], "/", "{report}");
 }
