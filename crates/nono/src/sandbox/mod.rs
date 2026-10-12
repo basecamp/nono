@@ -11,6 +11,9 @@ use crate::error::Result;
 #[cfg(target_os = "linux")]
 mod linux;
 
+#[cfg(target_os = "linux")]
+mod metadata;
+
 #[cfg(target_os = "macos")]
 mod macos;
 
@@ -28,19 +31,26 @@ pub use linux::{
 #[cfg(target_os = "linux")]
 pub use linux::is_wsl2;
 
+// Re-export Linux file mode and timestamp emulation for supervisor use
+#[cfg(target_os = "linux")]
+pub use metadata::{
+    MetadataChange, MetadataRequest, MetadataTarget, Timestamp, is_metadata_syscall,
+    read_metadata_request,
+};
+
 // Re-export Linux seccomp-notify primitives for supervisor use
 #[cfg(target_os = "linux")]
 pub use linux::{
-    OpenHow, PreparedLandlockSandbox, PreparedSeccompNotifyFilter, RawSandboxError,
-    RawSandboxStage, SYS_BIND, SYS_CONNECT, SYS_OPENAT, SYS_OPENAT2, SYS_SENDMMSG, SYS_SENDMSG,
-    SYS_SENDTO, SeccompData, SeccompNetFallback, SeccompNotif, SeccompOpts, SockaddrInfo,
-    UnixSocketKind, classify_access_from_flags, classify_af_unix, continue_notif, deny_notif,
-    inject_fd, install_seccomp_af_unix_filter, install_seccomp_notify,
+    METADATA_SYSCALLS, OpenHow, PreparedLandlockSandbox, PreparedSeccompNotifyFilter,
+    RawSandboxError, RawSandboxStage, SYS_BIND, SYS_CONNECT, SYS_OPENAT, SYS_OPENAT2, SYS_SENDMMSG,
+    SYS_SENDMSG, SYS_SENDTO, SeccompData, SeccompNetFallback, SeccompNotif, SeccompOpts,
+    SockaddrInfo, UnixSocketKind, classify_access_from_flags, classify_af_unix, continue_notif,
+    deny_notif, inject_fd, install_seccomp_af_unix_filter, install_seccomp_notify,
     install_seccomp_proxy_filter, notif_id_valid, prepare_landlock_with_abi,
-    prepare_seccomp_af_unix_filter, prepare_seccomp_proxy_filter, prepare_seccomp_with_abi,
-    probe_seccomp_block_network_support, read_mmsghdr_dests, read_msghdr_dest, read_notif_path,
-    read_notif_sockaddr, read_open_how, recv_notif, resolve_notif_path, respond_notif_errno,
-    validate_openat2_size,
+    prepare_seccomp_af_unix_filter, prepare_seccomp_metadata_filter, prepare_seccomp_proxy_filter,
+    prepare_seccomp_with_abi, probe_seccomp_block_network_support, read_mmsghdr_dests,
+    read_msghdr_dest, read_notif_path, read_notif_sockaddr, read_open_how, recv_notif,
+    resolve_notif_path, respond_notif_errno, respond_notif_success, validate_openat2_size,
 };
 
 /// Information about sandbox support on this platform
