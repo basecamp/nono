@@ -28,6 +28,20 @@ pub(crate) fn maybe_run_internal_tool_sandbox_entrypoint() -> bool {
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub(crate) fn record_main_start() {}
 
+/// No command mediation on this platform: a command sandbox cannot be resolved.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn resolve_policy_grants(
+    _policy: &crate::command_policy::CommandSandboxConfig,
+    _policy_root: &std::path::Path,
+    _cwd: &std::path::Path,
+    _outer_caps: &nono::CapabilitySet,
+    _deny_paths: &[std::path::PathBuf],
+) -> nono::Result<(nono::CapabilitySet, Vec<std::path::PathBuf>)> {
+    Err(nono::NonoError::UnsupportedPlatform(
+        "command sandboxes are not mediated on this platform".to_string(),
+    ))
+}
+
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub(crate) fn log_main_total() {}
 
@@ -644,7 +658,7 @@ mod linux;
 #[cfg(target_os = "linux")]
 pub(crate) use linux::{
     PreparedToolSandboxRuntime, TOOL_SANDBOX_PARENT_MONOTONIC_ENV, log_main_total,
-    maybe_run_internal_tool_sandbox_entrypoint, record_main_start,
+    maybe_run_internal_tool_sandbox_entrypoint, record_main_start, resolve_policy_grants,
 };
 
 #[cfg(target_os = "macos")]
@@ -654,6 +668,7 @@ mod macos;
 #[cfg(target_os = "macos")]
 pub(crate) use macos::{
     PreparedToolSandboxRuntime, log_main_total, maybe_run_internal_tool_sandbox_entrypoint,
-    record_main_start, resume_mediated_children, signal_active_children_in_pgroup,
-    signal_relay_write_fd, stop_active_children_in_pgroup, stop_signal_relay,
+    record_main_start, resolve_policy_grants, resume_mediated_children,
+    signal_active_children_in_pgroup, signal_relay_write_fd, stop_active_children_in_pgroup,
+    stop_signal_relay,
 };

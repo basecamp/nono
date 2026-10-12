@@ -3995,6 +3995,33 @@ fn add_chaining_control_caps(caps: &mut CapabilitySet, state: &ToolSandboxState)
     Ok(())
 }
 
+/// The grants a command's sandbox policy gives it when the command runs from
+/// `cwd`: the filesystem and Unix-socket capabilities `build_child_caps`
+/// derives from the policy, and the `exec_paths` its launch spec allows. The
+/// runtime parts of a child's capabilities (its binary, runtime baseline,
+/// shims, credentials, proxy) are not policy and are not included. Used by
+/// `nono run --dry-run --json` to report each brokered command's sandbox
+/// resolved by the same code that builds it at launch.
+pub(crate) fn resolve_policy_grants(
+    policy: &CommandSandboxConfig,
+    policy_root: &Path,
+    cwd: &Path,
+    outer_caps: &CapabilitySet,
+    deny_paths: &[PathBuf],
+) -> Result<(CapabilitySet, Vec<PathBuf>)> {
+    let cwd = cwd
+        .canonicalize()
+        .map_err(|source| NonoError::PathCanonicalization {
+            path: cwd.to_path_buf(),
+            source,
+        })?;
+    let mut caps = CapabilitySet::new();
+    add_policy_fs(&mut caps, policy, policy_root, &cwd, outer_caps, deny_paths)?;
+    add_policy_unix_sockets(&mut caps, policy, policy_root, &cwd, outer_caps, deny_paths)?;
+    let exec_paths = resolve_exec_paths(&policy.exec_paths, policy_root, &cwd, outer_caps)?;
+    Ok((caps, exec_paths))
+}
+
 fn add_policy_fs(
     caps: &mut CapabilitySet,
     policy: &CommandSandboxConfig,
