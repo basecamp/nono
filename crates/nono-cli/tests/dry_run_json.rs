@@ -98,11 +98,7 @@ fn reports_each_brokered_command_sandbox_resolved() {
           "meta": {{"name": "t"}},
           "workdir": {{"access": "readwrite"}},
           "command_policies": {{
-            "credentials": {{
-              "tok": {{"type": "raw-file", "path": "{ws}/token"}},
-              "sock": {{"type": "local-socket", "path": "{ws}/token"}},
-              "nul": {{"type": "raw-file", "path": "/dev/null"}}
-            }},
+            "credentials": {{"tok": {{"type": "raw-file", "path": "{ws}/token"}}}},
             "commands": {{
               "probe": {{
                 "executable": "/bin/true",
@@ -125,7 +121,7 @@ fn reports_each_brokered_command_sandbox_resolved() {
               }},
               "nocan": {{
                 "executable": "/bin/echo",
-                "sandbox": {{"fs_read": ["{ws}/other"], "use_credentials": ["sock", "nul"]}}
+                "sandbox": {{"fs_read": ["{ws}/other"], "use_credentials": []}}
               }},
               "denied": {{
                 "executable": "/bin/echo",
@@ -173,15 +169,13 @@ fn reports_each_brokered_command_sandbox_resolved() {
     );
     assert_eq!(probe["executable"], canon(Path::new("/bin/true")).as_str());
     #[cfg(target_os = "linux")]
-    assert_eq!(
-        probe["exec_paths"],
-        serde_json::json!([ws.join("helpers").to_str().expect("utf-8")])
-    );
-    #[cfg(target_os = "macos")]
-    assert_eq!(
-        probe["exec_paths"],
-        serde_json::json!([]),
-        "macOS launches use no exec_paths"
+    assert!(
+        probe["exec_paths"]
+            .as_array()
+            .expect("exec_paths")
+            .iter()
+            .any(|p| p == ws.join("helpers").to_str().expect("utf-8")),
+        "the launch's execute allowlist holds the policy's exec_paths: {probe}"
     );
     assert_eq!(
         probe["cwd_dependent"],
@@ -198,27 +192,9 @@ fn reports_each_brokered_command_sandbox_resolved() {
         "a declared path that is not there yet is still reported: {probe}"
     );
     assert_eq!(probe["incomplete"], serde_json::json!([]));
-    let nocan = find("nocan", "session")
-        .unwrap_or_else(|| panic!("nocan's top-level sandbox is the session's: {report}"));
     assert!(
-        nocan["incomplete"]
-            .as_array()
-            .expect("incomplete")
-            .iter()
-            .any(|i| i
-                .as_str()
-                .is_some_and(|i| i.starts_with("credential 'sock'"))),
-        "a socket credential naming a regular file is incomplete, not an error: {nocan}"
-    );
-    assert!(
-        nocan["incomplete"]
-            .as_array()
-            .expect("incomplete")
-            .iter()
-            .any(|i| i
-                .as_str()
-                .is_some_and(|i| i.starts_with("credential 'nul'"))),
-        "a raw-file credential that is no regular file is incomplete: {nocan}"
+        find("nocan", "session").is_some(),
+        "nocan's top-level sandbox is the session's: {report}"
     );
     let from_caller = find("probe", "caller")
         .unwrap_or_else(|| panic!("an admitted caller's edge is listed: {report}"));
@@ -240,9 +216,14 @@ fn reports_each_brokered_command_sandbox_resolved() {
     );
     let intercept = commands
         .iter()
-        .find(|c| c["command"] == "probe" && c["intercept"] == 0)
+        .find(|c| c["command"] == "probe" && c["intercept"] == 0 && c["caller"] == "session")
         .unwrap_or_else(|| panic!("the intercept rule's sandbox listed: {report}"));
-    assert!(intercept["caller"].is_null());
+    assert!(
+        commands
+            .iter()
+            .any(|c| c["command"] == "probe" && c["intercept"] == 0 && c["caller"] == "caller"),
+        "for each caller whose run it intercepts: {report}"
+    );
     assert!(
         !commands
             .iter()
@@ -295,20 +276,11 @@ fn reports_the_network_mode_the_run_applies() {
         r#"{"meta":{"name":"t"},"network":{"allow_domain":["example.com"]}}"#,
         |run| run,
     );
-    assert_eq!(
-        proxied["network"],
-        serde_json::json!({"mode": "proxy", "blocked": true})
-    );
+    assert_eq!(proxied["network"], serde_json::json!({"mode": "proxy"}));
     let blocked = report(&t, r#"{"meta":{"name":"t"}}"#, |run| run.block_net());
-    assert_eq!(
-        blocked["network"],
-        serde_json::json!({"mode": "blocked", "blocked": true})
-    );
+    assert_eq!(blocked["network"], serde_json::json!({"mode": "blocked"}));
     let open = report(&t, r#"{"meta":{"name":"t"}}"#, |run| run);
-    assert_eq!(
-        open["network"],
-        serde_json::json!({"mode": "allowed", "blocked": false})
-    );
+    assert_eq!(open["network"], serde_json::json!({"mode": "allowed"}));
     // A credential route defined but not enabled starts no proxy.
     let defined_only = report(
         &t,
@@ -317,7 +289,7 @@ fn reports_the_network_mode_the_run_applies() {
     );
     assert_eq!(
         defined_only["network"],
-        serde_json::json!({"mode": "allowed", "blocked": false})
+        serde_json::json!({"mode": "allowed"})
     );
 }
 
@@ -340,7 +312,7 @@ fn reports_a_manifest_blocked_network_as_blocked() {
     let report: Value = serde_json::from_str(&completed.stdout()).expect("one JSON document");
     assert_eq!(
         report["network"],
-        serde_json::json!({"mode": "blocked", "blocked": true}),
+        serde_json::json!({"mode": "blocked"}),
         "the launch keeps the manifest's block: {report}"
     );
 }
@@ -383,4 +355,161 @@ fn json_requires_dry_run() {
         .expect("run nono");
     assert!(!out.status.success(), "--json with --detached is refused");
     assert!(String::from_utf8_lossy(&out.stderr).contains("--detached"));
+}
+
+/// The report is the run's own capability set: the same profile (a glob, a
+/// variable, a symlink, a brokered command) reported by the dry run and run for
+/// real, where the sandboxed process reads the capability state nono writes
+/// for it (`$NONO_CAP_FILE`, the set the run applies) and runs the brokered
+/// command on a path its sandbox reaches through a symlink.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_report_is_the_capability_set_the_run_applies() {
+    let t = nono_test!("dry-run-json-equals-run");
+    let ws = t.workspace().to_path_buf();
+    for dir in ["logs-a", "logs-b", "target", "data"] {
+        fs::create_dir_all(ws.join(dir)).expect("create dir");
+    }
+    symlink(ws.join("target"), ws.join("link")).expect("symlink");
+    symlink(ws.join("data"), ws.join("data-link")).expect("symlink");
+    fs::write(ws.join("data").join("secret"), "secret-7096\n").expect("write secret");
+    fs::create_dir_all(t.home().join("docs")).expect("create docs");
+    let json = format!(
+        r#"{{
+          "meta": {{"name": "t"}},
+          "workdir": {{"access": "readwrite"}},
+          "filesystem": {{"read": ["{ws}/logs-*", "$HOME/docs", "{ws}/link"]}},
+          "command_policies": {{
+            "commands": {{
+              "probe": {{
+                "executable": "/bin/cat",
+                "from": {{"session": {{"sandbox": {{"fs_read": ["{ws}/data-link", "$HOME/docs"]}}}}}}
+              }}
+            }}
+          }}
+        }}"#,
+        ws = ws.display()
+    );
+    let report = report(&t, &json, |run| run.allow_cwd());
+    let profile = t.write_profile("dry-run-json", &json);
+    let completed = t
+        .run()
+        .profile(&profile)
+        .workdir(t.workspace())
+        .allow_cwd()
+        .exec(Argv::new("/bin/sh").arg("-c").arg(format!(
+            // (The shell reads the state itself: cat is the brokered binary,
+            // which the session may run only through its shim.)
+            "while IFS= read -r l || [ -n \"$l\" ]; do printf '%s\\n' \"$l\"; done < \"$NONO_CAP_FILE\"; echo ---; probe {}/data-link/secret",
+            ws.display()
+        )))
+        .assert_success("the run applies the profile");
+    let stdout = completed.stdout();
+    let (state, probed) = stdout
+        .split_once("\n---\n")
+        .unwrap_or_else(|| panic!("the state, then the probe: {stdout}"));
+    let state: Value = serde_json::from_str(state.trim()).unwrap_or_else(|e| {
+        panic!(
+            "the capability state is JSON ({e}): {state}\nstderr: {}",
+            completed.stderr()
+        )
+    });
+    // (Path and access; /proc aside, which the exec widens after the state is
+    // written, as the report shows it.)
+    let set = |entries: &Value| {
+        let mut set: Vec<(String, String)> = entries
+            .as_array()
+            .expect("an array")
+            .iter()
+            .map(|e| {
+                (
+                    e["path"].as_str().expect("a path").to_string(),
+                    e["access"].as_str().expect("an access").to_string(),
+                )
+            })
+            .filter(|(path, _)| !path.starts_with("/proc"))
+            .collect();
+        set.sort();
+        set.dedup();
+        set
+    };
+    assert_eq!(
+        set(&report["filesystem"]),
+        set(&state["fs"]),
+        "the report's filesystem is the set the run applies"
+    );
+    for dir in ["logs-a", "logs-b", "target"] {
+        assert!(
+            fs_entry(&report, &canon(&ws.join(dir))).is_some(),
+            "{dir}: {report}"
+        );
+    }
+    // The brokered command reads through its symlinked grant, which the
+    // report lists where it leads.
+    assert!(
+        probed.contains("secret-7096"),
+        "the brokered command reads what its sandbox grants: {probed}"
+    );
+    let probe = report["commands"]
+        .as_array()
+        .expect("commands")
+        .iter()
+        .find(|c| c["command"] == "probe" && c["caller"] == "session" && c["intercept"].is_null())
+        .unwrap_or_else(|| panic!("probe listed: {report}"));
+    assert!(
+        probe["filesystem"]
+            .as_array()
+            .expect("filesystem")
+            .iter()
+            .any(|e| e["path"] == canon(&ws.join("data")).as_str() && e["access"] == "read"),
+        "{probe}"
+    );
+    assert_eq!(probe["executable"], canon(Path::new("/bin/cat")).as_str());
+}
+
+/// Capability elevation lets the supervisor grant paths beyond the list at
+/// runtime: the report says so, and a consumer fails closed.
+#[cfg(target_os = "linux")]
+#[test]
+fn capability_elevation_makes_the_report_incomplete() {
+    let t = nono_test!("dry-run-json-elevation");
+    let report = report(
+        &t,
+        r#"{"meta":{"name":"t"},"security":{"capability_elevation":true}}"#,
+        |run| run,
+    );
+    assert!(
+        report["incomplete"]
+            .as_array()
+            .expect("incomplete")
+            .iter()
+            .any(|i| i
+                .as_str()
+                .is_some_and(|i| i.starts_with("capability elevation"))),
+        "{report}"
+    );
+    assert!(
+        report["out_of_scope"]
+            .as_array()
+            .is_some_and(|a| !a.is_empty()),
+        "what the report does not cover is named: {report}"
+    );
+}
+
+/// A credential the launch cannot resolve stops the run; the dry run stops
+/// with it rather than report a run that never starts.
+#[test]
+fn a_credential_the_launch_cannot_resolve_fails_the_dry_run_as_the_run() {
+    let t = nono_test!("dry-run-json-credential");
+    let profile = t.write_profile(
+        "dry-run-json",
+        r#"{"meta":{"name":"t"},"command_policies":{"credentials":{"tok":{"type":"raw-file","path":"/nonexistent-7096/token"}},"commands":{"probe":{"executable":"/bin/true","sandbox":{"use_credentials":["tok"]}}}}}"#,
+    );
+    t.run()
+        .profile(&profile)
+        .workdir(t.workspace())
+        .allow_cwd()
+        .dry_run_json()
+        .exec(Argv::new("/bin/true"))
+        .assert_failure("an unresolvable credential stops the dry run, as it stops the run");
 }
