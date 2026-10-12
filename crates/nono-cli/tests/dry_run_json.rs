@@ -773,3 +773,20 @@ fn a_process_relative_grant_is_reported_as_the_child_gets_it() {
         "no entry names the test's own process"
     );
 }
+
+/// The session proxy's credential routes are listed by name, as declared: a
+/// dry run reads none of their keys.
+#[test]
+fn lists_session_proxy_credentials_as_declared() {
+    let t = nono_test!("dry-run-json-proxy-credentials");
+    let report = report(
+        &t,
+        r#"{"meta":{"name":"t"},"network":{"allow_domain":["example.com"],"custom_credentials":{"x":{"upstream":"https://example.com","credential_key":"env://NONO_DRY_RUN_UNSET_TOKEN"}},"credentials":["x"]}}"#,
+        |run| run,
+    );
+    assert_eq!(
+        report["credentials"]["proxy"],
+        serde_json::json!(["x"]),
+        "{report}"
+    );
+}

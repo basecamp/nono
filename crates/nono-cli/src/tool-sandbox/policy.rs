@@ -414,7 +414,7 @@ pub(super) fn load_supervisor_credential_source(
     source: &crate::command_policy::AmbientCredentialSourceConfig,
     outer_caps: &nono::CapabilitySet,
 ) -> nono::Result<Vec<u8>> {
-    if crate::credential_runtime::credential_sources_skipped() {
+    if crate::credential_runtime::plan_only() {
         return Err(nono::NonoError::SandboxInit(
             "a dry run reads no credential source".to_string(),
         ));

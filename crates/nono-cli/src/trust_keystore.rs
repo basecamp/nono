@@ -431,6 +431,13 @@ pub(crate) fn remove_secret_for_ref(
 // called from the `Keystore` branch of the `_for_ref` dispatchers in trust_cmd.rs.
 
 pub(crate) fn load_secret(service: &str, account: &str) -> Result<Zeroizing<String>> {
+    // (A JSON dry run asks no keystore: a trust key it would need stops it
+    // rather than prompt.)
+    if crate::credential_runtime::plan_only() {
+        return Err(nono::NonoError::KeystoreAccess(format!(
+            "a dry run doesn't read the keystore ('{account}')"
+        )));
+    }
     TrustKeyStore::selected().load(service, account)
 }
 

@@ -158,7 +158,7 @@ pub(crate) fn run_sandbox(mut run_args: RunArgs, silent: bool) -> Result<()> {
     // prompts for one, and each credential is planned as declared.
     let dry_run_json = run_args.sandbox.dry_run && run_args.json;
     if dry_run_json {
-        crate::credential_runtime::skip_credential_sources();
+        crate::credential_runtime::enter_plan_only();
     }
 
     // Load profile once and reuse for binary resolution and command_args.
@@ -235,6 +235,7 @@ pub(crate) fn run_sandbox(mut run_args: RunArgs, silent: bool) -> Result<()> {
             .unwrap_or_default();
         let plan = prepare_run_launch_plan(run_args, program, cmd_args, true)?;
         let mediation = crate::execution_runtime::dry_run_children(&plan)?;
+        undecided.extend(crate::credential_runtime::undecided());
         let report = crate::dry_run_report::dry_run_report(
             &plan,
             &mediation,

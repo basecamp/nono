@@ -35,19 +35,36 @@ fn parse_env_credential_map_args(values: &[String]) -> Result<Vec<(String, Strin
 }
 
 /// Set once by `nono run --dry-run --json`, before it builds the plan: from
-/// then on this process reads no credential source. No keystore or password
-/// manager is asked, no credential command runs, nothing prompts; each
-/// credential is planned as declared, with an empty value that never leaves
-/// the dry run (it launches nothing).
-static CREDENTIAL_SOURCES_SKIPPED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+/// then on this process only plans. It reads no credential source (no
+/// keystore or password manager is asked, no credential command runs), asks
+/// nothing on the terminal and pulls no profile; each credential is planned
+/// as declared, with an empty value that never leaves the dry run (it
+/// launches nothing).
+static PLAN_ONLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-pub(crate) fn skip_credential_sources() {
-    CREDENTIAL_SOURCES_SKIPPED.store(true, std::sync::atomic::Ordering::SeqCst);
+pub(crate) fn enter_plan_only() {
+    PLAN_ONLY.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
-pub(crate) fn credential_sources_skipped() -> bool {
-    CREDENTIAL_SOURCES_SKIPPED.load(std::sync::atomic::Ordering::SeqCst)
+/// What a plan-only run left for a person or a source to decide at launch, as
+/// `incomplete` names it.
+static UNDECIDED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+pub(crate) fn note_undecided(reason: impl Into<String>) {
+    if let Ok(mut undecided) = UNDECIDED.lock() {
+        undecided.push(reason.into());
+    }
+}
+
+pub(crate) fn undecided() -> Vec<String> {
+    UNDECIDED
+        .lock()
+        .map(|undecided| undecided.clone())
+        .unwrap_or_default()
+}
+
+pub(crate) fn plan_only() -> bool {
+    PLAN_ONLY.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 pub(crate) fn load_env_credentials(
@@ -68,7 +85,7 @@ pub(crate) fn load_env_credentials(
         return Ok(Vec::new());
     }
     // (A dry run plans each as declared: its destination, never its value.)
-    if credential_sources_skipped() {
+    if plan_only() {
         return Ok(secret_mappings
             .values()
             .map(|env_var| LoadedSecret {

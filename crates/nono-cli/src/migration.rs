@@ -117,7 +117,9 @@ pub fn check_and_run(profile_name: &str) -> Result<MigrationOutcome> {
     if is_path_or_registry_ref(profile_name) {
         return Ok(MigrationOutcome::NotApplicable);
     }
-    if env_flag(ENV_NO_MIGRATE) {
+    // (A JSON dry run only plans: it looks nothing up, asks nothing, pulls
+    // nothing.)
+    if env_flag(ENV_NO_MIGRATE) || crate::credential_runtime::plan_only() {
         return Ok(MigrationOutcome::Skipped);
     }
 
