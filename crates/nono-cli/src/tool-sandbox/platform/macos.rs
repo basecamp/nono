@@ -3698,9 +3698,12 @@ impl PreparedToolSandboxRuntime {
                 // reaches it: the command then runs under the selected sandbox
                 // only if that rule launches it as it is, with no sandbox of its
                 // own and no helper.)
-                let catch_all = command.intercept.iter().find(|rule| {
-                    rule.args.as_ref().is_some_and(Vec::is_empty) && rule.match_config.is_none()
-                });
+                // (`args` decides a rule when present: an empty list is a
+                // catch-all whatever else the rule says.)
+                let catch_all = command
+                    .intercept
+                    .iter()
+                    .find(|rule| rule.args.as_ref().is_some_and(Vec::is_empty));
                 let base_runs = catch_all.is_none_or(|rule| {
                     rule.sandbox.is_none()
                         && !matches!(
@@ -3722,6 +3725,27 @@ impl PreparedToolSandboxRuntime {
                     ));
                 }
                 for (index, rule) in command.intercept.iter().enumerate() {
+                    // (Rules match in order: an `args` rule whose own arguments
+                    // an earlier `args` rule already matches never runs, as the
+                    // runtime's matcher decides on them.)
+                    if let Some(args) = &rule.args {
+                        let mut argv = vec![name.as_bytes().to_vec()];
+                        argv.extend(args.iter().map(|arg| arg.as_bytes().to_vec()));
+                        let shadowed =
+                            super::resolve_intercept_action(command, &argv, || Ok(Vec::new()))
+                                .ok()
+                                .and_then(|won| won.rule_index)
+                                .is_some_and(|won| {
+                                    won < index
+                                        && command
+                                            .intercept
+                                            .get(won)
+                                            .is_some_and(|w| w.args.is_some())
+                                });
+                        if shadowed {
+                            continue;
+                        }
+                    }
                     let sandbox = rule.sandbox.as_ref().unwrap_or(policy);
                     let scope =
                         scoped_proxy_key(name, caller, rule.sandbox.as_ref().map(|_| index));

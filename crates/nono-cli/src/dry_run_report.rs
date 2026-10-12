@@ -34,7 +34,7 @@ pub(crate) const DRY_RUN_REPORT_VERSION: u32 = 1;
 /// What a run does that the report does not cover: out of its contract.
 pub(crate) const OUT_OF_SCOPE: &[&str] = &[
     "brokered commands' network policy (each command's proxy, ports and domains)",
-    "network enforcement left to the deployment (linux.sandbox_policy = external)",
+    "how the network mode is enforced: left to the deployment (linux.sandbox_policy = external), Landlock alone (linux.sandbox_policy = landlock), or an unenforced proxy on WSL2 (wsl2_proxy_policy = insecure_proxy)",
     "resolution of the program through PATH (program is as given)",
     "session hooks, which run on the host outside the sandbox",
     "environment credentials injected into the session or a command",
