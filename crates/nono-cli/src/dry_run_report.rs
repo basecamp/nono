@@ -253,11 +253,12 @@ fn network_mode(intent: &NetworkIntent, caps: &CapabilitySet) -> &'static str {
     }
 }
 
-/// Whether a Seatbelt rule holds an `allow` form anywhere, however it is
-/// spaced: `(allow`, `( allow`, `(\tallow`.
+/// Whether a Seatbelt rule may hold an `allow` form: any `allow` in it at all,
+/// however it is spaced or commented (`( allow`, `(; note` then `allow` on
+/// the next line). A deny whose path says "allow" counts too, which only
+/// errs toward `incomplete`.
 fn seatbelt_allows(rule: &str) -> bool {
-    rule.match_indices('(')
-        .any(|(at, _)| rule[at + 1..].trim_start().starts_with("allow"))
+    rule.contains("allow")
 }
 
 /// The Seatbelt rules that can grant beyond the capability list: the
@@ -508,6 +509,14 @@ mod tests {
             seatbelt_widenings(&caps, &unapplied).len(),
             1,
             "a raw rule the set doesn't apply counts for nothing"
+        );
+        assert!(
+            seatbelt_allows("( allow file-read* (subpath \"/e\"))"),
+            "however spaced"
+        );
+        assert!(
+            seatbelt_allows("(; note\n allow file-read* (subpath \"/f\"))"),
+            "however commented"
         );
         Ok(())
     }
