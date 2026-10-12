@@ -418,13 +418,15 @@ fn the_report_is_the_capability_set_the_run_applies() {
             completed.stderr()
         )
     });
-    // (Path and access; /proc aside, which the exec widens after the state is
-    // written, as the report shows it.)
+    // (Path and access; /proc and what the launch remaps to the child's own
+    // process aside: the state names this run's process, the report the
+    // child's self-relative spelling.)
     let set = |entries: &Value| {
         let mut set: Vec<(String, String)> = entries
             .as_array()
             .expect("an array")
             .iter()
+            .filter(|e| e["process_relative"] != true)
             .map(|e| {
                 (
                     e["path"].as_str().expect("a path").to_string(),
@@ -649,5 +651,31 @@ fn reports_port_exceptions_beside_the_network_mode() {
         report["network"]["connect_ports"],
         serde_json::json!([2222]),
         "{report}"
+    );
+}
+
+/// A grant the launch remaps to the child's own process after it forks is
+/// reported as the child gets it: in its self-relative spelling, marked, not
+/// as the dry run's own process.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_process_relative_grant_is_reported_as_the_child_gets_it() {
+    let t = nono_test!("dry-run-json-procfs");
+    let report = report(
+        &t,
+        r#"{"meta":{"name":"t"},"filesystem":{"read":["/proc/self/task"]}}"#,
+        |run| run,
+    );
+    let entry = fs_entry(&report, "/proc/self/task")
+        .unwrap_or_else(|| panic!("listed in its self-relative spelling: {report}"));
+    assert_eq!(entry["process_relative"], true, "{entry}");
+    let own = format!("/proc/{}/", std::process::id());
+    assert!(
+        !report["filesystem"]
+            .as_array()
+            .expect("filesystem")
+            .iter()
+            .any(|e| e["path"].as_str().is_some_and(|p| p.starts_with(&own))),
+        "no entry names the test's own process"
     );
 }
