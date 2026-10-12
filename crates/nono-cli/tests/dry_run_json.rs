@@ -343,7 +343,11 @@ fn json_requires_dry_run() {
         .args(["run", "--json", "--", "/bin/true"])
         .output()
         .expect("run nono");
-    assert_eq!(out.status.code(), Some(2), "--json without --dry-run is a usage error");
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "--json without --dry-run is a usage error"
+    );
     assert!(String::from_utf8_lossy(&out.stderr).contains("--dry-run"));
     // Nor with --remote, which plans nothing here and would launch remotely.
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_nono"))
@@ -359,7 +363,11 @@ fn json_requires_dry_run() {
         ])
         .output()
         .expect("run nono");
-    assert_eq!(out.status.code(), Some(2), "--json with --remote is a usage error");
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "--json with --remote is a usage error"
+    );
     assert!(String::from_utf8_lossy(&out.stderr).contains("--remote"));
     // Nor with --detached, whose launch discards stdout.
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_nono"))
@@ -373,7 +381,11 @@ fn json_requires_dry_run() {
         ])
         .output()
         .expect("run nono");
-    assert_eq!(out.status.code(), Some(2), "--json with --detached is a usage error");
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "--json with --detached is a usage error"
+    );
     assert!(String::from_utf8_lossy(&out.stderr).contains("--detached"));
 }
 
