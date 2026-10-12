@@ -246,16 +246,25 @@ impl CommandContext<'_> {
                 continue;
             };
             match credential_path(credential) {
+                // A path that isn't the kind the credential says (a regular
+                // file named as a socket) leaves the credential unavailable
+                // at launch; it is named here rather than failing the report.
                 Ok(Some((path, CommandCredentialType::LocalSocket))) => {
-                    caps.add_unix_socket(UnixSocketCapability::new_file(
-                        &path,
-                        nono::UnixSocketMode::Connect,
-                    )?);
-                    caps.add_fs(FsCapability::new_file(&path, AccessMode::Read)?);
+                    match UnixSocketCapability::new_file(&path, nono::UnixSocketMode::Connect)
+                        .and_then(|socket| {
+                            FsCapability::new_file(&path, AccessMode::Read).map(|f| (socket, f))
+                        }) {
+                        Ok((socket, file)) => {
+                            caps.add_unix_socket(socket);
+                            caps.add_fs(file);
+                        }
+                        Err(e) => incomplete.push(format!("credential '{handle}': {e}")),
+                    }
                 }
-                Ok(Some((path, _))) => {
-                    caps.add_fs(FsCapability::new_file(&path, AccessMode::Read)?)
-                }
+                Ok(Some((path, _))) => match FsCapability::new_file(&path, AccessMode::Read) {
+                    Ok(file) => caps.add_fs(file),
+                    Err(e) => incomplete.push(format!("credential '{handle}': {e}")),
+                },
                 Ok(None) => {}
                 Err(reason) => incomplete.push(format!("credential '{handle}': {reason}")),
             }
