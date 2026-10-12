@@ -29,7 +29,7 @@ use serde_json::{Value, json};
 use crate::cli::SandboxArgs;
 use crate::command_policy::{
     CommandCredentialGrantConfig, CommandCredentialType, CommandPoliciesConfig,
-    CommandSandboxConfig,
+    CommandSandboxConfig, InterceptActionConfig,
 };
 use crate::sandbox_prepare::PreparedSandbox;
 
@@ -148,7 +148,7 @@ fn command_reports(
         let mut reachable = false;
         if let Some(sandbox) = session {
             reachable = true;
-            out.push(ctx.value(Some("session"), None, sandbox)?);
+            out.push(ctx.value(Some("session"), None, sandbox, None)?);
         }
         for (caller, from) in &command.from {
             if caller == "session" {
@@ -160,15 +160,29 @@ fn command_reports(
                 .is_some_and(|c| c.can_use.iter().any(|n| n == name));
             if let (true, Some(sandbox)) = (admitted, from.sandbox()) {
                 reachable = true;
-                out.push(ctx.value(Some(caller), None, sandbox)?);
+                out.push(ctx.value(Some(caller), None, sandbox, None)?);
             }
         }
         // (An intercept rule's override applies to a run of the command, which
         // only a session or admitted caller makes.)
+        // A `respond` rule launches nothing. An `exec` rule launches its helper,
+        // under the rule's own sandbox or else the one selected for the caller
+        // (here the session's); any other rule with no sandbox of its own runs
+        // the command as already listed.
         if reachable {
             for (index, rule) in command.intercept.iter().enumerate() {
-                if let Some(sandbox) = rule.sandbox.as_ref() {
-                    out.push(ctx.value(None, Some(index), sandbox)?);
+                let helper = match &rule.action {
+                    InterceptActionConfig::Respond { .. } => continue,
+                    InterceptActionConfig::Exec { command: argv } => {
+                        argv.first().map(String::as_str)
+                    }
+                    _ => None,
+                };
+                if rule.sandbox.is_none() && helper.is_none() {
+                    continue;
+                }
+                if let Some(sandbox) = rule.sandbox.as_ref().or(session) {
+                    out.push(ctx.value(None, Some(index), sandbox, helper)?);
                 }
             }
         }
@@ -186,11 +200,14 @@ struct CommandContext<'a> {
 }
 
 impl CommandContext<'_> {
+    /// `helper`: an `exec` intercept's helper, as written, which the launch runs
+    /// in place of the command's own executable.
     fn value(
         &self,
         caller: Option<&str>,
         intercept: Option<usize>,
         sandbox: &CommandSandboxConfig,
+        helper: Option<&str>,
     ) -> Result<Value> {
         // Resolved as a run of the command from the working directory would be.
         let grants = crate::tool_sandbox::resolve_policy_grants(
@@ -202,6 +219,19 @@ impl CommandContext<'_> {
         )?;
         let mut caps = grants.caps;
         let mut incomplete: Vec<String> = Vec::new();
+        let executable = match helper {
+            None => self.executable.clone(),
+            Some(raw) => match crate::policy::expand_env_vars_strict(raw)
+                .map_err(|e| e.to_string())
+                .and_then(|p| PathBuf::from(p).canonicalize().map_err(|e| e.to_string()))
+            {
+                Ok(path) => Some(path),
+                Err(reason) => {
+                    incomplete.push(format!("exec helper '{raw}': {reason}"));
+                    None
+                }
+            },
+        };
         if !sandbox.unsafe_macos_seatbelt_rules.is_empty() {
             incomplete.push(format!(
                 "{} raw Seatbelt rule(s) (unsafe_macos_seatbelt_rules) the report cannot model",
@@ -249,7 +279,7 @@ impl CommandContext<'_> {
             "command": self.name,
             "caller": caller,
             "intercept": intercept,
-            "executable": self.executable.as_deref().map(path_value),
+            "executable": executable.as_deref().map(path_value),
             "incomplete": incomplete,
             "filesystem": caps.fs_capabilities().iter().map(fs_value).collect::<Vec<_>>(),
             "unix_sockets": caps.unix_socket_capabilities().iter().map(socket_value).collect::<Vec<_>>(),
