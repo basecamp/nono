@@ -556,6 +556,10 @@ fn only_what_the_runtime_launches_is_reported() {
           "caught":{"executable":"/bin/true","sandbox":{},"intercept":[
             {"args":["x"],"sandbox":{}},
             {"args":[],"action":{"type":"respond","stdout":"no"}}]},
+          "ordered":{"executable":"/bin/true","sandbox":{},"intercept":[
+            {"args":["a"],"sandbox":{}},
+            {"args":["a","b"],"sandbox":{}},
+            {"args":["b"],"sandbox":{}}]},
           "passed":{"executable":"/bin/true","sandbox":{},"intercept":[
             {"args":[],"action":{"type":"passthrough"}}]},
           "limited":{"executable":"/bin/echo","sandbox":{"resources":{}}}}}}"#,
@@ -577,6 +581,16 @@ fn only_what_the_runtime_launches_is_reported() {
             .iter()
             .any(|c| c["command"] == "passed" && c["intercept"].is_null()),
         "a catch-all that passes the run through still runs the command under its sandbox: {report}"
+    );
+    let ordered: Vec<&Value> = commands
+        .iter()
+        .filter(|c| c["command"] == "ordered" && !c["intercept"].is_null())
+        .map(|c| &c["intercept"])
+        .collect();
+    assert_eq!(
+        ordered,
+        vec![&serde_json::json!(0), &serde_json::json!(2)],
+        "a rule an earlier one already matches never runs; one it doesn't match does: {report}"
     );
     let limited = commands
         .iter()
