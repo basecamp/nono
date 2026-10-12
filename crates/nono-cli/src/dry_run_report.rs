@@ -41,6 +41,7 @@ pub(crate) const OUT_OF_SCOPE: &[&str] = &[
     "URL opening delegated to the host browser (open_urls)",
     "signal, process-information and IPC scope",
     "a brokered command allowed to run directly (allow_direct_exec_bypass), which then runs under the session's own sandbox, as filesystem lists it",
+    "what the supervisor runs or sends on the host for the run (credential source commands, a daemon_pid_source helper, an approval webhook)",
     "nono's own per-launch files (its capability state file, command-mediation shims and sockets, the proxy's CA bundle)",
 ];
 
@@ -97,7 +98,7 @@ pub(crate) fn dry_run_report(
     let runtime_allows = mediation
         .session_rules
         .iter()
-        .filter(|rule| rule.contains("(allow"))
+        .filter(|rule| seatbelt_allows(rule))
         .count();
     if runtime_allows > 0 {
         incomplete.push(format!(
@@ -208,6 +209,13 @@ fn network_mode(intent: &NetworkIntent, caps: &CapabilitySet) -> &'static str {
     }
 }
 
+/// Whether a Seatbelt rule holds an `allow` form anywhere, however it is
+/// spaced: `(allow`, `( allow`, `(\tallow`.
+fn seatbelt_allows(rule: &str) -> bool {
+    rule.match_indices('(')
+        .any(|(at, _)| rule[at + 1..].trim_start().starts_with("allow"))
+}
+
 /// The Seatbelt rules that can grant beyond the capability list: the
 /// profile's raw rules the set applies, whatever they say, and every other
 /// `allow` rule the preparation generated (a keychain grant, say). Deny rules
@@ -228,7 +236,7 @@ fn seatbelt_widenings(caps: &CapabilitySet, raw_rules: &[String]) -> Vec<String>
     let generated = caps
         .platform_rules()
         .iter()
-        .filter(|rule| !raw_rules.contains(rule) && rule.contains("(allow"))
+        .filter(|rule| !raw_rules.contains(rule) && seatbelt_allows(rule))
         .count();
     if generated > 0 {
         out.push(format!(
