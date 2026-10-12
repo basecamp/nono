@@ -4035,17 +4035,23 @@ pub(crate) fn resolve_policy_grants(
         for entry in entries {
             let expansions =
                 expand_dynamic_tokens(std::slice::from_ref(entry), Some(&cwd), outer_caps)?;
+            // (A dynamic token resolves against the live working directory;
+            // so does an entry its variables leave relative, `$UID/x` say.)
+            let dynamic = entry.starts_with('@');
             if expansions.is_empty() {
                 declared.push(super::DeclaredGrant {
                     field,
                     entry: entry.clone(),
                     expanded: None,
+                    cwd_dependent: true,
                 });
             }
             for expanded in expansions {
+                let filled = crate::profile::expand_vars(&expanded, policy_root)?;
                 declared.push(super::DeclaredGrant {
                     field,
                     entry: entry.clone(),
+                    cwd_dependent: dynamic || !filled.is_absolute(),
                     expanded: Some(resolve_policy_path(&expanded, policy_root, &cwd)?),
                 });
             }

@@ -100,13 +100,14 @@ fn reports_each_brokered_command_sandbox_resolved() {
           "command_policies": {{
             "credentials": {{
               "tok": {{"type": "raw-file", "path": "{ws}/token"}},
-              "sock": {{"type": "local-socket", "path": "{ws}/token"}}
+              "sock": {{"type": "local-socket", "path": "{ws}/token"}},
+              "nul": {{"type": "raw-file", "path": "/dev/null"}}
             }},
             "commands": {{
               "probe": {{
                 "executable": "/bin/true",
                 "from": {{
-                  "session": {{"sandbox": {{"fs_read": ["{ws}/data-link", ".", "{ws}/not-yet"], "exec_paths": ["{ws}/helpers"], "use_credentials": ["tok"]}}}},
+                  "session": {{"sandbox": {{"fs_read": ["{ws}/data-link", ".", "{ws}/not-yet", "$UID/rel"], "exec_paths": ["{ws}/helpers"], "use_credentials": ["tok"]}}}},
                   "caller": {{"sandbox": {{"fs_read": ["{ws}/from-caller"]}}}},
                   "stranger": {{"sandbox": {{"fs_read": ["{ws}/other"]}}}},
                   "nocan": {{"sandbox": {{"fs_read": ["{ws}/other"]}}}}
@@ -124,7 +125,7 @@ fn reports_each_brokered_command_sandbox_resolved() {
               }},
               "nocan": {{
                 "executable": "/bin/echo",
-                "sandbox": {{"fs_read": ["{ws}/other"], "use_credentials": ["sock"]}}
+                "sandbox": {{"fs_read": ["{ws}/other"], "use_credentials": ["sock", "nul"]}}
               }},
               "denied": {{
                 "executable": "/bin/echo",
@@ -182,7 +183,11 @@ fn reports_each_brokered_command_sandbox_resolved() {
         serde_json::json!([]),
         "macOS launches use no exec_paths"
     );
-    assert_eq!(probe["cwd_dependent"], serde_json::json!(["."]));
+    assert_eq!(
+        probe["cwd_dependent"],
+        serde_json::json!([".", "$UID/rel"]),
+        "an entry its variables leave relative depends on the working directory too"
+    );
     assert!(
         probe["declared"]
             .as_array()
@@ -204,6 +209,16 @@ fn reports_each_brokered_command_sandbox_resolved() {
                 .as_str()
                 .is_some_and(|i| i.starts_with("credential 'sock'"))),
         "a socket credential naming a regular file is incomplete, not an error: {nocan}"
+    );
+    assert!(
+        nocan["incomplete"]
+            .as_array()
+            .expect("incomplete")
+            .iter()
+            .any(|i| i
+                .as_str()
+                .is_some_and(|i| i.starts_with("credential 'nul'"))),
+        "a raw-file credential that is no regular file is incomplete: {nocan}"
     );
     let from_caller = find("probe", "caller")
         .unwrap_or_else(|| panic!("an admitted caller's edge is listed: {report}"));
@@ -236,8 +251,20 @@ fn reports_each_brokered_command_sandbox_resolved() {
     );
     let exec = commands
         .iter()
-        .find(|c| c["command"] == "probe" && c["intercept"] == 2)
+        .find(|c| c["command"] == "probe" && c["intercept"] == 2 && c["caller"] == "session")
         .unwrap_or_else(|| panic!("an exec rule is listed, under the session's sandbox: {report}"));
+    let exec_caller = commands
+        .iter()
+        .find(|c| c["command"] == "probe" && c["intercept"] == 2 && c["caller"] == "caller")
+        .unwrap_or_else(|| panic!("and under each admitted caller's: {report}"));
+    assert!(
+        has_path(exec_caller, &ws.join("from-caller")),
+        "{exec_caller}"
+    );
+    assert_eq!(
+        exec_caller["executable"],
+        canon(Path::new("/bin/echo")).as_str()
+    );
     assert_eq!(
         exec["executable"],
         canon(Path::new("/bin/echo")).as_str(),
@@ -291,6 +318,30 @@ fn reports_the_network_mode_the_run_applies() {
     assert_eq!(
         defined_only["network"],
         serde_json::json!({"mode": "allowed", "blocked": false})
+    );
+}
+
+#[test]
+fn reports_a_manifest_blocked_network_as_blocked() {
+    let t = nono_test!("dry-run-json-manifest-network");
+    let manifest = t.root().join("manifest.json");
+    fs::write(
+        &manifest,
+        r#"{"version": "0.1.0", "filesystem": {"grants": []}, "network": {"mode": "blocked"}}"#,
+    )
+    .expect("write manifest");
+    let completed = t
+        .run()
+        .config(&manifest)
+        .workdir(t.workspace())
+        .dry_run_json()
+        .exec(Argv::new("/bin/true"))
+        .assert_success("--dry-run --json exits 0");
+    let report: Value = serde_json::from_str(&completed.stdout()).expect("one JSON document");
+    assert_eq!(
+        report["network"],
+        serde_json::json!({"mode": "blocked", "blocked": true}),
+        "the launch keeps the manifest's block: {report}"
     );
 }
 

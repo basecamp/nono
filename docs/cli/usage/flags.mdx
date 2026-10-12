@@ -1329,17 +1329,17 @@ nono run --profile my-agent --workdir . --allow-cwd --dry-run --json -- my-agent
 
 - **Paths.** `path` is where a grant leads, and `original` is how it was written once variables are filled. A path that is not UTF-8 is reported as `{"hex": "..."}` (its bytes), so it is never approximated.
 - **Sources.** `source` is `user`, `profile`, `system` or `group`; a group grant also has a `group` field naming it.
-- **Network.** `network.mode` is `blocked`, `proxy` (the run starts its proxy and allows nothing else) or `allowed`, decided as the launch decides it: a credential route defined but not enabled starts no proxy.
+- **Network.** `network.mode` is `blocked`, `proxy` (the run starts its proxy and allows nothing else) or `allowed`, decided as the launch decides it: a credential route defined but not enabled starts no proxy, and with no proxy the mode is the prepared one (a manifest's `"mode": "blocked"` stays blocked).
 - **Commands.** `commands` lists every sandbox a brokered command can run under, as the runtime selects it:
   - its session sandbox;
   - each `from.<caller>` edge whose caller is a command that lists it in `can_use` (`caller`);
-  - each intercept rule that launches something (`intercept`, the rule's index): its own sandbox override, or the session's. For an `exec` rule, `executable` is the helper it runs.
+  - each intercept rule that launches something (`intercept`, the rule's index): under its own sandbox override, whoever calls; or, for an `exec` rule without one, under each sandbox above (`caller` says which). For an `exec` rule, `executable` is the helper it runs.
 
   An explicit deny and a `respond` rule run nothing and aren't listed. Each entry's `filesystem` includes the credential paths its launch hands it (a raw file, a local socket).
 - **Declared paths.** `declared` lists every path a command's policy declares, as the launch expands it before checking that it exists. A path that isn't there yet, which a later run would grant once it is, is still reported. A dynamic `@` token that expands to nothing from the working directory is listed with `"expanded": null`, since it may expand to something where the command runs.
-- **Working-directory entries.** `cwd_dependent` holds the entries written relative to the command's working directory (a relative path, `.`, an `@` token), which resolve wherever the command runs.
+- **Working-directory entries.** `cwd_dependent` holds the entries whose grant depends on the command's working directory: an `@` token, and an entry still relative once its variables are filled (`.`, `data`, `$UID/data`). They resolve wherever the command runs.
 - **macOS.** `exec_paths` is empty there, because the launch doesn't use it.
-- **`incomplete`.** It names what the report can't model: the profile's raw `unsafe_macos_seatbelt_rules` (not the rules nono generates itself), the same per command, and a credential path it can't resolve. A program that decides on the report should treat a non-empty `incomplete` as "can't be shown".
+- **`incomplete`.** It names what the report can't model: the profile's raw `unsafe_macos_seatbelt_rules` (not the rules nono generates itself), the same per command, a credential path it can't resolve or that isn't the kind the credential needs (a regular file for `raw-file`, a socket for `local-socket`), and an `exec` helper it can't find. A program that decides on the report should treat a non-empty `incomplete` as "can't be shown".
 - **Not listed.** What nono adds for itself once it runs: its capability state file, the command-mediation shims and sockets in its runtime directory. For a brokered command, what its launch derives from the binary it runs rather than from its policy: the binary's interpreter and its ELF dependency closure. A command's own network policy isn't listed either; `network` is the session's. Instruction files the trust scan verifies aren't listed either. On Linux a read grant of `/proc/self` is reported as `/proc`, as the child gets it. Other `/proc/<pid>` entries name the dry run's own process.
 - **Versioning.** `version` changes only when a field changes or is removed; new fields are added without a version change.
 
