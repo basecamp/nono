@@ -104,13 +104,36 @@ pub(crate) fn dry_run_report(
         "out_of_scope": OUT_OF_SCOPE,
         "filesystem": caps.fs_capabilities().iter().map(fs_value).collect::<Vec<_>>(),
         "unix_sockets": caps.unix_socket_capabilities().iter().map(socket_value).collect::<Vec<_>>(),
-        "network": { "mode": network_mode(&plan.flags.network, &caps) },
+        "network": network_value(&plan.flags.network, &caps),
         "resources": {
             "memory_bytes": limits.and_then(|l| l.memory_bytes),
             "max_processes": limits.and_then(|l| l.max_processes),
         },
         "commands": commands,
     }))
+}
+
+/// The plan's network: its mode, and the port exceptions the capability set
+/// carries beside it (a connect or bind port, a localhost port or range, the
+/// ports the proxy lets the run bind), which a restricted mode still allows.
+fn network_value(intent: &NetworkIntent, caps: &CapabilitySet) -> Value {
+    let mut bind_ports: Vec<u16> = caps.tcp_bind_ports().to_vec();
+    if let Some(proxy) = intent.proxy_options().filter(|proxy| proxy.is_active()) {
+        bind_ports.extend(proxy.allow_bind_ports.iter().copied());
+    }
+    bind_ports.sort_unstable();
+    bind_ports.dedup();
+    json!({
+        "mode": network_mode(intent, caps),
+        "connect_ports": caps.tcp_connect_ports(),
+        "bind_ports": bind_ports,
+        "localhost_ports": caps.localhost_ports(),
+        "localhost_port_ranges": caps
+            .localhost_port_ranges()
+            .iter()
+            .map(|(low, high)| json!([low, high]))
+            .collect::<Vec<_>>(),
+    })
 }
 
 /// The network mode the plan decided: blocked, through the proxy, or open

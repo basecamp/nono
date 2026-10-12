@@ -166,6 +166,12 @@ impl<'t, M: Sandboxing> Sandboxed<'t, M> {
         self
     }
 
+    /// `--allow-connect-port <PORT>`, repeatable.
+    pub fn allow_connect_port(mut self, port: u16) -> Self {
+        self.inner.opt("--allow-connect-port", port.to_string());
+        self
+    }
+
     pub fn config(mut self, path: impl AsRef<Path>) -> Self {
         self.inner.opt("--config", path.as_ref());
         self
