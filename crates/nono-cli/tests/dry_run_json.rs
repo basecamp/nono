@@ -668,6 +668,9 @@ fn only_what_the_runtime_launches_is_reported() {
             {"args":["a"],"sandbox":{}},
             {"args":["a","b"],"sandbox":{}},
             {"args":["b"],"sandbox":{}}]},
+          "early":{"executable":"/bin/true","sandbox":{},"intercept":[
+            {"args":["x"],"action":{"type":"passthrough"}},
+            {"args":[],"action":{"type":"respond","stdout":"no"}}]},
           "passed":{"executable":"/bin/true","sandbox":{},"intercept":[
             {"args":[],"action":{"type":"passthrough"}}]},
           "gated":{"executable":"/bin/true","from":{"session":{"sandbox":{},"invocation_policy":{"default":"deny"}}}},
@@ -717,6 +720,12 @@ fn only_what_the_runtime_launches_is_reported() {
             .as_array()
             .is_some_and(|i| !i.is_empty()),
         "{tokened}"
+    );
+    assert!(
+        commands
+            .iter()
+            .any(|c| c["command"] == "early" && c["intercept"].is_null()),
+        "a rule before a replacing catch-all that passes its run through still runs the command: {report}"
     );
     let limited = commands
         .iter()
