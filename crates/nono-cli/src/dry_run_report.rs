@@ -109,10 +109,16 @@ fn network_value(args: &SandboxArgs, prepared: &PreparedSandbox) -> Result<Value
         true,
         "dry-run".to_string(),
     )?;
+    // With no proxy and no block decided, the launch keeps the prepared
+    // capability set's own mode (a manifest's `"mode": "blocked"`, say).
     let mode = match intent {
         crate::launch_runtime::NetworkIntent::BlockAll => "blocked",
         ref intent if intent.is_proxy_active() => "proxy",
-        _ => "allowed",
+        _ => match prepared.caps.network_mode() {
+            nono::NetworkMode::Blocked => "blocked",
+            nono::NetworkMode::ProxyOnly { .. } => "proxy",
+            nono::NetworkMode::AllowAll => "allowed",
+        },
     };
     Ok(json!({ "mode": mode, "blocked": mode != "allowed" }))
 }
@@ -145,9 +151,11 @@ fn command_reports(
             Some(from) => from.sandbox(),
             None => command.sandbox.as_ref(),
         };
-        let mut reachable = false;
+        // Each sandbox a run of the command selects, with the caller that
+        // selects it.
+        let mut selected: Vec<(&str, &CommandSandboxConfig)> = Vec::new();
         if let Some(sandbox) = session {
-            reachable = true;
+            selected.push(("session", sandbox));
             out.push(ctx.value(Some("session"), None, sandbox, None)?);
         }
         for (caller, from) in &command.from {
@@ -159,17 +167,17 @@ fn command_reports(
                 .get(caller)
                 .is_some_and(|c| c.can_use.iter().any(|n| n == name));
             if let (true, Some(sandbox)) = (admitted, from.sandbox()) {
-                reachable = true;
+                selected.push((caller.as_str(), sandbox));
                 out.push(ctx.value(Some(caller), None, sandbox, None)?);
             }
         }
-        // (An intercept rule's override applies to a run of the command, which
-        // only a session or admitted caller makes.)
-        // A `respond` rule launches nothing. An `exec` rule launches its helper,
-        // under the rule's own sandbox or else the one selected for the caller
-        // (here the session's); any other rule with no sandbox of its own runs
-        // the command as already listed.
-        if reachable {
+        // (An intercept rule applies to a run of the command, which only a
+        // session or admitted caller makes.) A `respond` rule launches nothing.
+        // A rule with a sandbox of its own runs under it, whoever called; an
+        // `exec` rule without one runs its helper under each sandbox the
+        // callers select; any other rule without one runs the command as
+        // already listed.
+        if !selected.is_empty() {
             for (index, rule) in command.intercept.iter().enumerate() {
                 let helper = match &rule.action {
                     InterceptActionConfig::Respond { .. } => continue,
@@ -178,11 +186,16 @@ fn command_reports(
                     }
                     _ => None,
                 };
-                if rule.sandbox.is_none() && helper.is_none() {
-                    continue;
-                }
-                if let Some(sandbox) = rule.sandbox.as_ref().or(session) {
-                    out.push(ctx.value(None, Some(index), sandbox, helper)?);
+                match (rule.sandbox.as_ref(), helper) {
+                    (Some(sandbox), _) => {
+                        out.push(ctx.value(None, Some(index), sandbox, helper)?)
+                    }
+                    (None, Some(_)) => {
+                        for (caller, sandbox) in &selected {
+                            out.push(ctx.value(Some(caller), Some(index), sandbox, helper)?);
+                        }
+                    }
+                    (None, None) => {}
                 }
             }
         }
@@ -261,6 +274,12 @@ impl CommandContext<'_> {
                         Err(e) => incomplete.push(format!("credential '{handle}': {e}")),
                     }
                 }
+                // (The launch reads a raw-file credential only from a regular
+                // file: a device, a FIFO or a socket leaves it unavailable.)
+                Ok(Some((path, _))) if !path.is_file() => incomplete.push(format!(
+                    "credential '{handle}': {} is not a regular file",
+                    path.display()
+                )),
                 Ok(Some((path, _))) => match FsCapability::new_file(&path, AccessMode::Read) {
                     Ok(file) => caps.add_fs(file),
                     Err(e) => incomplete.push(format!("credential '{handle}': {e}")),
@@ -270,20 +289,14 @@ impl CommandContext<'_> {
             }
         }
         // The entries whose meaning depends on where the command runs: a
-        // relative path, or a dynamic `@` token, resolve against its live
-        // working directory.
-        let cwd_dependent: Vec<&String> = sandbox
-            .fs_read
-            .iter()
-            .chain(&sandbox.fs_read_file)
-            .chain(&sandbox.fs_write)
-            .chain(&sandbox.fs_write_file)
-            .chain(&sandbox.unix_socket_bind)
-            .chain(&sandbox.exec_paths)
-            .filter(|entry| {
-                !(entry.starts_with('/') || entry.starts_with('$') || entry.starts_with('~'))
-            })
-            .collect();
+        // dynamic `@` token, or an entry still relative once its variables are
+        // filled, resolve against its live working directory.
+        let mut cwd_dependent: Vec<&String> = Vec::new();
+        for d in grants.declared.iter().filter(|d| d.cwd_dependent) {
+            if !cwd_dependent.contains(&&d.entry) {
+                cwd_dependent.push(&d.entry);
+            }
+        }
         Ok(json!({
             "command": self.name,
             "caller": caller,

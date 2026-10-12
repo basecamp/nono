@@ -51,6 +51,9 @@ pub(crate) struct DeclaredGrant {
     /// dynamic token expands to nothing from this working directory (it may
     /// expand to something where the command runs).
     pub(crate) expanded: Option<std::path::PathBuf>,
+    /// Whether what it grants depends on the command's working directory: a
+    /// dynamic token, or an entry still relative once its variables are filled.
+    pub(crate) cwd_dependent: bool,
 }
 
 /// No command mediation on this platform: a command sandbox cannot be resolved.
