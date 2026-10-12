@@ -790,3 +790,56 @@ fn lists_session_proxy_credentials_as_declared() {
         "{report}"
     );
 }
+
+/// A dry run asks nothing: a working directory a run would ask the person to
+/// share is planned without it, and `incomplete` says so.
+#[test]
+fn a_working_directory_a_run_would_ask_about_is_undecided() {
+    let t = nono_test!("dry-run-json-cwd");
+    let report = report(
+        &t,
+        r#"{"meta":{"name":"t"},"workdir":{"access":"readwrite"}}"#,
+        |run| run,
+    );
+    assert!(
+        report["incomplete"]
+            .as_array()
+            .expect("incomplete")
+            .iter()
+            .any(|i| i
+                .as_str()
+                .is_some_and(|i| i.starts_with("the working directory"))),
+        "{report}"
+    );
+}
+
+/// A brokered grant the launch would resolve for the supervisor's own process
+/// can't be carried to the command: the entry says so, in the grant's
+/// self-relative spelling.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_process_relative_brokered_grant_is_named() {
+    let t = nono_test!("dry-run-json-child-procfs");
+    let report = report(
+        &t,
+        r#"{"meta":{"name":"t"},"command_policies":{"commands":{"probe":{"executable":"/bin/true","sandbox":{"fs_read_file":["/proc/self/status"]}}}}}"#,
+        |run| run.allow_cwd(),
+    );
+    let probe = &report["commands"][0];
+    assert!(
+        probe["filesystem"]
+            .as_array()
+            .expect("filesystem")
+            .iter()
+            .any(|e| e["path"] == "/proc/self/status" && e["process_relative"] == true),
+        "{probe}"
+    );
+    assert!(
+        probe["incomplete"]
+            .as_array()
+            .expect("incomplete")
+            .iter()
+            .any(|i| i.as_str().is_some_and(|i| i.contains("process-relative"))),
+        "{probe}"
+    );
+}

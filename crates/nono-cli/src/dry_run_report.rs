@@ -42,6 +42,7 @@ pub(crate) const OUT_OF_SCOPE: &[&str] = &[
     "signal, process-information and IPC scope",
     "a brokered command allowed to run directly (allow_direct_exec_bypass), which then runs under the session's own sandbox, as filesystem lists it",
     "what the supervisor runs or sends on the host for the run (credential source commands, a daemon_pid_source helper, an approval webhook)",
+    "how Unix-socket grants are enforced (with linux.af_unix_mediation off, the default, AF_UNIX is not mediated; abstract and unnamed sockets are never path grants)",
     "nono's own per-launch files (its capability state file, command-mediation shims and sockets, the proxy's CA bundle)",
 ];
 
@@ -146,23 +147,37 @@ pub(crate) fn dry_run_report(
 }
 
 /// The credential routes the session's proxy would carry, by name (a
-/// `--credential` service, a profile's custom credential), as declared.
+/// `--credential` service, a profile's custom credential, a provider route),
+/// as declared.
 fn proxy_credential_names(intent: &NetworkIntent) -> Vec<String> {
-    let mut names: Vec<String> = intent
-        .proxy_options()
-        .and_then(|proxy| proxy.credentials.as_ref())
-        .map(|credentials| {
-            credentials
-                .credentials
+    let mut names: Vec<String> = Vec::new();
+    if let Some(proxy) = intent.proxy_options() {
+        if let Some(credentials) = proxy.credentials.as_ref() {
+            names.extend(credentials.credentials.iter().cloned());
+            names.extend(credentials.custom_credentials.keys().cloned());
+        }
+        names.extend(
+            proxy
+                .credential_routes
                 .iter()
-                .cloned()
-                .chain(credentials.custom_credentials.keys().cloned())
-                .collect()
-        })
-        .unwrap_or_default();
+                .map(|route| route.name.clone()),
+        );
+    }
     names.sort();
     names.dedup();
     names
+}
+
+/// Whether the launch remaps `cap` to the process it applies to
+/// (`remap_procfs_self_references` rewrites it).
+fn process_relative(cap: &FsCapability) -> bool {
+    let mut probe = CapabilitySet::new();
+    probe.add_fs(cap.clone());
+    probe.remap_procfs_self_references(0, None);
+    probe
+        .fs_capabilities()
+        .first()
+        .is_some_and(|after| after.resolved != cap.resolved)
 }
 
 /// A session grant as the child gets it. One the launch remaps to the child's
@@ -171,15 +186,8 @@ fn proxy_credential_names(intent: &NetworkIntent) -> Vec<String> {
 /// self-relative spelling, marked `process_relative`, not as the dry run's own
 /// process.
 fn session_fs_value(cap: &FsCapability) -> Value {
-    let mut probe = CapabilitySet::new();
-    probe.add_fs(cap.clone());
-    probe.remap_procfs_self_references(0, None);
-    let remapped = probe
-        .fs_capabilities()
-        .first()
-        .is_some_and(|after| after.resolved != cap.resolved);
     let mut value = fs_value(cap);
-    if remapped
+    if process_relative(cap)
         && cap.resolved != Path::new("/proc")
         && let Some(object) = value.as_object_mut()
     {
@@ -326,11 +334,30 @@ fn child_value(child: &DryRunChild, workdir: &Path, outer_caps: &CapabilitySet) 
     let launch = match &child.launch {
         Ok(launch) => {
             let raw = &child.sandbox.unsafe_macos_seatbelt_rules;
+            let mut incomplete = seatbelt_widenings(&launch.caps, raw);
+            // (A grant the launch spec carries resolved for the supervisor's own
+            // process: the child, a different process, can't apply it, and its
+            // launch stops. Reported in its self-relative spelling.)
+            let mut filesystem = Vec::new();
+            for cap in launch.caps.fs_capabilities() {
+                let mut entry = without_source(fs_value(cap));
+                if process_relative(cap)
+                    && let Some(object) = entry.as_object_mut()
+                {
+                    incomplete.push(format!(
+                        "{} is process-relative, which its launch can't carry to the command",
+                        cap.original.display()
+                    ));
+                    object.insert("path".to_string(), path_value(&cap.original));
+                    object.insert("process_relative".to_string(), json!(true));
+                }
+                filesystem.push(entry);
+            }
             json!({
                 "executable": path_value(&launch.executable),
-                "incomplete": seatbelt_widenings(&launch.caps, raw),
+                "incomplete": incomplete,
                 // (No `source`: the launch spec a child applies carries none.)
-                "filesystem": launch.caps.fs_capabilities().iter().map(|c| without_source(fs_value(c))).collect::<Vec<_>>(),
+                "filesystem": filesystem,
                 "unix_sockets": launch.caps.unix_socket_capabilities().iter().map(|c| without_source(socket_value(c))).collect::<Vec<_>>(),
                 "exec_paths": launch.exec_paths.iter().map(|p| path_value(p)).collect::<Vec<_>>(),
             })
