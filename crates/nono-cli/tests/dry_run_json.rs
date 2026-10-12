@@ -108,7 +108,11 @@ fn reports_each_brokered_command_sandbox_resolved() {
                   "stranger": {{"sandbox": {{"fs_read": ["{ws}/other"]}}}},
                   "nocan": {{"sandbox": {{"fs_read": ["{ws}/other"]}}}}
                 }},
-                "intercept": [{{"args": ["x"], "sandbox": {{"fs_read": ["{ws}/intercepted"]}}}}]
+                "intercept": [
+                  {{"args": ["x"], "sandbox": {{"fs_read": ["{ws}/intercepted"]}}}},
+                  {{"args": ["r"], "action": {{"type": "respond", "stdout": "hi"}}}},
+                  {{"args": ["e"], "action": {{"type": "exec", "command": ["/bin/echo"]}}}}
+                ]
               }},
               "caller": {{
                 "executable": "/bin/echo",
@@ -209,6 +213,25 @@ fn reports_each_brokered_command_sandbox_resolved() {
         .find(|c| c["command"] == "probe" && c["intercept"] == 0)
         .unwrap_or_else(|| panic!("the intercept rule's sandbox listed: {report}"));
     assert!(intercept["caller"].is_null());
+    assert!(
+        !commands
+            .iter()
+            .any(|c| c["command"] == "probe" && c["intercept"] == 1),
+        "a respond rule launches nothing, and its sandbox is not listed: {report}"
+    );
+    let exec = commands
+        .iter()
+        .find(|c| c["command"] == "probe" && c["intercept"] == 2)
+        .unwrap_or_else(|| panic!("an exec rule is listed, under the session's sandbox: {report}"));
+    assert_eq!(
+        exec["executable"],
+        canon(Path::new("/bin/echo")).as_str(),
+        "its helper is what runs: {exec}"
+    );
+    assert!(
+        has_path(exec, &ws.join("data")),
+        "the session's sandbox: {exec}"
+    );
     assert!(has_path(intercept, &ws.join("intercepted")), "{intercept}");
     let caller = find("caller", "session")
         .unwrap_or_else(|| panic!("a top-level sandbox is the session's: {report}"));
