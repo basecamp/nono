@@ -556,6 +556,8 @@ fn only_what_the_runtime_launches_is_reported() {
           "caught":{"executable":"/bin/true","sandbox":{},"intercept":[
             {"args":["x"],"sandbox":{}},
             {"args":[],"action":{"type":"respond","stdout":"no"}}]},
+          "passed":{"executable":"/bin/true","sandbox":{},"intercept":[
+            {"args":[],"action":{"type":"passthrough"}}]},
           "limited":{"executable":"/bin/echo","sandbox":{"resources":{}}}}}}"#,
         |run| run.allow_cwd(),
     );
@@ -570,6 +572,12 @@ fn only_what_the_runtime_launches_is_reported() {
         "only the rule before the catch-all launches: {report}"
     );
     assert_eq!(caught[0]["intercept"], 0);
+    assert!(
+        commands
+            .iter()
+            .any(|c| c["command"] == "passed" && c["intercept"].is_null()),
+        "a catch-all that passes the run through still runs the command under its sandbox: {report}"
+    );
     let limited = commands
         .iter()
         .find(|c| c["command"] == "limited")
