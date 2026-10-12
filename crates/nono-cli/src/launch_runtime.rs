@@ -750,6 +750,7 @@ mod tests {
             rollback_dest: None,
             no_diagnostics: false,
             diagnostics_json: false,
+            json: false,
             startup_timeout_secs: None,
             network_denial_audit_rate: None,
             network_denial_audit_burst: None,

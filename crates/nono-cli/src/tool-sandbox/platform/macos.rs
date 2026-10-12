@@ -3584,6 +3584,33 @@ fn add_file_if_exists(caps: &mut CapabilitySet, path: &str, access: AccessMode) 
     Ok(())
 }
 
+/// The grants a command's sandbox policy gives it when the command runs from
+/// `cwd`: the filesystem and Unix-socket capabilities `build_child_caps`
+/// derives from the policy, and no `exec_paths` (this
+/// platform's launch spec does not use them). The
+/// runtime parts of a child's capabilities (its binary, runtime baseline,
+/// shims, credentials, proxy) are not policy and are not included. Used by
+/// `nono run --dry-run --json` to report each brokered command's sandbox
+/// resolved by the same code that builds it at launch.
+pub(crate) fn resolve_policy_grants(
+    policy: &CommandSandboxConfig,
+    policy_root: &Path,
+    cwd: &Path,
+    outer_caps: &CapabilitySet,
+    deny_paths: &[PathBuf],
+) -> Result<(CapabilitySet, Vec<PathBuf>)> {
+    let cwd = cwd
+        .canonicalize()
+        .map_err(|source| NonoError::PathCanonicalization {
+            path: cwd.to_path_buf(),
+            source,
+        })?;
+    let mut caps = CapabilitySet::new();
+    add_policy_fs(&mut caps, policy, policy_root, &cwd, outer_caps, deny_paths)?;
+    add_policy_unix_sockets(&mut caps, policy, policy_root, &cwd, outer_caps, deny_paths)?;
+    Ok((caps, Vec::new()))
+}
+
 fn add_policy_fs(
     caps: &mut CapabilitySet,
     policy: &CommandSandboxConfig,

@@ -1983,6 +1983,12 @@ pub struct RunArgs {
     #[arg(long = "diagnostics-json", help_heading = "OPTIONS")]
     pub diagnostics_json: bool,
 
+    /// With --dry-run: print what the run would apply as JSON on stdout (every
+    /// filesystem and Unix-socket capability resolved, resource limits, and each
+    /// brokered command's sandbox) instead of the text summary.
+    #[arg(long, requires = "dry_run", help_heading = "OPTIONS")]
+    pub json: bool,
+
     /// Kill the process if it has not entered alt-screen mode after this many seconds.
     /// Startup banners and log lines do not count; only a full-screen TUI transition satisfies the check.
     /// Set to 0 to disable. Env: NONO_STARTUP_TIMEOUT.

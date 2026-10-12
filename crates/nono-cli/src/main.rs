@@ -25,6 +25,7 @@ mod connect_client;
 mod credential_runtime;
 mod deprecation_warnings;
 mod diagnostic;
+mod dry_run_report;
 mod exec_strategy;
 mod execution_runtime;
 #[cfg(unix)]
