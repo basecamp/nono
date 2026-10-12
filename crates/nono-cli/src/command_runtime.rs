@@ -214,10 +214,10 @@ pub(crate) fn run_sandbox(mut run_args: RunArgs, silent: bool) -> Result<()> {
             .map(|(_, profile)| profile.unsafe_macos_seatbelt_rules.clone())
             .unwrap_or_default();
         let plan = prepare_run_launch_plan(run_args, program, cmd_args, true)?;
-        let children = crate::execution_runtime::dry_run_children(&plan)?;
+        let mediation = crate::execution_runtime::dry_run_children(&plan)?;
         let report = crate::dry_run_report::dry_run_report(
             &plan,
-            &children,
+            &mediation,
             &raw_rules,
             &plan.flags.workdir,
         )?;
