@@ -284,21 +284,18 @@ fn reports_the_network_mode_the_run_applies() {
         r#"{"meta":{"name":"t"},"network":{"allow_domain":["example.com"]}}"#,
         |run| run,
     );
-    assert_eq!(proxied["network"], serde_json::json!({"mode": "proxy"}));
+    assert_eq!(proxied["network"]["mode"], "proxy");
     let blocked = report(&t, r#"{"meta":{"name":"t"}}"#, |run| run.block_net());
-    assert_eq!(blocked["network"], serde_json::json!({"mode": "blocked"}));
+    assert_eq!(blocked["network"]["mode"], "blocked");
     let open = report(&t, r#"{"meta":{"name":"t"}}"#, |run| run);
-    assert_eq!(open["network"], serde_json::json!({"mode": "allowed"}));
+    assert_eq!(open["network"]["mode"], "allowed");
     // A credential route defined but not enabled starts no proxy.
     let defined_only = report(
         &t,
         r#"{"meta":{"name":"t"},"network":{"custom_credentials":{"x":{"upstream":"https://example.com","credential_key":"env://ASN_UNSET_TOKEN"}}}}"#,
         |run| run,
     );
-    assert_eq!(
-        defined_only["network"],
-        serde_json::json!({"mode": "allowed"})
-    );
+    assert_eq!(defined_only["network"]["mode"], "allowed");
 }
 
 #[test]
@@ -319,8 +316,7 @@ fn reports_a_manifest_blocked_network_as_blocked() {
         .assert_success("--dry-run --json exits 0");
     let report: Value = serde_json::from_str(&completed.stdout()).expect("one JSON document");
     assert_eq!(
-        report["network"],
-        serde_json::json!({"mode": "blocked"}),
+        report["network"]["mode"], "blocked",
         "the launch keeps the manifest's block: {report}"
     );
 }
@@ -638,4 +634,20 @@ fn the_report_follows_the_launch_on_this_platform() {
     );
     assert_eq!(report["incomplete"], serde_json::json!([]), "{report}");
     assert_eq!(report["workdir"], "/", "{report}");
+}
+
+/// A restricted mode with a port exception: the report carries the exception
+/// beside the mode, as the capability set does.
+#[test]
+fn reports_port_exceptions_beside_the_network_mode() {
+    let t = nono_test!("dry-run-json-ports");
+    let report = report(&t, r#"{"meta":{"name":"t"}}"#, |run| {
+        run.block_net().allow_connect_port(2222)
+    });
+    assert_eq!(report["network"]["mode"], "blocked", "{report}");
+    assert_eq!(
+        report["network"]["connect_ports"],
+        serde_json::json!([2222]),
+        "{report}"
+    );
 }
