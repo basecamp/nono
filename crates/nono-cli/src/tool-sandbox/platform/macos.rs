@@ -3778,16 +3778,30 @@ impl PreparedToolSandboxRuntime {
                             .map_err(|e| e.to_string()),
                     }
                 };
+                // (A policy the runtime refuses, resources it cannot enforce
+                // say, launches nothing: listed with the reason, as the launch
+                // refuses it before any intercept.)
+                if let Err(err) = super::reject_unenforced_resources(name, policy) {
+                    out.push(child(None, policy, Err(err)));
+                    continue;
+                }
+                // (A catch-all rule, last by validation, matches every run: the
+                // command itself never runs.)
+                let catch_all = command.intercept.iter().any(|rule| {
+                    rule.args.as_ref().is_some_and(Vec::is_empty) && rule.match_config.is_none()
+                });
                 let scope = scoped_proxy_key(name, caller, None);
                 let context = ChildLaunchContext {
                     caller,
                     proxy_scope: &scope,
                 };
-                out.push(child(
-                    None,
-                    policy,
-                    build_child_launch_spec(state, &request, policy, &context),
-                ));
+                if !catch_all {
+                    out.push(child(
+                        None,
+                        policy,
+                        build_child_launch_spec(state, &request, policy, &context),
+                    ));
+                }
                 for (index, rule) in command.intercept.iter().enumerate() {
                     let sandbox = rule.sandbox.as_ref().unwrap_or(policy);
                     let scope =
