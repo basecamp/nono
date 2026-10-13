@@ -1177,6 +1177,10 @@ pub async fn start_with_nonce_resolver(
     }
 
     // Build filter. Strict mode treats an empty allowlist as deny-all.
+    config
+        .resolved_addresses
+        .validate()
+        .map_err(ProxyError::Config)?;
     let filter = if config.strict_filter {
         ProxyFilter::new_strict(&config.allowed_hosts)
     } else if config.allowed_hosts.is_empty() {
@@ -1184,11 +1188,15 @@ pub async fn start_with_nonce_resolver(
     } else {
         ProxyFilter::new(&config.allowed_hosts)
     }
-    .with_denied_hosts(&config.denied_hosts);
+    .with_denied_hosts(&config.denied_hosts)
+    .with_resolved_address_policy(&config.resolved_addresses);
     let mut route_allowed_hosts: Vec<String> = route_hosts.iter().cloned().collect();
     route_allowed_hosts.extend(oauth_capture_store.host_ports());
-    let route_filter =
-        ProxyFilter::new_strict(&route_allowed_hosts).with_denied_hosts(&config.denied_hosts);
+    // Route upstreams resolve through the same address policy: a route's
+    // host is the profile's, but its name is resolved like any other.
+    let route_filter = ProxyFilter::new_strict(&route_allowed_hosts)
+        .with_denied_hosts(&config.denied_hosts)
+        .with_resolved_address_policy(&config.resolved_addresses);
 
     // Build bypass matcher from external proxy config (once, not per-request)
     let bypass_matcher = config
@@ -5914,5 +5922,147 @@ mod tests {
         );
 
         handle.shutdown();
+    }
+
+    /// Send `CONNECT authority` through the proxy at `port` and return the
+    /// proxy's status line.
+    async fn unauthenticated_connect_to(port: u16, authority: &str) -> String {
+        let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        client
+            .write_all(
+                format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n").as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut buf = [0u8; 1024];
+        let n = client.read(&mut buf).await.unwrap_or(0);
+        String::from_utf8_lossy(&buf[..n])
+            .lines()
+            .next()
+            .unwrap_or("")
+            .to_string()
+    }
+
+    fn public_only_policy(
+        exceptions: &[(&str, &[nono::net_filter::AddressClass])],
+    ) -> crate::config::ResolvedAddressPolicy {
+        crate::config::ResolvedAddressPolicy {
+            public_only: true,
+            exceptions: exceptions
+                .iter()
+                .map(|(pattern, classes)| ((*pattern).to_string(), classes.to_vec()))
+                .collect(),
+        }
+    }
+
+    #[tokio::test]
+    async fn public_only_refuses_an_allowlisted_name_at_loopback() {
+        // `localhost` is allowlisted by name and resolves to loopback, where
+        // the upstream listens. Under public_only both the plain-HTTP forward
+        // path and CONNECT refuse it; the upstream is never reached.
+        let upstream = spawn_mock_upstream().await;
+        let port = upstream.rsplit_once(':').unwrap().1.to_string();
+        let config = ProxyConfig {
+            allowed_hosts: vec!["localhost".to_string()],
+            strict_filter: true,
+            require_auth: false,
+            resolved_addresses: public_only_policy(&[]),
+            ..Default::default()
+        };
+        let handle = start(config).await.unwrap();
+
+        let forward =
+            unauthenticated_forward_request(handle.port, &format!("localhost:{port}")).await;
+        assert!(forward.contains("403"), "forward: {forward:?}");
+        let connect = unauthenticated_connect_to(handle.port, &format!("localhost:{port}")).await;
+        assert!(connect.contains("403"), "CONNECT: {connect:?}");
+
+        // Control: the same upstream answers through the proxy by an
+        // IP-literal allowlist entry, which names its own address.
+        handle.shutdown();
+        let config = ProxyConfig {
+            allowed_hosts: vec!["127.0.0.1".to_string()],
+            strict_filter: true,
+            require_auth: false,
+            resolved_addresses: public_only_policy(&[]),
+            ..Default::default()
+        };
+        let handle = start(config).await.unwrap();
+        let named = unauthenticated_forward_request(handle.port, &upstream).await;
+        assert!(named.contains("200"), "named literal: {named:?}");
+        handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn public_only_exception_lets_a_name_reach_its_class() {
+        let upstream = spawn_mock_upstream().await;
+        let port = upstream.rsplit_once(':').unwrap().1.to_string();
+        let config = ProxyConfig {
+            allowed_hosts: vec!["localhost".to_string()],
+            strict_filter: true,
+            require_auth: false,
+            resolved_addresses: public_only_policy(&[(
+                "localhost",
+                &[nono::net_filter::AddressClass::Loopback],
+            )]),
+            ..Default::default()
+        };
+        let handle = start(config).await.unwrap();
+        let connect = unauthenticated_connect_to(handle.port, &format!("localhost:{port}")).await;
+        assert!(connect.contains("200"), "CONNECT: {connect:?}");
+        handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn public_only_gates_route_upstreams_too() {
+        // A reverse route's upstream is the profile's, but its name resolves
+        // like any other: under public_only a loopback route upstream needs
+        // an exception.
+        let upstream = spawn_mock_upstream().await;
+        let port = upstream.rsplit_once(':').unwrap().1.to_string();
+        let route = declarative_route(&format!("http://localhost:{port}"));
+        let config = ProxyConfig {
+            routes: vec![route.clone()],
+            require_auth: false,
+            resolved_addresses: public_only_policy(&[]),
+            ..Default::default()
+        };
+        let handle = start(config).await.unwrap();
+        let refused = unauthenticated_reverse_request(handle.port).await;
+        assert!(!refused.contains("200"), "refused route: {refused:?}");
+        handle.shutdown();
+
+        let upstream = spawn_mock_upstream().await;
+        let port = upstream.rsplit_once(':').unwrap().1.to_string();
+        let config = ProxyConfig {
+            routes: vec![declarative_route(&format!("http://localhost:{port}"))],
+            require_auth: false,
+            resolved_addresses: public_only_policy(&[(
+                "localhost",
+                &[nono::net_filter::AddressClass::Loopback],
+            )]),
+            ..Default::default()
+        };
+        let handle = start(config).await.unwrap();
+        let allowed = unauthenticated_reverse_request(handle.port).await;
+        assert!(allowed.contains("200"), "excepted route: {allowed:?}");
+        handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn start_refuses_an_invalid_address_policy() {
+        let config = ProxyConfig {
+            allowed_hosts: vec!["localhost".to_string()],
+            require_auth: false,
+            resolved_addresses: public_only_policy(&[(
+                "localhost",
+                &[nono::net_filter::AddressClass::LinkLocal],
+            )]),
+            ..Default::default()
+        };
+        let err = start(config).await.err().expect("start must refuse");
+        assert!(err.to_string().contains("always refused"), "{err}");
     }
 }

@@ -4,7 +4,9 @@
 //! credential routes, and external proxy settings.
 
 use globset::GlobBuilder;
+use nono::net_filter::AddressClass;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::path::PathBuf;
 use zeroize::Zeroizing;
@@ -136,6 +138,15 @@ pub struct ProxyConfig {
     /// credential injection are filtered out at proxy startup.
     #[serde(default)]
     pub no_proxy: Vec<String>,
+
+    /// Which addresses a host the proxy resolves may connect to.
+    ///
+    /// The default allows every address but link-local (today's behaviour).
+    /// With `public_only`, a host whose resolved addresses include a
+    /// loopback, private, shared (CGNAT) or unspecified one is refused unless
+    /// the policy's `exceptions` permit that class for it.
+    #[serde(default, skip_serializing_if = "ResolvedAddressPolicy::is_default")]
+    pub resolved_addresses: ResolvedAddressPolicy,
 
     /// Maximum concurrent connections (0 = unlimited).
     #[serde(default)]
@@ -271,6 +282,7 @@ impl Default for ProxyConfig {
             external_proxy: None,
             direct_connect_ports: Vec::new(),
             no_proxy: Vec::new(),
+            resolved_addresses: ResolvedAddressPolicy::default(),
             max_connections: 256,
             intercept_ca_dir: None,
             intercept_parent_ca_pems: None,
@@ -301,6 +313,93 @@ pub fn default_intercept_ca_env_vars() -> Vec<String> {
     .into_iter()
     .map(str::to_string)
     .collect()
+}
+
+/// Which addresses a host the proxy resolves may connect to.
+///
+/// The proxy resolves a host once, checks the addresses, and connects only to
+/// the addresses it checked (see [`crate::filter::ProxyFilter::check_host`]).
+/// Link-local addresses are always refused there. This policy extends that
+/// check to the other non-public classes, so an allowlisted *name* that
+/// resolves to the local host, the LAN or a tailnet is refused unless the
+/// policy names that class for it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResolvedAddressPolicy {
+    /// Refuse a host when any address it resolves to is loopback, private,
+    /// shared (CGNAT) or unspecified, unless `exceptions` permits that class
+    /// for the host. An IP-literal allowlist entry (`10.1.2.3`,
+    /// `[fd00::1]:8443`) permits its own address: the address is named.
+    #[serde(default)]
+    pub public_only: bool,
+
+    /// Host patterns (an exact name, IP literal or wildcard, in the
+    /// allowlist's grammar) and the non-public classes each may resolve to:
+    /// `loopback`, `private` and `cgnat`. An exception allows no host by
+    /// itself: the host must still be allowed by the allowlist or a route.
+    #[serde(default)]
+    pub exceptions: BTreeMap<String, Vec<AddressClass>>,
+}
+
+impl ResolvedAddressPolicy {
+    /// `true` for the default policy (every address but link-local allowed,
+    /// no exceptions).
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        !self.public_only && self.exceptions.is_empty()
+    }
+
+    /// The policy that holds both `self` and `child`: `public_only` if either
+    /// sets it, and every exception class from both.
+    #[must_use]
+    pub fn merged_with(&self, child: &Self) -> Self {
+        let mut exceptions = self.exceptions.clone();
+        for (pattern, classes) in &child.exceptions {
+            let entry = exceptions.entry(pattern.clone()).or_default();
+            for class in classes {
+                if !entry.contains(class) {
+                    entry.push(*class);
+                }
+            }
+        }
+        Self {
+            public_only: self.public_only || child.public_only,
+            exceptions,
+        }
+    }
+
+    /// Check the exceptions: each pattern is valid allowlist grammar and
+    /// names at least one class, and no class is one that is never permitted
+    /// (`link_local`, `unspecified`).
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        for (pattern, classes) in &self.exceptions {
+            nono::net_filter::validate_host_pattern(pattern)
+                .map_err(|e| format!("resolved_addresses.exceptions: {e}"))?;
+            if pattern.contains('/')
+                || (pattern.contains(':') && parse_host_ip_literal(pattern).is_none())
+            {
+                return Err(format!(
+                    "resolved_addresses.exceptions: '{pattern}' is not a host: an exception \
+                     names a host or IP literal, with no port or prefix length"
+                ));
+            }
+            if classes.is_empty() {
+                return Err(format!(
+                    "resolved_addresses.exceptions: '{pattern}' names no address class \
+                     (loopback, private or cgnat)"
+                ));
+            }
+            for class in classes {
+                if matches!(class, AddressClass::LinkLocal | AddressClass::Unspecified) {
+                    return Err(format!(
+                        "resolved_addresses.exceptions: '{pattern}' names {class}, which is \
+                         always refused (only loopback, private and cgnat can be permitted)"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Declarative OAuth capture provider configuration.
@@ -2600,5 +2699,80 @@ mod tests {
         // the raw form elsewhere (GHSA-8r33-hr9m-69wh).
         assert!(!compiled.matches("/backend-api/%2e%2e/backend-api/codex/responses"));
         assert!(!compiled.matches("/backend-api/codex/responses;v=1"));
+    }
+
+    #[test]
+    fn test_resolved_address_policy_default_is_inert_and_omitted() {
+        let config = ProxyConfig::default();
+        assert!(config.resolved_addresses.is_default());
+        let json = serde_json::to_value(&config).unwrap();
+        assert!(json.get("resolved_addresses").is_none());
+    }
+
+    #[test]
+    fn test_resolved_address_policy_parses_and_validates() {
+        let policy: ResolvedAddressPolicy = serde_json::from_str(
+            r#"{"public_only": true, "exceptions": {"console.int.example": ["private"], "localhost": ["loopback", "cgnat"], "[fd00::1]": ["private"], "10.1.2.3": ["private"]}}"#,
+        )
+        .unwrap();
+        assert!(policy.public_only);
+        assert_eq!(
+            policy.exceptions["localhost"],
+            vec![AddressClass::Loopback, AddressClass::Cgnat]
+        );
+        assert!(policy.validate().is_ok());
+
+        assert!(
+            serde_json::from_str::<ResolvedAddressPolicy>(r#"{"public_only": true, "extra": 1}"#)
+                .is_err(),
+            "unknown fields are refused"
+        );
+        assert!(
+            serde_json::from_str::<ResolvedAddressPolicy>(
+                r#"{"exceptions": {"a.example": ["public"]}}"#
+            )
+            .is_err(),
+            "an unknown class is refused"
+        );
+    }
+
+    #[test]
+    fn test_resolved_address_policy_refuses_unpermittable_exceptions() {
+        for (json, needle) in [
+            (r#"{"a.example": ["link_local"]}"#, "always refused"),
+            (r#"{"a.example": ["unspecified"]}"#, "always refused"),
+            (r#"{"a.example": []}"#, "names no address class"),
+            (r#"{"*example.com": ["private"]}"#, "leading '*'"),
+            (r#"{"": ["private"]}"#, "empty"),
+            (r#"{"localhost:443": ["loopback"]}"#, "not a host"),
+            (r#"{"10.0.0.0/8": ["private"]}"#, "not a host"),
+        ] {
+            let policy = ResolvedAddressPolicy {
+                public_only: true,
+                exceptions: serde_json::from_str(json).unwrap(),
+            };
+            let err = policy.validate().unwrap_err();
+            assert!(err.contains(needle), "{json}: {err}");
+        }
+    }
+
+    #[test]
+    fn test_resolved_address_policy_merge_keeps_both() {
+        let base: ResolvedAddressPolicy = serde_json::from_str(
+            r#"{"public_only": true, "exceptions": {"a.example": ["private"]}}"#,
+        )
+        .unwrap();
+        let child: ResolvedAddressPolicy = serde_json::from_str(
+            r#"{"exceptions": {"a.example": ["loopback", "private"], "b.example": ["cgnat"]}}"#,
+        )
+        .unwrap();
+        let merged = base.merged_with(&child);
+        assert!(merged.public_only, "a child cannot turn public_only off");
+        assert_eq!(
+            merged.exceptions["a.example"],
+            vec![AddressClass::Private, AddressClass::Loopback]
+        );
+        assert_eq!(merged.exceptions["b.example"], vec![AddressClass::Cgnat]);
+        assert!(child.merged_with(&base).public_only);
     }
 }

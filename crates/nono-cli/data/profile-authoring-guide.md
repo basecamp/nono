@@ -422,6 +422,25 @@ Here `read` only ever matches `.ts`/`.tsx` files, so it can never overlap `.env`
 | `custom_credentials`    | map of string to credential def   | `{}`     | Custom credential route definitions (see below). Defines the route only — the proxy does not activate unless the service name also appears in `credentials`. |
 | `upstream_proxy`        | string                            | `null`   | Enterprise proxy address (`host:port`). |
 | `upstream_bypass`       | array of string                   | `[]`     | Hosts to bypass the upstream proxy. Supports `*.` wildcard suffixes. |
+| `resolved_addresses`    | object                            | `{}`     | Which addresses a host the proxy resolves may connect to. `public_only: true` refuses a host when any address it resolves to is loopback, private (RFC 1918, `fc00::/7`), shared/CGNAT (`100.64.0.0/10`) or unspecified; link-local is always refused. `exceptions` maps a host pattern (the `allow_domain` grammar, or an IP literal) to the classes it may resolve to (`loopback`, `private`, `cgnat`), and allows no host by itself. An IP-literal `allow_domain` entry permits its own address. Merged: `public_only` holds if any layer sets it; exception classes accumulate. See [Resolved address classes](#resolved-address-classes). |
+
+#### Resolved address classes
+
+The proxy resolves each host once, checks every address it got, and connects only to those addresses. Link-local answers are always refused. With `resolved_addresses.public_only`, an allowed *name* that resolves to the local host, the LAN or a tailnet is refused too, unless an exception names that class for it:
+
+```json
+{
+  "network": {
+    "allow_domain": ["api.example.com", "console.int.example.com"],
+    "resolved_addresses": {
+      "public_only": true,
+      "exceptions": { "console.int.example.com": ["private"] }
+    }
+  }
+}
+```
+
+Here `console.int.example.com` may resolve to a private address and no other non-public class: the same name answering with `127.0.0.1` is refused. One non-public answer the policy does not permit refuses the host, even beside public ones. Route upstreams (`custom_credentials.<name>.upstream`) go through the same check. Command-scoped proxies inherit the session's policy. With an `upstream_proxy`, the check applies to the proxy's own resolution; the upstream proxy resolves again.
 
 #### Hostname wildcard patterns
 
