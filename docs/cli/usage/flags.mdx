@@ -1275,6 +1275,53 @@ On Linux, combine `--dry-run` with `-v` to include detected Landlock ABI details
 nono run --dry-run -v --profile nolabs-ai/claude -- claude
 ```
 
+#### `--json` (with `--dry-run`)
+
+`nono run --dry-run --json` prints what the run would apply as one JSON document on stdout, for a program to check rather than a person to read. It's read from the launch's own plan, built by the code `nono run` uses: the run's filesystem and Unix-socket capabilities (globs expanded, variables filled, symlinks followed, policy groups and command-line flags included), its network mode and resource limits, and each brokered command's sandbox as the launch builds it for a run of the command from the working directory. The program isn't launched (the launch's own preparation still runs what it runs to plan: the trust scan, and `git` for a brokered policy's `@git:` tokens), and the run is only planned: no credential source is read (no keystore or password manager is asked, no credential command runs), no profile is pulled, and nothing prompts. The working directory is shared only with `--allow-cwd`, as on a non-interactive terminal; a trust key the keystore would supply to verify an instruction file isn't read: the file is left unverified and ungranted, and `incomplete` names it. A registry profile that isn't installed isn't pulled: the dry run stops. The profile's own setup still happens as in a run (a credential store's parent directory, nono's profile directories). Each credential is planned as declared. `--json` needs `--dry-run` and can't be combined with `--detached` or `--remote`.
+
+```bash
+nono run --profile my-agent --workdir . --allow-cwd --dry-run --json -- my-agent
+```
+
+```json
+{
+  "version": 1,
+  "program": "my-agent",
+  "workdir": "/Users/luke/project",
+  "incomplete": [],
+  "out_of_scope": ["session hooks, which run on the host outside the sandbox", "..."],
+  "filesystem": [
+    {"path": "/Users/luke/project", "original": "/Users/luke/project", "access": "readwrite", "kind": "directory", "source": "user"},
+    {"path": "/Users/luke/.cache/tool", "original": "/Users/luke/cache-link", "access": "read", "kind": "directory", "source": "profile"}
+  ],
+  "unix_sockets": [],
+  "metadata_paths": ["/usr/local/bin", "/usr/bin"],
+  "network": {"mode": "proxy", "connect_ports": [], "bind_ports": [], "localhost_ports": [], "localhost_port_ranges": [], "resolver": true},
+  "resources": {"memory_bytes": null, "max_processes": null},
+  "commands": [
+    {"command": "git", "caller": "session", "intercept": null, "executable": "/usr/bin/git", "incomplete": [],
+     "filesystem": [{"path": "/Users/luke/project", "original": "/Users/luke/project", "access": "readwrite", "kind": "directory"}],
+     "unix_sockets": [], "exec_paths": ["/usr/bin/git", "/usr/lib/git-core"],
+     "declared": [{"field": "fs_write", "entry": "$WORKDIR", "expanded": "/Users/luke/project"}],
+     "cwd_dependent": []}
+  ]
+}
+```
+
+- **The contract.** The report is the capability set the plan builds: `filesystem`, `unix_sockets`, `network.mode`, `resources`, and each entry of `commands`. Everything else a run does is out of it, and `out_of_scope` names it: brokered commands' own network policy, how the network mode is enforced (left to the deployment with `linux.sandbox_policy = "external"`, Landlock alone with `"landlock"`, an unenforced proxy on WSL2 with `wsl2_proxy_policy = "insecure_proxy"`), resolution of the program through `PATH` (`program` is as given), session hooks, environment credentials, URL opening delegated to the host browser (`open_urls`), signal, process-information and IPC scope, a brokered command allowed to run directly (`allow_direct_exec_bypass`), which then runs under the session's own sandbox, what the supervisor runs or sends on the host for the run (credential source commands, a `daemon_pid_source` helper, an approval webhook), the execute allowlist, which a dry run doesn't compute (the session's execute gate: an ELF dependency closure over the executables on `PATH`, nearly all of a full preparation's cost; on macOS its `process-exec` rule), how Unix-socket grants are enforced (with `linux.af_unix_mediation` off, the default, AF_UNIX isn't mediated; abstract and unnamed sockets are never path grants), and nono's own per-launch files (its capability state file, command-mediation shims and sockets, the proxy's CA bundle); where a brokered sandbox's launch grants one, the path names the dry run's own runtime directory, removed when it ends.
+- **`incomplete`.** It names what would widen filesystem access beyond the list: capability elevation (the supervisor can grant paths at runtime), the profile's raw `unsafe_macos_seatbelt_rules`, and any other Seatbelt `allow` rule the preparation generates (a keychain grant, say); per command, the same for its sandbox, and a launch the runtime would not build from the working directory, with the reason. A program that decides on the report should treat a non-empty `incomplete` as "can't be shown".
+- **Credentials.** `credentials.env` lists the environment variables env credentials would set (never a value). `credentials.proxy` names the credential routes the session's proxy would carry (a `--credential` service, a custom credential, a provider route). `credentials.commands` lists each command-policy credential as declared: `name`, `type`, its declared `path` (a raw file's or a local socket's), where that path `resolved`, and why it's `unresolved` when it isn't there as declared. A credential that doesn't resolve is named in `incomplete`, and the rest of the report is still built (a run would stop on it). On macOS, when only Claude Code's Keychain login would decide whether the run grants it LaunchServices, `incomplete` says so: the dry run doesn't read it.
+- **Access.** `read` (and `readwrite`) also lets the sandbox execute files beneath the grant: Landlock maps read to execute, and macOS allows executing what it can read.
+- **Paths.** `path` is where a grant leads, and `original` is how it was written once variables are filled. A path that is not UTF-8 is reported as `{"hex": "..."}` (its bytes), so it is never approximated.
+- **Sources.** In the session's `filesystem` and `unix_sockets`, `source` is `user`, `profile`, `system` or `group`; a group grant also has a `group` field naming it. A brokered sandbox's entries have none: the launch spec the child applies doesn't carry it.
+- **`workdir`.** Where the program starts, as the launch decides: the working directory, or `/` when no command is brokered and the capability set doesn't cover it.
+- **Network.** `network.mode` is `blocked`, `proxy` (the run routes egress through its proxy) or `allowed`, as the plan decides it, with the port exceptions the capability set carries beside it: `connect_ports` and `bind_ports` (the proxy's bind ports included), `localhost_ports` and `localhost_port_ranges` (`[low, high]`), and `resolver`: on macOS, whether a restricted mode still lets the sandbox query the host's resolver (unless the profile blocks DNS). How the mode is enforced is out of the contract (above).
+- **Commands.** `commands` lists every sandbox a brokered command can run under (it may list one the runtime never reaches, never leave one out), each built by the launch's `build_child_launch_spec` and read back from the launch spec the child applies: under the session (`caller: "session"`) and under each command whose `can_use` names it (`caller` names it), and for each intercept rule that launches something (`intercept`, the rule's index): under its own sandbox override, or for an `exec` rule, its helper (`executable`) under the selected sandbox. A caller the policy denies, a `respond` rule, and the command itself when a catch-all rule intercepts every run, run nothing and aren't listed; a policy the runtime refuses (resources it can't enforce) is listed with the reason in `incomplete`. A brokered interpreter run with a script argument also reads the session's own read grant that covers the script, which `filesystem` already lists. `exec_paths` is the launch's execute allowlist (Linux): the binary, its interpreter and ELF closure, the shims, and the policy's `exec_paths`.
+- **Declared paths.** A brokered command resolves its policy again each time it runs, so `declared` lists every path its policy declares, as the launch expands it before checking that it exists: a path that isn't there yet, which a later run would grant once it is, is still reported, and a dynamic `@` token that expands to nothing from the working directory is listed with `"expanded": null`. `cwd_dependent` holds the entries whose grant depends on the command's working directory: an `@` token, and an entry still relative once its variables are filled (`.`, `data`, `$UID/data`).
+- **`/proc`.** On Linux a read grant of `/proc/self` is reported as `/proc`, as the exec widens it for the child. A grant the launch remaps to the child's own process after it forks (`/proc/self/...`, `/proc/thread-self/...`, `/dev/fd`, `/dev/std*`) is reported in that self-relative spelling with `"process_relative": true`.
+- **`metadata_paths`.** On macOS, the paths whose metadata the sandbox can read beyond `filesystem`, metadata only: the `$PATH` directories (each with its children, ancestors and symlink hops) and, with command mediation, the working directory's ancestors. Empty on Linux.
+- **Versioning.** `version` changes only when a field changes or is removed; new fields are added without a version change.
+
 #### `--verbose`, `-v`
 
 Increase logging verbosity. Can be specified multiple times.
