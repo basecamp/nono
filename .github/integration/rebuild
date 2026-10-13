@@ -1,0 +1,180 @@
+#!/usr/bin/env bash
+# Rebuild basecamp/nono `integration` from its recipe:
+#
+#   1. upstream nolabs-ai/nono `main`;
+#   2. each topic branch in .github/integration/topics, merged --no-ff in the order listed;
+#   3. the fork layer, as one commit: upstream's workflows removed, this directory and the fork's
+#      two workflows taken from LAYER, and INTEGRATION.md written from what went in.
+#
+#   .github/integration/rebuild [--push] [--layer REF]
+#
+#   --push       force-push the result to the fork's `integration`, leased on the tip it was
+#                built from; without it, build and report only
+#   --layer REF  take the recipe and the fork layer from REF, a commit-ish in this clone (a branch
+#                proposing a change to them), instead of the fork's current `integration`
+#
+# Works in a temporary worktree of the clone it runs from, which it leaves as it was apart from
+# refs under refs/integration/. Prints `sha=<commit>` and `changed=<true|false>` on stdout (for
+# $GITHUB_OUTPUT). Commits carry the caller's git identity.
+#
+# Exit 0: rebuilt, or already current (same tree as the fork's tip: nothing to push).
+# Exit 1: a topic branch is missing or does not merge, or the push was refused; nothing was
+#         pushed. The reason is on stderr and, when REBUILD_REASON_FILE is set, in that file as
+#         one line.
+# Exit 2: usage, or a fetch failed.
+#
+# Upstream's workflows are removed rather than left disabled: the fork's Actions settings disable
+# each upstream workflow by path, so one upstream adds later would run here on its first push.
+#
+# Environment: UPSTREAM_URL, FORK_URL (default: the GitHub https URLs).
+set -euo pipefail
+
+UPSTREAM_URL="${UPSTREAM_URL:-https://github.com/nolabs-ai/nono.git}"
+FORK_URL="${FORK_URL:-https://github.com/basecamp/nono.git}"
+UPSTREAM_WEB=https://github.com/nolabs-ai/nono
+FORK_WEB=https://github.com/basecamp/nono
+BRANCH=integration
+RECIPE=.github/integration/topics
+LAYER_PATHS=(.github/integration .github/workflows/build-integration.yml .github/workflows/rebuild-integration.yml)
+
+push=0 layer=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --push) push=1; shift ;;
+    --layer) [ $# -ge 2 ] || { echo "rebuild: --layer needs a REF" >&2; exit 2; }; layer="$2"; shift 2 ;;
+    -h|--help) sed -n '2,/^set -euo/{/^set -euo/d;s/^# \{0,1\}//;p}' "$0"; exit 0 ;;
+    *) echo "rebuild: unknown argument: $1" >&2; exit 2 ;;
+  esac
+done
+
+say() { printf 'rebuild: %s\n' "$*" >&2; }
+fail() { # fail REASON: exit 1 with REASON, nothing pushed
+  say "$1"
+  [ -z "${REBUILD_REASON_FILE:-}" ] || printf '%s\n' "$1" > "$REBUILD_REASON_FILE"
+  exit 1
+}
+
+repo="$(git rev-parse --show-toplevel)"
+git -C "$repo" fetch -q --no-tags "$UPSTREAM_URL" "+refs/heads/main:refs/integration/upstream" \
+  || { say "fetching $UPSTREAM_URL main failed"; exit 2; }
+git -C "$repo" fetch -q --no-tags "$FORK_URL" "+refs/heads/$BRANCH:refs/integration/old" \
+  || { say "fetching $FORK_URL $BRANCH failed"; exit 2; }
+old="$(git -C "$repo" rev-parse refs/integration/old)"
+base="$(git -C "$repo" rev-parse refs/integration/upstream)"
+layer_commit="$(git -C "$repo" rev-parse --verify -q "${layer:-refs/integration/old}^{commit}")" \
+  || { say "--layer $layer: no such commit in $repo"; exit 2; }
+
+# The recipe: "<branch> <description>" lines; blank lines and # comments skipped. Read whole
+# first: a recipe that cannot be read stops the rebuild, never reads as one with no topics.
+recipe="$(git -C "$repo" show "$layer_commit:$RECIPE" 2>/dev/null)" \
+  || fail "cannot read $RECIPE in ${layer:-$BRANCH} ${layer_commit:0:12}: nothing rebuilt"
+topics=() descs=()
+while IFS= read -r line || [ -n "$line" ]; do
+  case "$line" in ''|'#'*) continue ;; esac
+  t="${line%%[[:space:]]*}" d="${line#"$t"}" d="${d#"${d%%[![:space:]]*}"}"
+  # A ref name, nothing a refspec or an option could read differently.
+  [[ "$t" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ && "$t" != *..* && "$t" != *.lock && "$t" != */ ]] \
+    || fail "$RECIPE: '$t' is not a branch name"
+  topics+=("$t") descs+=("$d")
+done <<<"$recipe"
+
+if [ "${#topics[@]}" -gt 0 ]; then
+  specs=()
+  for t in "${topics[@]}"; do specs+=("+refs/heads/$t:refs/integration/topic/$t"); done
+  if ! err="$(git -C "$repo" fetch -q --no-tags "$FORK_URL" "${specs[@]}" 2>&1)"; then
+    for t in "${topics[@]}"; do
+      git -C "$repo" ls-remote --exit-code -q "$FORK_URL" "refs/heads/$t" >/dev/null 2>&1 \
+        || fail "topic branch $t is in $RECIPE but not on $FORK_URL"
+    done
+    say "fetching the topic branches failed: $err"; exit 2
+  fi
+fi
+
+work="$(mktemp -d)"
+cleanup() { git -C "$repo" worktree remove --force "$work/tree" >/dev/null 2>&1 || true; rm -rf "$work"; }
+trap cleanup EXIT
+git -C "$repo" worktree add -q --detach "$work/tree" "$base"
+tree="$work/tree"
+
+shas=()
+for i in "${!topics[@]}"; do
+  t="${topics[$i]}"
+  sha="$(git -C "$repo" rev-parse "refs/integration/topic/$t")"
+  shas+=("$sha")
+  before="$(git -C "$tree" rev-parse 'HEAD^{tree}')"
+  if ! git -C "$tree" merge -q --no-ff --no-edit -m "Merge $t into $BRANCH" "$sha" >/dev/null 2>&1; then
+    files="$(git -C "$tree" diff --name-only --diff-filter=U | tr '\n' ' ')"
+    git -C "$tree" merge --abort >/dev/null 2>&1 || true
+    fail "topic branch $t (${sha:0:12}) does not merge onto upstream main ${base:0:12}${files:+: conflicts in ${files% }}"
+  fi
+  [ "$(git -C "$tree" rev-parse 'HEAD^{tree}')" != "$before" ] \
+    || say "note: $t (${sha:0:12}) changes nothing on upstream main ${base:0:12}: already upstream? Drop it from $RECIPE"
+done
+
+# The fork layer.
+git -C "$tree" rm -r -q --ignore-unmatch -- .github/workflows
+git -C "$tree" checkout "$layer_commit" -- "${LAYER_PATHS[@]}" \
+  || fail "the fork layer (${LAYER_PATHS[*]}) is not all in ${layer:-$BRANCH} ${layer_commit:0:12}"
+
+# shellcheck disable=SC2016 # backticks are Markdown
+code() { printf '`%s`' "${1//\`/}"; }
+{
+  cat <<EOF
+# basecamp/nono \`$BRANCH\`
+
+This branch is upstream [nolabs-ai/nono]($UPSTREAM_WEB) \`main\` plus fixes we have
+prepared for upstream that have not landed yet. \`.github/workflows/rebuild-integration.yml\`
+rebuilds it daily and after every change to it (\`.github/integration/rebuild\`): reset to
+upstream \`main\`, the topic branches in \`.github/integration/topics\` merged in order,
+upstream's workflows removed, force-pushed. So never base work on it: base topic branches
+on upstream \`main\`, and change what it carries with a pull request to
+\`.github/integration/topics\`. A topic branch that does not merge stops the rebuild and
+opens an issue labelled \`integration-rebuild\`.
+
+\`.github/workflows/build-integration.yml\` builds each rebuild for x86_64-unknown-linux-gnu,
+aarch64-apple-darwin and x86_64-apple-darwin, attests build provenance, and publishes a
+prerelease tagged \`integration-<sha12>\`.
+
+## Upstream base
+
+nolabs-ai/nono \`main\` at [\`${base:0:12}\`]($UPSTREAM_WEB/commit/$base) ($(code "$(git -C "$repo" log -1 --format=%s "$base")")).
+
+## Carried topic branches
+
+Each is merged with \`--no-ff\`, in this order.
+
+| Branch | Commit | Fixes |
+|---|---|---|
+EOF
+  for i in "${!topics[@]}"; do
+    # shellcheck disable=SC2016 # backticks are Markdown
+    printf '| [`%s`](%s/tree/%s) | `%s` | %s |\n' "${topics[$i]}" "$FORK_WEB" "${topics[$i]}" "${shas[$i]:0:12}" "${descs[$i]//|/\\|}"
+  done
+} > "$tree/INTEGRATION.md"
+git -C "$tree" add -A -- INTEGRATION.md .github
+
+{
+  printf 'ci: fork layer for integration\n\n'
+  printf 'Upstream nolabs-ai/nono main %s.\n' "$base"
+  for i in "${!topics[@]}"; do printf 'Merged %s %s.\n' "${topics[$i]}" "${shas[$i]}"; done
+  printf 'Fork layer from %s.\n' "$layer_commit"
+} > "$work/msg"
+git -C "$tree" commit -q -F "$work/msg"
+new="$(git -C "$tree" rev-parse HEAD)"
+
+if [ "$(git -C "$repo" rev-parse "$new^{tree}")" = "$(git -C "$repo" rev-parse "$old^{tree}")" ]; then
+  say "$BRANCH ${old:0:12} is current (upstream ${base:0:12}, ${#topics[@]} topic(s))"
+  printf 'sha=%s\nchanged=false\n' "$old"
+  exit 0
+fi
+say "built ${new:0:12}: upstream ${base:0:12} + ${#topics[@]} topic(s) + fork layer (was ${old:0:12})"
+
+if [ "$push" = 1 ]; then
+  if ! err="$(git -C "$tree" push -q --force-with-lease="refs/heads/$BRANCH:$old" "$FORK_URL" "$new:refs/heads/$BRANCH" 2>&1)"; then
+    hint=""
+    case "$err" in *workflow*) hint=" (a push that changes .github/workflows needs a token with the Workflows permission: set the INTEGRATION_PUSH_TOKEN secret, or run this with --push from a clone)" ;; esac
+    fail "pushing ${new:0:12} to $BRANCH was refused: $(printf '%s' "$err" | tr '\n' ' ' | cut -c1-300)$hint"
+  fi
+  say "pushed ${new:0:12} to $FORK_URL $BRANCH"
+fi
+printf 'sha=%s\nchanged=true\n' "$new"
