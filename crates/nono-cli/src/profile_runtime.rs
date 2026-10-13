@@ -21,6 +21,8 @@ pub(crate) struct PreparedProfile {
     #[cfg(target_os = "linux")]
     pub(crate) af_unix_mediation: profile::LinuxAfUnixMediation,
     #[cfg(target_os = "linux")]
+    pub(crate) metadata_mediation: profile::LinuxMetadataMediation,
+    #[cfg(target_os = "linux")]
     pub(crate) sandbox_policy: profile::LinuxSandboxPolicy,
     #[cfg(target_os = "linux")]
     pub(crate) explicit_sandbox_policy: Option<profile::LinuxSandboxPolicy>,
@@ -817,6 +819,11 @@ fn prepare_profile_with_options(
         af_unix_mediation: loaded_profile
             .as_ref()
             .and_then(|profile| profile.linux.af_unix_mediation)
+            .unwrap_or_default(),
+        #[cfg(target_os = "linux")]
+        metadata_mediation: loaded_profile
+            .as_ref()
+            .and_then(|profile| profile.linux.metadata_mediation)
             .unwrap_or_default(),
         #[cfg(target_os = "linux")]
         sandbox_policy: loaded_profile

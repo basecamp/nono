@@ -152,11 +152,22 @@ pub(super) fn spawn(
         return Err(failure("required notification filters unavailable on WSL2"));
     }
     let baseline = prepare(caps, &abi, config.sandbox_policy)?;
-    let network = if config.seccomp_policy.proxy_fallback {
-        let has_bind = matches!(caps.network_mode(), nono::NetworkMode::ProxyOnly { bind_ports, .. } if !bind_ports.is_empty());
-        sandbox::prepare_seccomp_proxy_filter(has_bind)
+    // One listener carries every notification this session mediates: the
+    // network program (if any), file metadata, then openat.
+    let network = if !config.seccomp_policy.needs_network_notify() {
+        sandbox::prepare_seccomp_metadata_filter()
     } else {
-        sandbox::prepare_seccomp_af_unix_filter()
+        let network = if config.seccomp_policy.proxy_fallback {
+            let has_bind = matches!(caps.network_mode(), nono::NetworkMode::ProxyOnly { bind_ports, .. } if !bind_ports.is_empty());
+            sandbox::prepare_seccomp_proxy_filter(has_bind)
+        } else {
+            sandbox::prepare_seccomp_af_unix_filter()
+        };
+        if config.seccomp_policy.metadata_mediation {
+            network.with_metadata_notifications()
+        } else {
+            network
+        }
     };
     let network = if config.seccomp_policy.needs_openat_notify() {
         network.with_openat_notifications()
