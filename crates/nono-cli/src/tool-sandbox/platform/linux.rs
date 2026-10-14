@@ -124,7 +124,10 @@ struct ToolSandboxState {
     plan: ResolvedToolSandboxPlan,
     shims_by_command: BTreeMap<String, ShimIdentity>,
     credential_handles: BTreeMap<String, ResolvedCredential>,
-    allowed_outer_exec_files: Vec<PathBuf>,
+    /// The session's execute allowlist (the outer exec gate). `None` in a
+    /// plan-only run (`nono run --dry-run --json`), which applies no gate and
+    /// does not build it.
+    allowed_outer_exec_files: Option<Vec<PathBuf>>,
     landlock_abi: nono::DetectedAbi,
     baseline_cache: BaselineCache,
     proxy_trust_bundle_paths: Vec<PathBuf>,
@@ -361,17 +364,27 @@ impl PreparedToolSandboxRuntime {
         // canonicalized / resolved / read / stat'd once per launch, not per batch.
         reset_elf_resolution_cache();
         let start_outer_exec = std::time::Instant::now();
-        let allowed_outer_exec_files = build_outer_exec_files(
-            shims_by_command.values().chain(url_open_shim.iter()),
-            &plan,
-            &shim_source,
-            outer_caps,
-            Some(initial_program),
-        )?;
+        // (A plan-only run applies no execute gate: the ELF closure over every
+        // executable on PATH, nearly all of its cost, is not built. Only the
+        // test that shows the report doesn't depend on it asks for it anyway,
+        // with NONO_DRY_RUN_BUILD_EXEC_GATE=1.)
+        let allowed_outer_exec_files = if crate::credential_runtime::plan_only()
+            && std::env::var_os("NONO_DRY_RUN_BUILD_EXEC_GATE").is_none()
+        {
+            None
+        } else {
+            Some(build_outer_exec_files(
+                shims_by_command.values().chain(url_open_shim.iter()),
+                &plan,
+                &shim_source,
+                outer_caps,
+                Some(initial_program),
+            )?)
+        };
         tool_sandbox_profile_log!(
             "prepare:build_outer_exec_files: {:?} ({} paths)",
             start_outer_exec.elapsed(),
-            allowed_outer_exec_files.len()
+            allowed_outer_exec_files.as_ref().map_or(0, Vec::len)
         );
 
         let start_baseline_cache = std::time::Instant::now();
@@ -495,7 +508,7 @@ impl PreparedToolSandboxRuntime {
 
     pub(crate) fn prepare_outer_exec_gate(&self) -> Result<OwnedFd> {
         let ruleset = prepare_outer_exec_gate(
-            &self.inner.allowed_outer_exec_files,
+            self.outer_exec_files()?,
             &self.inner.plan.outer_exec_writable_dirs,
             self.inner.landlock_abi,
         )?;
@@ -504,9 +517,22 @@ impl PreparedToolSandboxRuntime {
         })
     }
 
+    /// The session's execute allowlist; an error in a plan-only run, which
+    /// builds none (it never applies the gate).
+    fn outer_exec_files(&self) -> Result<&[PathBuf]> {
+        self.inner
+            .allowed_outer_exec_files
+            .as_deref()
+            .ok_or_else(|| {
+                NonoError::SandboxInit(
+                    "command-mediation execute gate is not built in a plan-only run".to_string(),
+                )
+            })
+    }
+
     pub(crate) fn apply_outer_exec_gate(&self) -> Result<()> {
         apply_outer_exec_gate(
-            &self.inner.allowed_outer_exec_files,
+            self.outer_exec_files()?,
             &self.inner.plan.outer_exec_writable_dirs,
             self.inner.landlock_abi,
         )
@@ -3986,6 +4012,239 @@ fn add_chaining_control_caps(caps: &mut CapabilitySet, state: &ToolSandboxState)
     Ok(())
 }
 
+/// Every path a command's sandbox policy declares, as the launch expands it
+/// before checking that it exists (dynamic tokens and variables filled,
+/// relative entries joined to `cwd`, no link followed): what a later run of the
+/// command resolves again, so a consumer of `nono run --dry-run --json` can
+/// judge a path absent today, or one that depends on where the command runs.
+/// What the launch grants is reported from the launch itself
+/// (`PreparedToolSandboxRuntime::dry_run_children`), not from here.
+pub(crate) fn declared_policy_paths(
+    policy: &CommandSandboxConfig,
+    policy_root: &Path,
+    cwd: &Path,
+    outer_caps: &CapabilitySet,
+) -> Result<Vec<super::DeclaredGrant>> {
+    use super::dynamic_providers::expand_dynamic_tokens;
+    let cwd = cwd
+        .canonicalize()
+        .map_err(|source| NonoError::PathCanonicalization {
+            path: cwd.to_path_buf(),
+            source,
+        })?;
+    let mut declared = Vec::new();
+    for (field, entries) in [
+        ("fs_read", &policy.fs_read),
+        ("fs_read_file", &policy.fs_read_file),
+        ("fs_write", &policy.fs_write),
+        ("fs_write_file", &policy.fs_write_file),
+        ("unix_socket_bind", &policy.unix_socket_bind),
+        ("exec_paths", &policy.exec_paths),
+    ] {
+        for entry in entries {
+            let expansions =
+                expand_dynamic_tokens(std::slice::from_ref(entry), Some(&cwd), outer_caps)?;
+            // (A dynamic token resolves against the live working directory;
+            // so does an entry its variables leave relative, `$UID/x` say.)
+            let dynamic = entry.starts_with('@');
+            if expansions.is_empty() {
+                declared.push(super::DeclaredGrant {
+                    field,
+                    entry: entry.clone(),
+                    expanded: None,
+                    cwd_dependent: true,
+                });
+            }
+            for expanded in expansions {
+                let filled = crate::profile::expand_vars(&expanded, policy_root)?;
+                declared.push(super::DeclaredGrant {
+                    field,
+                    entry: entry.clone(),
+                    cwd_dependent: dynamic || !filled.is_absolute(),
+                    expanded: Some(resolve_policy_path(&expanded, policy_root, &cwd)?),
+                });
+            }
+        }
+    }
+    Ok(declared)
+}
+
+impl PreparedToolSandboxRuntime {
+    /// Every sandbox a brokered command can run under, each built by the code a
+    /// run uses (`select_effective_policy`, then `build_child_launch_spec`, or
+    /// for an `exec` intercept `build_child_launch_spec_for_binary` with its
+    /// helper) for a run of the command from `cwd`, and read back from the
+    /// launch spec as the child applies it. Callers: the session, and each
+    /// command whose `can_use` names it; a caller the policy denies is not
+    /// listed. A `respond` intercept launches nothing; another intercept with no
+    /// sandbox of its own and no helper runs the command as already listed. A
+    /// launch the runtime would refuse from `cwd` is listed with the reason.
+    /// Used by `nono run --dry-run --json`.
+    pub(crate) fn dry_run_children(&self, cwd: &Path) -> Vec<super::DryRunChild> {
+        let state = &*self.inner;
+        let config = &state.plan.config;
+        let mut out = Vec::new();
+        for (name, command) in &config.commands {
+            let mut callers = vec![(String::from("session"), Caller::Session { pid: 0 })];
+            for (caller_name, caller_command) in &config.commands {
+                if caller_command.can_use.iter().any(|n| n == name) {
+                    callers.push((caller_name.clone(), command_caller(caller_name)));
+                }
+            }
+            for (label, caller) in &callers {
+                let Ok(policy) = select_effective_policy(config, name, caller) else {
+                    continue;
+                };
+                // (An invocation policy that denies by default and allows or
+                // approves nothing refuses every run, before any launch.)
+                if select_invocation_policy(config, name, caller).is_some_and(|invocation| {
+                    matches!(
+                        invocation.default,
+                        crate::command_policy::PolicyDecisionConfig::Decision(
+                            crate::command_policy::PolicyDecision::Deny
+                        )
+                    ) && invocation.allow.is_empty()
+                        && invocation.approve.is_empty()
+                }) {
+                    continue;
+                }
+                let request = ToolSandboxShimRequest {
+                    command: name.clone(),
+                    argv: vec![name.as_bytes().to_vec()],
+                    env: Vec::new(),
+                    cwd: cwd.as_os_str().as_bytes().to_vec(),
+                    stdio_tty: [false; 3],
+                };
+                let child = |intercept: Option<usize>,
+                             sandbox: &CommandSandboxConfig,
+                             spec: Result<ToolSandboxChildLaunchSpec>| {
+                    super::DryRunChild {
+                        command: name.clone(),
+                        caller: label.clone(),
+                        intercept,
+                        sandbox: sandbox.clone(),
+                        launch: spec
+                            .and_then(|spec| dry_run_launch(&spec))
+                            .map_err(|e| e.to_string()),
+                    }
+                };
+                // (A policy the runtime refuses, resources it cannot enforce
+                // say, launches nothing: listed with the reason, as the launch
+                // refuses it before any intercept.)
+                if let Err(err) = super::reject_unenforced_resources(name, policy) {
+                    out.push(child(None, policy, Err(err)));
+                    continue;
+                }
+                // (A catch-all rule, last by validation, matches every run that
+                // reaches it: the command then runs under the selected sandbox
+                // only if that rule launches it as it is, with no sandbox of its
+                // own and no helper.)
+                // (`args` decides a rule when present: an empty list is a
+                // catch-all whatever else the rule says.)
+                let catch_all = command
+                    .intercept
+                    .iter()
+                    .find(|rule| rule.args.as_ref().is_some_and(Vec::is_empty));
+                // (The command runs as it is when no rule matches, which only a
+                // catch-all prevents, or when a matching rule, catch-all or
+                // not, launches it with no sandbox of its own and no helper.)
+                let base_runs = catch_all.is_none()
+                    || command.intercept.iter().any(|rule| {
+                        rule.sandbox.is_none()
+                            && !matches!(
+                                rule.action,
+                                crate::command_policy::InterceptActionConfig::Respond { .. }
+                                    | crate::command_policy::InterceptActionConfig::Exec { .. }
+                            )
+                    });
+                let scope = scoped_proxy_key(name, caller, None);
+                let context = ChildLaunchContext {
+                    caller,
+                    proxy_scope: &scope,
+                };
+                if base_runs {
+                    out.push(child(
+                        None,
+                        policy,
+                        build_child_launch_spec(state, &request, policy, &context),
+                    ));
+                }
+                for (index, rule) in command.intercept.iter().enumerate() {
+                    // (Rules match in order: an `args` rule whose own arguments
+                    // an earlier `args` rule already matches never runs, as the
+                    // runtime's matcher decides on them.)
+                    if let Some(args) = &rule.args {
+                        let mut argv = vec![name.as_bytes().to_vec()];
+                        argv.extend(args.iter().map(|arg| arg.as_bytes().to_vec()));
+                        let shadowed =
+                            super::resolve_intercept_action(command, &argv, || Ok(Vec::new()))
+                                .ok()
+                                .and_then(|won| won.rule_index)
+                                .is_some_and(|won| {
+                                    won < index
+                                        && command
+                                            .intercept
+                                            .get(won)
+                                            .is_some_and(|w| w.args.is_some())
+                                });
+                        if shadowed {
+                            continue;
+                        }
+                    }
+                    let sandbox = rule.sandbox.as_ref().unwrap_or(policy);
+                    let scope =
+                        scoped_proxy_key(name, caller, rule.sandbox.as_ref().map(|_| index));
+                    let context = ChildLaunchContext {
+                        caller,
+                        proxy_scope: &scope,
+                    };
+                    let spec = match &rule.action {
+                        crate::command_policy::InterceptActionConfig::Respond { .. } => continue,
+                        crate::command_policy::InterceptActionConfig::Exec { command: argv } => {
+                            super::policy::resolve_exec_helper(&state.plan.exec_helpers, argv)
+                                .and_then(|(helper, extra_args)| {
+                                    build_child_launch_spec_for_binary(
+                                        state,
+                                        &request,
+                                        sandbox,
+                                        helper,
+                                        &extra_args,
+                                        false,
+                                        &context,
+                                    )
+                                })
+                        }
+                        _ if rule.sandbox.is_none() => continue,
+                        _ => build_child_launch_spec(state, &request, sandbox, &context),
+                    };
+                    out.push(child(Some(index), sandbox, spec));
+                }
+            }
+        }
+        out
+    }
+}
+
+/// A child's launch read back from its launch spec, as the child applies it.
+fn dry_run_launch(spec: &ToolSandboxChildLaunchSpec) -> Result<super::DryRunLaunch> {
+    Ok(super::DryRunLaunch {
+        executable: PathBuf::from(OsString::from_vec(spec.real_binary.clone())),
+        caps: caps_from_spec(&spec.caps)?,
+        exec_paths: spec
+            .allowed_exec_paths
+            .iter()
+            .map(|p| PathBuf::from(OsString::from_vec(p.clone())))
+            .collect(),
+    })
+}
+
+fn command_caller(name: &str) -> Caller {
+    Caller::Command {
+        command: name.to_string(),
+        pid: 0,
+    }
+}
+
 fn add_policy_fs(
     caps: &mut CapabilitySet,
     policy: &CommandSandboxConfig,
@@ -6464,7 +6723,7 @@ mod tests {
             },
             shims_by_command: BTreeMap::from([("git".to_string(), shim.clone())]),
             credential_handles: BTreeMap::new(),
-            allowed_outer_exec_files: Vec::new(),
+            allowed_outer_exec_files: Some(Vec::new()),
             landlock_abi: nono::DetectedAbi::new(landlock::ABI::V3),
             baseline_cache: BaselineCache {
                 closures: BTreeMap::from([(shim.path, Vec::new())]),
