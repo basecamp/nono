@@ -1147,7 +1147,12 @@ fn test_schema_linux_config_matches_rust_model() {
     assert_schema_properties(
         &schema,
         "LinuxConfig",
-        &["af_unix_mediation", "metadata_mediation", "sandbox_policy", "isolate"],
+        &[
+            "af_unix_mediation",
+            "metadata_mediation",
+            "sandbox_policy",
+            "isolate",
+        ],
     );
 }
 

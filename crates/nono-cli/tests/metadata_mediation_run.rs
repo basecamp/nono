@@ -158,10 +158,16 @@ impl Fixture {
     fn profile(&self, linux: &str) -> nono_test_support::Profile {
         let own = self.path("own");
         let ro = self.path("ro");
+        // An isolated network namespace refuses an unrestricted network.
+        let network = if linux.contains(r#""isolate""#) {
+            r#","network":{"block":true}"#
+        } else {
+            ""
+        };
         self.t.write_profile(
             "metadata",
             &format!(
-                r#"{{"meta":{{"name":"metadata"}},"workdir":{{"access":"readwrite"}},"linux":{linux},"filesystem":{{"allow":["{}"],"read":["{}"]}}}}"#,
+                r#"{{"meta":{{"name":"metadata"}},"workdir":{{"access":"readwrite"}},"linux":{linux}{network},"filesystem":{{"allow":["{}"],"read":["{}"]}}}}"#,
                 own.display(),
                 ro.display()
             ),
@@ -229,6 +235,10 @@ impl Fixture {
 const MEDIATED: &str = r#"{"metadata_mediation":"write_grants"}"#;
 const MEDIATED_WITH_AF_UNIX: &str =
     r#"{"metadata_mediation":"write_grants","af_unix_mediation":"pathname"}"#;
+/// Namespace isolation takes the raw-clone bootstrap with no network
+/// notifications: the listener carries file metadata alone.
+const MEDIATED_ISOLATED: &str =
+    r#"{"metadata_mediation":"write_grants","isolate":{"network":true}}"#;
 
 /// A label, the test its every result must pass, and what that test means.
 type Expectation<'a> = (&'a str, fn(&str) -> bool, &'a str);
@@ -312,6 +322,21 @@ fn metadata_mediation_applies_to_every_thread() {
 #[test]
 fn metadata_mediation_shares_the_listener_with_af_unix_mediation() {
     run_mode_and_time_matrix("metadata-af-unix", MEDIATED_WITH_AF_UNIX, "ops");
+}
+
+#[test]
+fn metadata_mediation_applies_under_network_namespace_isolation() {
+    let probe = nono_test!("metadata-isolate-probe");
+    let profile = probe.write_profile(
+        "isolate-probe",
+        r#"{"meta":{"name":"isolate-probe"},"network":{"block":true},"linux":{"isolate":{"network":true}}}"#,
+    );
+    let completed = probe.run().profile(&profile).exec(Argv::new("/bin/true"));
+    if completed.stderr().contains("namespace isolation (net") {
+        eprintln!("skipping: host cannot create unprivileged namespaces");
+        return;
+    }
+    run_mode_and_time_matrix("metadata-isolate", MEDIATED_ISOLATED, "ops");
 }
 
 #[test]
