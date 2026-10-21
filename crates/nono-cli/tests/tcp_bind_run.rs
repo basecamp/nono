@@ -37,12 +37,18 @@ fn host_has_ipv6() -> bool {
     TcpListener::bind("[::1]:0").is_ok()
 }
 
-/// A TCP port that is free on the host right now.
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .and_then(|listener| listener.local_addr())
-        .map(|addr| addr.port())
-        .expect("bind an ephemeral host port")
+/// `N` distinct TCP ports that are free on the host right now: all are held
+/// at once while they are picked, so no two are the same.
+fn free_ports<const N: usize>() -> [u16; N] {
+    let listeners: Vec<TcpListener> = (0..N)
+        .map(|_| TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral host port"))
+        .collect();
+    std::array::from_fn(|i| {
+        listeners[i]
+            .local_addr()
+            .expect("ephemeral listener address")
+            .port()
+    })
 }
 
 /// Python that binds each `(family, address, port)` in turn and prints one
@@ -72,7 +78,7 @@ fn proxy_mode_open_port_binds_loopback_only() {
         eprintln!("skipping: no system python3 available");
         return;
     };
-    let (open, range_start, ungranted) = (free_port(), free_port(), free_port());
+    let [open, range_start, ungranted] = free_ports::<3>();
     let t = nono_test!("tcp-bind-open-port");
     let profile = t.write_profile(
         "tcp-bind-open-port",
@@ -114,7 +120,7 @@ fn proxy_mode_listen_port_binds_any_address() {
         eprintln!("skipping: no system python3 available");
         return;
     };
-    let listen = free_port();
+    let [listen] = free_ports::<1>();
     let t = nono_test!("tcp-bind-listen-port");
     let profile = t.write_profile(
         "tcp-bind-listen-port",
