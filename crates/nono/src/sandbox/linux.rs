@@ -2795,18 +2795,9 @@ pub fn bind_notif_socket_in_range(
     // The syscall's fd argument is an `int`; the kernel ignores the upper bits.
     let child_fd = sockfd as u32 as libc::c_int;
 
-    // SAFETY: pidfd_open takes a pid and flags and returns a new fd or -1.
-    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
-    if pidfd < 0 {
-        return Err(NonoError::SandboxInit(format!(
-            "pidfd_open({pid}) failed: {}",
-            std::io::Error::last_os_error()
-        )));
-    }
-    // SAFETY: pidfd_open returned a new fd that nothing else owns.
-    let pidfd = unsafe { OwnedFd::from_raw_fd(pidfd as libc::c_int) };
+    let pidfd = open_notif_pidfd(pid)?;
 
-    // The notification still pending means `pid` is still the process that
+    // The notification still pending means `pid` is still the thread that
     // made the call, so the pidfd refers to it and not to a reused pid.
     if !notif_id_valid(notify_fd, notif_id)? {
         return Err(NonoError::SandboxInit(
@@ -2856,6 +2847,47 @@ pub fn bind_notif_socket_in_range(
         end,
         first,
     ))
+}
+
+/// A pidfd for the thread `tid` that made a seccomp-notified call.
+///
+/// The notification names the calling thread, which for a worker thread is
+/// not its thread group's leader. Linux 6.9+ opens that thread itself
+/// (`PIDFD_THREAD`), and `pidfd_getfd` then reads the thread's own descriptor
+/// table. An older kernel refuses the flag, and `pidfd_open` there takes only
+/// a leader: open the thread's group (`Tgid` in `/proc/<tid>/status`), whose
+/// threads share one descriptor table unless one was cloned without
+/// `CLONE_FILES`.
+fn open_notif_pidfd(tid: libc::pid_t) -> Result<std::os::fd::OwnedFd> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+
+    let open = |pid: libc::pid_t, flags: libc::c_int| -> std::io::Result<OwnedFd> {
+        // SAFETY: pidfd_open takes a pid and flags and returns a new fd or -1.
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, flags) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: pidfd_open returned a new fd that nothing else owns.
+        Ok(unsafe { OwnedFd::from_raw_fd(fd as libc::c_int) })
+    };
+    // PIDFD_THREAD is O_EXCL (include/uapi/linux/pidfd.h).
+    match open(tid, libc::O_EXCL) {
+        Ok(fd) => return Ok(fd),
+        Err(err) if err.raw_os_error() == Some(libc::EINVAL) => {}
+        Err(err) => {
+            return Err(NonoError::SandboxInit(format!(
+                "pidfd_open({tid}, PIDFD_THREAD) failed: {err}"
+            )));
+        }
+    }
+    let status = std::fs::read_to_string(format!("/proc/{tid}/status"))
+        .map_err(|e| NonoError::SandboxInit(format!("cannot read /proc/{tid}/status: {e}")))?;
+    let tgid = status
+        .lines()
+        .find_map(|line| line.strip_prefix("Tgid:"))
+        .and_then(|value| value.trim().parse::<libc::pid_t>().ok())
+        .ok_or_else(|| NonoError::SandboxInit(format!("no Tgid in /proc/{tid}/status")))?;
+    open(tgid, 0).map_err(|err| NonoError::SandboxInit(format!("pidfd_open({tgid}) failed: {err}")))
 }
 
 /// Bind `fd` on `ip` to the first free port of `start..=end`, trying from

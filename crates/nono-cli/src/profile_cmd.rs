@@ -1034,6 +1034,7 @@ pub(crate) fn cmd_show(args: ProfileShowArgs) -> Result<()> {
         || !net.resolved_credentials().is_empty()
         || !net.open_port.is_empty()
         || !net.listen_port.is_empty()
+        || net.ephemeral_port_range.is_some()
         || !net.no_proxy.is_empty()
         || net.upstream_proxy.is_some()
         || !net.upstream_bypass.is_empty();
@@ -3147,7 +3148,6 @@ fn resolve_to_manifest(
         ports: if prof.network.listen_port.is_empty()
             && prof.network.open_port.is_empty()
             && prof.network.open_port_range.is_empty()
-            && prof.network.ephemeral_port_range.is_none()
         {
             None
         } else {
@@ -3165,13 +3165,13 @@ fn resolve_to_manifest(
                     .iter()
                     .filter_map(|p| std::num::NonZeroU64::new(u64::from(*p)))
                     .collect(),
-                // The manifest has no port-0 redirect: the ephemeral range
-                // keeps its grant as a localhost range.
+                // `ephemeral_port_range` is left out: the manifest has no
+                // port-0 redirect, and as a plain localhost range it would
+                // skip the check against the host's ephemeral range on load.
                 localhost_range: prof
                     .network
                     .open_port_range
                     .iter()
-                    .chain(prof.network.ephemeral_port_range.iter())
                     .filter_map(|&[s, e]| {
                         Some([
                             std::num::NonZeroU64::new(u64::from(s))?,

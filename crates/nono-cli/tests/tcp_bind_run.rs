@@ -156,7 +156,8 @@ fn free_block_below_host_ephemeral(len: u16) -> u16 {
 /// Python that binds loopback port 0 the way a test server does, connects to
 /// it, closes it and binds the same port again (Capybara's port probe), then
 /// tries a port-0 bind off loopback and a connect to a host listener on one
-/// of the host's own ephemeral ports.
+/// of the host's own ephemeral ports. Last, a worker thread binds port 0,
+/// as a browser's I/O thread does for its DevTools port.
 fn ephemeral_script(host_port: u16) -> String {
     format!(
         "import errno, socket\n\
@@ -180,7 +181,16 @@ fn ephemeral_script(host_port: u16) -> String {
          try:\n\
          \x20   y.connect(('127.0.0.1', {host_port})); print('host OK')\n\
          except OSError as e:\n\
-         \x20   print('host', err(e))\n"
+         \x20   print('host', err(e))\n\
+         import threading\n\
+         out = []\n\
+         def worker():\n\
+         \x20   w = socket.socket()\n\
+         \x20   try:\n\
+         \x20       w.bind(('127.0.0.1', 0)); out.append('thread-bound %d' % w.getsockname()[1])\n\
+         \x20   except OSError as e:\n\
+         \x20       out.append('thread-bind0 %s' % err(e))\n\
+         th = threading.Thread(target=worker); th.start(); th.join(); print(out[0])\n"
     )
 }
 
@@ -221,6 +231,21 @@ fn proxy_mode_port_zero_bind_uses_ephemeral_port_range() {
     assert!(
         (start..=end).contains(&bound),
         "port-0 bind got {bound}, outside the ephemeral range {start}..={end}"
+    );
+    let thread_bound: u16 = completed
+        .stdout()
+        .lines()
+        .find_map(|line| line.strip_prefix("thread-bound "))
+        .and_then(|port| port.trim().parse().ok())
+        .unwrap_or_else(|| {
+            panic!(
+                "a worker thread's port-0 bind is served too\n{}",
+                completed.stdout()
+            )
+        });
+    assert!(
+        (start..=end).contains(&thread_bound),
+        "worker-thread port-0 bind got {thread_bound}, outside {start}..={end}"
     );
     drop(host_listener);
 }
