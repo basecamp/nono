@@ -52,6 +52,10 @@ pub use linux::{
     resolve_notif_path, respond_notif_errno, validate_openat2_size,
 };
 
+// Re-export the supervisor's bind-on-behalf primitive for port-0 binds
+#[cfg(target_os = "linux")]
+pub use linux::{RangeBindOutcome, bind_notif_socket_in_range};
+
 /// Information about sandbox support on this platform
 #[derive(Debug, Clone)]
 pub struct SupportInfo {

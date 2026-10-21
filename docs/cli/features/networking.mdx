@@ -420,6 +420,23 @@ nono run --allow-cwd --network-profile developer --listen-port 3000 -- npm run d
 
 See [CLI Reference](/cli/usage/flags#--listen-port) for platform limitations.
 
+### Ephemeral Ports
+
+A server that binds port 0 (a Capybara test server, Chromium's `--remote-debugging-port=0`, Node's `listen(0)`) gets a port from the host's ephemeral range, which an open port grant cannot name ahead of time, and which also holds every host process's own port-0 listeners. Set `network.ephemeral_port_range` to a range outside the host's:
+
+```json
+{
+  "network": {
+    "allow_domain": ["rubygems.org"],
+    "ephemeral_port_range": [20000, 20999]
+  }
+}
+```
+
+The range is granted like an `open_port_range`: connect and bind on loopback. On Linux in proxy mode, a bind to `127.0.0.1:0` or `[::1]:0` is answered by the supervisor, which binds the socket to a free port from the range (the address it checked, so there is no TOCTOU window); `getsockname()` then reports that port, and the sandbox can connect to it. A port-0 bind to a non-loopback address is refused. nono refuses a range that overlaps the host's ephemeral range (`/proc/sys/net/ipv4/ip_local_port_range`), where the sandbox could otherwise reach any host process's port-0 listener, a browser's DevTools port among them. Give each sandbox that runs at once its own range: two sandboxes sharing one can reach each other's servers.
+
+Not covered: `--block-net` and `linux.sandbox_policy` `landlock` or `external` have no supervisor to answer the bind, so a port-0 bind is refused there as before; commands brokered by a [tool sandbox](/cli/features/tool-sandbox) run under their own network policy and do not inherit the range. On macOS, Seatbelt cannot redirect a bind: the range is only an `open_port_range`, and a port-0 bind gets an OS ephemeral port the sandbox cannot connect to. With `linux.isolate` (`net,loopback`) the namespace's own loopback serves port 0 without this setting.
+
 ## Always-Denied Destinations
 
 The following destinations are always blocked by the proxy, regardless of configuration. These cannot be overridden.

@@ -1816,6 +1816,16 @@ pub struct NetworkConfig {
     /// Overlapping ranges are merged before applying rules.
     #[serde(default)]
     pub listen_port_range: Vec<[u16; 2]>,
+    /// Inclusive localhost port range, `[start, end]`, that serves a bind to
+    /// port 0. It is granted like an `open_port_range` (connect + bind, on
+    /// loopback). On Linux in proxy mode the supervisor binds a loopback
+    /// port-0 request to a free port from it, so a test server on an
+    /// ephemeral port (Capybara, a browser's DevTools port) is reachable from
+    /// the sandbox without granting the host's own ephemeral ports. It must
+    /// lie outside the host's ephemeral port range. Seatbelt cannot redirect
+    /// a bind: on macOS the range is only an `open_port_range`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ephemeral_port_range: Option<[u16; 2]>,
     /// Outbound TCP connect ports (allowlist). Linux Landlock V4+ only.
     /// Equivalent to `--allow-connect-port` CLI flag.
     #[serde(default)]
@@ -3755,6 +3765,11 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
                 &base.network.listen_port_range,
                 &child.network.listen_port_range,
             ),
+            // One range serves port 0: the child's replaces the base's.
+            ephemeral_port_range: child
+                .network
+                .ephemeral_port_range
+                .or(base.network.ephemeral_port_range),
             connect_port: dedup_append(&base.network.connect_port, &child.network.connect_port),
             no_proxy: dedup_append(&base.network.no_proxy, &child.network.no_proxy),
             // Child `Some([])` overrides parent credentials to empty (disables proxy).
@@ -6806,6 +6821,7 @@ mod tests {
                 open_port_range: vec![],
                 listen_port: vec![4000],
                 listen_port_range: vec![],
+                ephemeral_port_range: None,
                 connect_port: vec![],
                 no_proxy: vec!["base.local".to_string()],
                 credentials: Some(vec!["base_cred".to_string()]),
@@ -6897,6 +6913,7 @@ mod tests {
                 open_port_range: vec![],
                 listen_port: vec![4000, 6000],
                 listen_port_range: vec![],
+                ephemeral_port_range: None,
                 connect_port: vec![],
                 no_proxy: vec!["base.local".to_string(), "child.local".to_string()],
                 credentials: None,

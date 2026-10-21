@@ -753,13 +753,19 @@ fn handle_received_filesystem_notification(
 ///
 /// Split out as an explicit type so the (testable) policy logic is decoupled
 /// from the (untestable) seccomp-notify response plumbing. Callers translate
-/// `Allow` to `continue_notif(…)` and `Deny` to `respond_notif_errno(…, EACCES)`.
+/// `Allow` to `continue_notif(…)`, `Deny` to `respond_notif_errno(…, EACCES)`,
+/// and `BindFromRange` to a bind the supervisor makes itself
+/// ([`bind_from_ephemeral_range`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum NetworkDecision {
     /// Allow the operation.
     Allow,
     /// Fail the syscall with `EACCES`.
     Deny,
+    /// A loopback bind to port 0: bind the socket to a free port in
+    /// `start..=end` (the capability set's ephemeral port range) instead of
+    /// the host's ephemeral range, which the sandbox has no grant for.
+    BindFromRange { start: u16, end: u16 },
 }
 
 /// Whether a trapped network syscall on address `family` carries no policy
@@ -900,6 +906,21 @@ pub(super) fn decide_network_notification(
         }
         SYS_BIND => {
             let port = sockaddr.port;
+            // A loopback bind to port 0 asks the kernel for a port from the
+            // host's ephemeral range, whose ports the sandbox can neither bind
+            // nor reach (a host browser's DevTools port lives there). With an
+            // ephemeral port range granted, the supervisor binds it to a free
+            // port of that range instead, which the sandbox can reach.
+            if port == 0
+                && sockaddr.is_loopback
+                && let Some((start, end)) = config.caps.ephemeral_port_range()
+            {
+                debug!(
+                    "Proxy seccomp: binding a loopback port-0 request from {}..={}",
+                    start, end
+                );
+                return NetworkDecision::BindFromRange { start, end };
+            }
             // `--listen-port` / `listen_port` grants a server port: bind on
             // any local address, as documented.
             let listen_grant = config.proxy_bind_ports.contains(&port);
@@ -1330,6 +1351,9 @@ fn handle_received_network_notification(
     for sockaddr in &sockaddrs {
         match decide_network_notification(notif.pid, notif.data.nr, sockaddr, config) {
             NetworkDecision::Allow => {}
+            NetworkDecision::BindFromRange { start, end } => {
+                return bind_from_ephemeral_range(notify_fd, &notif, sockaddr, start, end);
+            }
             NetworkDecision::Deny => {
                 // Enforcement is unconditional: the throttle only bounds how
                 // much bookkeeping this denial may create.
@@ -1363,6 +1387,63 @@ fn handle_received_network_notification(
     }
 
     Ok(())
+}
+
+/// Where the next ephemeral-range bind starts looking, so consecutive binds
+/// spread over the range the way the kernel's own port-0 choice does.
+static NEXT_EPHEMERAL_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+
+/// Answer a loopback port-0 `bind(2)` by binding the child's socket to a free
+/// port in `start..=end` from the supervisor (see
+/// [`nono::sandbox::bind_notif_socket_in_range`]). The address bound is the
+/// one already checked, so this path has no TOCTOU window. Any failure to
+/// take the socket fails the child's bind with `EACCES`.
+fn bind_from_ephemeral_range(
+    notify_fd: std::os::fd::RawFd,
+    notif: &nono::sandbox::SeccompNotif,
+    sockaddr: &nono::sandbox::SockaddrInfo,
+    start: u16,
+    end: u16,
+) -> nono::error::Result<()> {
+    use nono::sandbox::{RangeBindOutcome, bind_notif_socket_in_range, respond_notif_errno};
+    use std::sync::atomic::Ordering;
+
+    let Some(ip) = sockaddr.ip else {
+        debug!("Proxy seccomp: port-0 bind without a parsed address, denying");
+        return respond_notif_errno(notify_fd, notif.id, libc::EACCES);
+    };
+    let first = NEXT_EPHEMERAL_PORT.load(Ordering::Relaxed);
+    match bind_notif_socket_in_range(
+        notify_fd,
+        notif.id,
+        notif.pid,
+        notif.data.args[0],
+        ip,
+        start,
+        end,
+        first,
+    ) {
+        Ok(RangeBindOutcome::Bound(port)) => {
+            NEXT_EPHEMERAL_PORT.store(port.wrapping_add(1), Ordering::Relaxed);
+            debug!("Proxy seccomp: bound port-0 request to {}:{}", ip, port);
+            // errno 0: the child's bind returns 0, its own syscall never runs.
+            respond_notif_errno(notify_fd, notif.id, 0)
+        }
+        Ok(RangeBindOutcome::Failed(errno)) => {
+            debug!(
+                "Proxy seccomp: port-0 bind in {}..={} failed with errno {}",
+                start, end, errno
+            );
+            respond_notif_errno(notify_fd, notif.id, errno)
+        }
+        Err(err) => {
+            debug!(
+                "Proxy seccomp: port-0 bind could not take the socket: {}",
+                err
+            );
+            respond_notif_errno(notify_fd, notif.id, libc::EACCES)
+        }
+    }
 }
 
 fn record_af_unix_ipc_denial(
@@ -2054,6 +2135,7 @@ mod tests {
                 family: libc::AF_UNIX as u16,
                 port: 0,
                 is_loopback: true,
+                ip: None,
                 unix_kind: Some(UnixSocketKind::Pathname),
                 unix_path: Some(path.to_path_buf()),
             }
@@ -2064,6 +2146,7 @@ mod tests {
                 family: libc::AF_UNIX as u16,
                 port: 0,
                 is_loopback: true,
+                ip: None,
                 unix_kind: Some(UnixSocketKind::Abstract),
                 unix_path: None,
             }
@@ -2074,6 +2157,7 @@ mod tests {
                 family: libc::AF_UNIX as u16,
                 port: 0,
                 is_loopback: true,
+                ip: None,
                 unix_kind: Some(UnixSocketKind::Unnamed),
                 unix_path: None,
             }
@@ -2084,6 +2168,7 @@ mod tests {
                 family: libc::AF_INET as u16,
                 port,
                 is_loopback: true,
+                ip: Some(std::net::Ipv4Addr::LOCALHOST.into()),
                 unix_kind: None,
                 unix_path: None,
             }
@@ -2094,6 +2179,7 @@ mod tests {
                 family: libc::AF_INET as u16,
                 port,
                 is_loopback: false,
+                ip: Some(std::net::Ipv4Addr::new(192, 0, 2, 1).into()),
                 unix_kind: None,
                 unix_path: None,
             }
@@ -2780,13 +2866,16 @@ mod tests {
         }
 
         fn inet6(port: u16, is_loopback: bool) -> SockaddrInfo {
+            let ip = if is_loopback {
+                std::net::Ipv6Addr::LOCALHOST
+            } else {
+                std::net::Ipv6Addr::UNSPECIFIED
+            };
             SockaddrInfo {
                 family: libc::AF_INET6 as u16,
-                ..if is_loopback {
-                    inet_loopback(port)
-                } else {
-                    inet_external(port)
-                }
+                is_loopback,
+                ip: Some(ip.into()),
+                ..inet_external(port)
             }
         }
 
@@ -2837,6 +2926,66 @@ mod tests {
             assert_eq!(
                 decide_network_notification(test_pid(), SYS_BIND, &inet6(49160, false), &config),
                 NetworkDecision::Deny
+            );
+        }
+
+        /// A loopback bind to port 0 is served from the ephemeral port range
+        /// when one is granted, and stays denied otherwise: the host's own
+        /// ephemeral ports are never granted. A non-loopback port-0 bind is
+        /// denied either way.
+        #[test]
+        fn port_zero_bind_uses_ephemeral_port_range() {
+            let backend = DenyAllBackend;
+            let mut caps = nono::CapabilitySet::default();
+            caps.set_ephemeral_port_range(20000, 20009)
+                .expect("valid ephemeral range");
+            let mut config = make_proxy_only_config(&backend, 8080, Vec::new());
+            config.caps = &caps;
+            for sockaddr in [inet_loopback(0), inet6(0, true)] {
+                assert_eq!(
+                    decide_network_notification(test_pid(), SYS_BIND, &sockaddr, &config),
+                    NetworkDecision::BindFromRange {
+                        start: 20000,
+                        end: 20009
+                    },
+                );
+            }
+            for sockaddr in [inet_external(0), inet6(0, false)] {
+                assert_eq!(
+                    decide_network_notification(test_pid(), SYS_BIND, &sockaddr, &config),
+                    NetworkDecision::Deny,
+                    "a port-0 bind off loopback must be denied"
+                );
+            }
+            // The range is an open range too: an explicit loopback bind and
+            // connect inside it are allowed, outside it denied.
+            for syscall in [SYS_BIND, SYS_CONNECT] {
+                assert_eq!(
+                    decide_network_notification(
+                        test_pid(),
+                        syscall,
+                        &inet_loopback(20005),
+                        &config
+                    ),
+                    NetworkDecision::Allow
+                );
+                assert_eq!(
+                    decide_network_notification(
+                        test_pid(),
+                        syscall,
+                        &inet_loopback(40000),
+                        &config
+                    ),
+                    NetworkDecision::Deny
+                );
+            }
+
+            let no_range = nono::CapabilitySet::default();
+            config.caps = &no_range;
+            assert_eq!(
+                decide_network_notification(test_pid(), SYS_BIND, &inet_loopback(0), &config),
+                NetworkDecision::Deny,
+                "without an ephemeral range a port-0 bind stays denied"
             );
         }
 

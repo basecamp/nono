@@ -1115,6 +1115,14 @@ pub(crate) fn cmd_show(args: ProfileShowArgs) -> Result<()> {
                 ranges.join(", ")
             );
         }
+        if let Some([s, e]) = net.ephemeral_port_range {
+            println!(
+                "    {}: {}..={}",
+                theme::fg("ephemeral_port_range", t.subtext),
+                s,
+                e
+            );
+        }
         if !net.no_proxy.is_empty() {
             println!(
                 "    {}: {}",
@@ -3139,6 +3147,7 @@ fn resolve_to_manifest(
         ports: if prof.network.listen_port.is_empty()
             && prof.network.open_port.is_empty()
             && prof.network.open_port_range.is_empty()
+            && prof.network.ephemeral_port_range.is_none()
         {
             None
         } else {
@@ -3156,10 +3165,13 @@ fn resolve_to_manifest(
                     .iter()
                     .filter_map(|p| std::num::NonZeroU64::new(u64::from(*p)))
                     .collect(),
+                // The manifest has no port-0 redirect: the ephemeral range
+                // keeps its grant as a localhost range.
                 localhost_range: prof
                     .network
                     .open_port_range
                     .iter()
+                    .chain(prof.network.ephemeral_port_range.iter())
                     .filter_map(|&[s, e]| {
                         Some([
                             std::num::NonZeroU64::new(u64::from(s))?,

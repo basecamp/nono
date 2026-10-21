@@ -73,6 +73,7 @@ fn test_schema_network_config_matches_rust_model() {
             "open_port_range",
             "listen_port",
             "listen_port_range",
+            "ephemeral_port_range",
             "connect_port",
             "no_proxy",
             "custom_credentials",

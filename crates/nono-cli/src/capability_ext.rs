@@ -1048,6 +1048,10 @@ impl CapabilitySetExt for CapabilitySet {
         for &[start, end] in &profile.network.open_port_range {
             caps.add_localhost_port_range(start, end)?;
         }
+        if let Some([start, end]) = profile.network.ephemeral_port_range {
+            check_outside_host_ephemeral_ports(start, end, host_ephemeral_port_range()?)?;
+            caps.set_ephemeral_port_range(start, end)?;
+        }
 
         // Outbound TCP connect port allowlist from profile (Linux Landlock V4+ only)
         #[cfg(target_os = "macos")]
@@ -1210,6 +1214,50 @@ fn finalize_caps(
         blocked_grants,
         applied_bypass_paths: bypass_paths,
     })
+}
+
+/// The host's ephemeral port range: where the kernel puts a port-0 bind or a
+/// client's source port for every process on the host, a browser's DevTools
+/// port among them.
+#[cfg(target_os = "linux")]
+fn host_ephemeral_port_range() -> Result<(u16, u16)> {
+    const PATH: &str = "/proc/sys/net/ipv4/ip_local_port_range";
+    let raw = std::fs::read_to_string(PATH).map_err(|e| {
+        NonoError::ConfigParse(format!(
+            "network.ephemeral_port_range: cannot read the host's ephemeral port range from \
+             {PATH}: {e}"
+        ))
+    })?;
+    let mut bounds = raw.split_whitespace().map(str::parse::<u16>);
+    match (bounds.next(), bounds.next(), bounds.next()) {
+        (Some(Ok(start)), Some(Ok(end)), None) if start <= end => Ok((start, end)),
+        _ => Err(NonoError::ConfigParse(format!(
+            "network.ephemeral_port_range: cannot parse the host's ephemeral port range from \
+             {PATH}: {raw:?}"
+        ))),
+    }
+}
+
+/// The host's ephemeral port range: macOS's default
+/// (`net.inet.ip.portrange.first`..`last`), the IANA dynamic range.
+#[cfg(not(target_os = "linux"))]
+fn host_ephemeral_port_range() -> Result<(u16, u16)> {
+    Ok((49152, 65535))
+}
+
+/// Refuse an ephemeral port range that overlaps the host's own: the sandbox
+/// could then connect to any host process's ephemeral listener in the
+/// overlap, which is what the range exists to avoid granting.
+fn check_outside_host_ephemeral_ports(start: u16, end: u16, host: (u16, u16)) -> Result<()> {
+    let (host_start, host_end) = host;
+    if start <= host_end && host_start <= end {
+        return Err(NonoError::ConfigParse(format!(
+            "network.ephemeral_port_range [{start}, {end}] overlaps the host's ephemeral port \
+             range {host_start}-{host_end}, where any host process's port-0 listener (a \
+             browser's DevTools port, another tool's server) is bound; choose a range outside it"
+        )));
+    }
+    Ok(())
 }
 
 fn apply_cli_network_mode(caps: &mut CapabilitySet, args: &SandboxArgs) {
@@ -1483,6 +1531,54 @@ mod tests {
                 .iter()
                 .any(|cap| !cap.is_file && cap.resolved == allowed_canonical),
             "explicit user grant under TMPDIR should still be present"
+        );
+    }
+
+    #[test]
+    fn test_ephemeral_port_range_must_not_overlap_host_range() {
+        let host = (32768, 60999);
+        assert!(check_outside_host_ephemeral_ports(20000, 20999, host).is_ok());
+        assert!(check_outside_host_ephemeral_ports(61000, 61999, host).is_ok());
+        for (start, end) in [(32000, 32768), (60999, 61500), (40000, 40100), (1, 65535)] {
+            assert!(
+                check_outside_host_ephemeral_ports(start, end, host).is_err(),
+                "[{start}, {end}] overlaps {host:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_from_profile_ephemeral_port_range() {
+        let (host_start, _) = host_ephemeral_port_range().expect("host ephemeral range");
+        let (start, end) = (host_start - 100, host_start - 1);
+        let dir = tempdir().expect("tmpdir");
+        let profile_path = dir.path().join("ephemeral.json");
+        std::fs::write(
+            &profile_path,
+            format!(
+                r#"{{"meta":{{"name":"ephemeral"}},"network":{{"ephemeral_port_range":[{start},{end}]}}}}"#
+            ),
+        )
+        .expect("write profile");
+        let profile = crate::profile::load_profile_from_path(&profile_path).expect("load profile");
+        let workdir = tempdir().expect("workdir");
+        let args = sandbox_args();
+
+        let (caps, _) = from_profile_locked(&profile, workdir.path(), &args).expect("build caps");
+        assert_eq!(caps.ephemeral_port_range(), Some((start, end)));
+        assert!(caps.localhost_port_ranges().contains(&(start, end)));
+
+        std::fs::write(
+            &profile_path,
+            format!(
+                r#"{{"meta":{{"name":"ephemeral"}},"network":{{"ephemeral_port_range":[{host_start},{host_start}]}}}}"#
+            ),
+        )
+        .expect("write profile");
+        let profile = crate::profile::load_profile_from_path(&profile_path).expect("load profile");
+        assert!(
+            from_profile_locked(&profile, workdir.path(), &args).is_err(),
+            "a range inside the host's ephemeral ports is refused"
         );
     }
 

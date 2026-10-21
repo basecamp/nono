@@ -959,6 +959,13 @@
           },
           "description": "Inclusive port ranges for TCP listen (bind only). Same platform behaviour as open_port_range for the bind side; no outbound connect rules are added. Overlapping ranges are merged before applying rules."
         },
+        "ephemeral_port_range": {
+          "type": "array",
+          "items": { "type": "integer", "minimum": 1, "maximum": 65535 },
+          "minItems": 2,
+          "maxItems": 2,
+          "description": "Inclusive localhost port range [start, end] that serves a bind to port 0. Granted like an open_port_range (connect + bind, on loopback). On Linux in proxy mode, nono binds a loopback port-0 request to a free port from this range, so a server on an ephemeral port (a Capybara test server, a browser's DevTools port) is reachable from the sandbox without granting the host's own ephemeral ports. Must lie outside the host's ephemeral port range. On macOS the range is only an open_port_range."
+        },
         "deny_domain": {
           "type": "array",
           "items": { "type": "string" },

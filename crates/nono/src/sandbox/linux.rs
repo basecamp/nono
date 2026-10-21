@@ -2741,6 +2741,205 @@ pub fn deny_notif(notify_fd: std::os::fd::RawFd, notif_id: u64) -> Result<()> {
     respond_notif_errno(notify_fd, notif_id, libc::EPERM)
 }
 
+/// Result of [`bind_notif_socket_in_range`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RangeBindOutcome {
+    /// The socket is bound to this port.
+    Bound(u16),
+    /// The bind failed with this errno, to be returned to the child:
+    /// `EADDRINUSE` when every port in the range is taken.
+    Failed(i32),
+}
+
+/// Bind a notifying process's TCP socket to a free port in `start..=end` on
+/// `ip`, on the process's behalf, for a trapped `bind(2)`.
+///
+/// The socket is taken from the process with `pidfd_getfd(2)`: the duplicate
+/// shares the child's open socket, so binding it binds the child's socket.
+/// The address bound is `ip` as the caller already parsed and checked it, not
+/// a second read of child memory, so there is no TOCTOU window between the
+/// check and the bind. The child's original syscall does not run: the caller
+/// answers the notification with success (`respond_notif_errno` with 0) for
+/// `Bound`, or with the errno for `Failed`.
+///
+/// Ports are tried from `first` (or `start`, when `first` is outside the
+/// range) upward, wrapping at `end`; a port in use moves to the next, and any
+/// other bind error is returned as is. Only `SOCK_STREAM` sockets are bound;
+/// any other socket type fails with `EACCES`.
+///
+/// # Errors
+///
+/// Returns an error if the range is empty or starts at 0, the notification
+/// is no longer pending, or the socket cannot be taken from the process
+/// (`pidfd_open`/`pidfd_getfd` need Linux 5.6 and ptrace access to it).
+#[allow(clippy::too_many_arguments)]
+pub fn bind_notif_socket_in_range(
+    notify_fd: std::os::fd::RawFd,
+    notif_id: u64,
+    pid: u32,
+    sockfd: u64,
+    ip: std::net::IpAddr,
+    start: u16,
+    end: u16,
+    first: u16,
+) -> Result<RangeBindOutcome> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    if start == 0 || end < start {
+        return Err(NonoError::SandboxInit(format!(
+            "invalid bind port range {start}..={end}"
+        )));
+    }
+    let pid = libc::pid_t::try_from(pid)
+        .map_err(|_| NonoError::SandboxInit(format!("pid {pid} out of range")))?;
+    // The syscall's fd argument is an `int`; the kernel ignores the upper bits.
+    let child_fd = sockfd as u32 as libc::c_int;
+
+    // SAFETY: pidfd_open takes a pid and flags and returns a new fd or -1.
+    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    if pidfd < 0 {
+        return Err(NonoError::SandboxInit(format!(
+            "pidfd_open({pid}) failed: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    // SAFETY: pidfd_open returned a new fd that nothing else owns.
+    let pidfd = unsafe { OwnedFd::from_raw_fd(pidfd as libc::c_int) };
+
+    // The notification still pending means `pid` is still the process that
+    // made the call, so the pidfd refers to it and not to a reused pid.
+    if !notif_id_valid(notify_fd, notif_id)? {
+        return Err(NonoError::SandboxInit(
+            "seccomp notification expired before the bind".to_string(),
+        ));
+    }
+
+    // SAFETY: pidfd_getfd takes a pidfd, a target fd number and flags (0)
+    // and returns a new fd in this process or -1.
+    let socket = unsafe { libc::syscall(libc::SYS_pidfd_getfd, pidfd.as_raw_fd(), child_fd, 0) };
+    if socket < 0 {
+        return Err(NonoError::SandboxInit(format!(
+            "pidfd_getfd({pid}, {child_fd}) failed: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    // SAFETY: pidfd_getfd returned a new fd that nothing else owns.
+    let socket = unsafe { OwnedFd::from_raw_fd(socket as libc::c_int) };
+
+    let mut sock_type: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: getsockopt writes at most `len` bytes into `sock_type`, a
+    // c_int whose size `len` holds.
+    let ret = unsafe {
+        libc::getsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_TYPE,
+            (&mut sock_type as *mut libc::c_int).cast(),
+            &mut len,
+        )
+    };
+    if ret < 0 {
+        return Ok(RangeBindOutcome::Failed(
+            std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EACCES),
+        ));
+    }
+    if sock_type != libc::SOCK_STREAM {
+        return Ok(RangeBindOutcome::Failed(libc::EACCES));
+    }
+    Ok(bind_first_free_port(
+        socket.as_raw_fd(),
+        ip,
+        start,
+        end,
+        first,
+    ))
+}
+
+/// Bind `fd` on `ip` to the first free port of `start..=end`, trying from
+/// `first` (or `start`) and wrapping at `end`. The caller checks the range is
+/// non-empty.
+fn bind_first_free_port(
+    fd: std::os::fd::RawFd,
+    ip: std::net::IpAddr,
+    start: u16,
+    end: u16,
+    first: u16,
+) -> RangeBindOutcome {
+    let span = u32::from(end - start) + 1;
+    let offset = if (start..=end).contains(&first) {
+        u32::from(first - start)
+    } else {
+        0
+    };
+    for step in 0..span {
+        let port_offset = (offset + step) % span;
+        // `port_offset < span`, so `start + port_offset <= end` fits in u16.
+        let port = start + port_offset as u16;
+        match bind_socket_to(fd, std::net::SocketAddr::new(ip, port)) {
+            Ok(()) => return RangeBindOutcome::Bound(port),
+            Err(errno) if errno == libc::EADDRINUSE => continue,
+            Err(errno) => return RangeBindOutcome::Failed(errno),
+        }
+    }
+    RangeBindOutcome::Failed(libc::EADDRINUSE)
+}
+
+/// `bind(2)` `fd` to `addr`, returning the errno on failure.
+fn bind_socket_to(
+    fd: std::os::fd::RawFd,
+    addr: std::net::SocketAddr,
+) -> std::result::Result<(), i32> {
+    let ret = match addr {
+        std::net::SocketAddr::V4(v4) => {
+            let sin = libc::sockaddr_in {
+                sin_family: libc::AF_INET as libc::sa_family_t,
+                sin_port: v4.port().to_be(),
+                sin_addr: libc::in_addr {
+                    s_addr: u32::from_ne_bytes(v4.ip().octets()),
+                },
+                sin_zero: [0; 8],
+            };
+            // SAFETY: `sin` is a valid sockaddr_in and the length passed is its size.
+            unsafe {
+                libc::bind(
+                    fd,
+                    (&sin as *const libc::sockaddr_in).cast(),
+                    std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                )
+            }
+        }
+        std::net::SocketAddr::V6(v6) => {
+            let sin6 = libc::sockaddr_in6 {
+                sin6_family: libc::AF_INET6 as libc::sa_family_t,
+                sin6_port: v6.port().to_be(),
+                sin6_flowinfo: 0,
+                sin6_addr: libc::in6_addr {
+                    s6_addr: v6.ip().octets(),
+                },
+                sin6_scope_id: 0,
+            };
+            // SAFETY: `sin6` is a valid sockaddr_in6 and the length passed is its size.
+            unsafe {
+                libc::bind(
+                    fd,
+                    (&sin6 as *const libc::sockaddr_in6).cast(),
+                    std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+                )
+            }
+        }
+    };
+    if ret == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EACCES))
+    }
+}
+
 // ==========================================================================
 // Seccomp proxy-only network fallback
 //
@@ -2802,6 +3001,9 @@ pub struct SockaddrInfo {
     pub port: u16,
     /// Whether the address is a loopback address (127.0.0.1 or ::1)
     pub is_loopback: bool,
+    /// For `AF_INET`/`AF_INET6`: the IP address as parsed. `None` for other
+    /// families.
+    pub ip: Option<std::net::IpAddr>,
     /// For `AF_UNIX`: kind of socket (pathname / abstract / unnamed). `None`
     /// for non-UNIX address families.
     pub unix_kind: Option<UnixSocketKind>,
@@ -3684,6 +3886,7 @@ pub fn read_notif_sockaddr(pid: u32, addr_ptr: u64, addrlen: u64) -> Result<Sock
                 family,
                 port,
                 is_loopback,
+                ip: Some(std::net::IpAddr::from(addr)),
                 unix_kind: None,
                 unix_path: None,
             })
@@ -3709,6 +3912,7 @@ pub fn read_notif_sockaddr(pid: u32, addr_ptr: u64, addrlen: u64) -> Result<Sock
                 family,
                 port,
                 is_loopback: is_loopback || is_v4_mapped_loopback,
+                ip: Some(std::net::IpAddr::from(addr)),
                 unix_kind: None,
                 unix_path: None,
             })
@@ -3742,6 +3946,7 @@ pub fn read_notif_sockaddr(pid: u32, addr_ptr: u64, addrlen: u64) -> Result<Sock
                 family,
                 port: 0,
                 is_loopback: true, // Unix sockets are always local
+                ip: None,
                 unix_kind: Some(unix_kind),
                 unix_path,
             })
@@ -3750,6 +3955,7 @@ pub fn read_notif_sockaddr(pid: u32, addr_ptr: u64, addrlen: u64) -> Result<Sock
             family,
             port: 0,
             is_loopback: false,
+            ip: None,
             unix_kind: None,
             unix_path: None,
         }),
@@ -5674,12 +5880,73 @@ mod tests {
         );
     }
 
+    /// A free port of a small range, found by binding and releasing it.
+    fn free_port_block(len: u16) -> u16 {
+        for _ in 0..50 {
+            let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe");
+            let start = probe.local_addr().expect("probe addr").port();
+            drop(probe);
+            if start.checked_add(len).is_none() {
+                continue;
+            }
+            let all_free = (start..start + len)
+                .all(|port| std::net::TcpListener::bind(("127.0.0.1", port)).is_ok());
+            if all_free {
+                return start;
+            }
+        }
+        panic!("no free block of {len} ports");
+    }
+
+    fn new_tcp_socket() -> std::os::fd::OwnedFd {
+        use std::os::fd::FromRawFd;
+        // SAFETY: socket() returns a new fd or -1, checked below.
+        let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+        assert!(fd >= 0, "socket(): {}", std::io::Error::last_os_error());
+        // SAFETY: fd is a new socket nothing else owns.
+        unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }
+    }
+
+    #[test]
+    fn test_bind_first_free_port_skips_ports_in_use_and_wraps() {
+        use std::os::fd::AsRawFd;
+        let start = free_port_block(3);
+        let end = start + 2;
+        let loopback = std::net::IpAddr::from(std::net::Ipv4Addr::LOCALHOST);
+        let _held = std::net::TcpListener::bind(("127.0.0.1", start + 1)).expect("hold a port");
+
+        let first = new_tcp_socket();
+        assert_eq!(
+            bind_first_free_port(first.as_raw_fd(), loopback, start, end, start + 1),
+            RangeBindOutcome::Bound(end),
+            "a port in use moves on to the next"
+        );
+        let second = new_tcp_socket();
+        assert_eq!(
+            bind_first_free_port(second.as_raw_fd(), loopback, start, end, end),
+            RangeBindOutcome::Bound(start),
+            "the search wraps from end to start"
+        );
+        let third = new_tcp_socket();
+        assert_eq!(
+            bind_first_free_port(third.as_raw_fd(), loopback, start, end, 0),
+            RangeBindOutcome::Failed(libc::EADDRINUSE),
+            "a full range fails with EADDRINUSE"
+        );
+        assert_eq!(
+            bind_first_free_port(first.as_raw_fd(), loopback, start, end, start),
+            RangeBindOutcome::Failed(libc::EINVAL),
+            "another error is returned as is (an already-bound socket)"
+        );
+    }
+
     #[test]
     fn test_sockaddr_info_ipv4_loopback() {
         let info = SockaddrInfo {
             family: libc::AF_INET as u16,
             port: 8080,
             is_loopback: true,
+            ip: None,
             unix_kind: None,
             unix_path: None,
         };
@@ -5693,6 +5960,7 @@ mod tests {
             family: libc::AF_INET6 as u16,
             port: 443,
             is_loopback: true,
+            ip: None,
             unix_kind: None,
             unix_path: None,
         };
@@ -5705,6 +5973,7 @@ mod tests {
             family: libc::AF_INET as u16,
             port: 80,
             is_loopback: false,
+            ip: None,
             unix_kind: None,
             unix_path: None,
         };
@@ -5717,6 +5986,7 @@ mod tests {
             family: libc::AF_UNIX as u16,
             port: 0,
             is_loopback: true,
+            ip: None,
             unix_kind: Some(UnixSocketKind::Pathname),
             unix_path: Some(PathBuf::from("/tmp/test.sock")),
         };

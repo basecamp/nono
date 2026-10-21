@@ -982,6 +982,16 @@ pub struct CapabilitySet {
     /// [`MACOS_PORT_RANGE_LIMIT`] (2¹⁴ = 16,384 ports) across all ranges combined;
     /// Linux accepts any range within the 16-bit port space (1–65535).
     localhost_port_ranges: Vec<(u16, u16)>,
+    /// Inclusive localhost port range that serves `bind(2)` to port 0.
+    ///
+    /// Also present in `localhost_port_ranges`, so its ports are granted for
+    /// connect and bind like any other localhost IPC range. The library only
+    /// records it: on Linux, nono-cli's proxy-mode seccomp supervisor binds a
+    /// loopback port-0 request to a free port from this range, so the
+    /// sandboxed process can reach the listeners it opened without a grant on
+    /// the host's own ephemeral ports. Seatbelt cannot redirect a bind, so on
+    /// macOS the range is only a localhost IPC range.
+    ephemeral_port_range: Option<(u16, u16)>,
     /// Commands explicitly allowed (overrides blocklists - for CLI use)
     allowed_commands: Vec<String>,
     /// Additional commands to block (extends blocklists - for CLI use)
@@ -1454,6 +1464,18 @@ impl CapabilitySet {
         Ok(())
     }
 
+    /// Set the localhost port range that serves `bind(2)` to port 0 (mutable).
+    ///
+    /// The range is also added as a localhost IPC range (connect + bind), with
+    /// the same validation as [`CapabilitySet::add_localhost_port_range`]. A
+    /// second call replaces the recorded range; the earlier one stays a
+    /// localhost IPC range.
+    pub fn set_ephemeral_port_range(&mut self, start: u16, end: u16) -> Result<()> {
+        self.add_localhost_port_range(start, end)?;
+        self.ephemeral_port_range = Some((start, end));
+        Ok(())
+    }
+
     /// Set sandbox extensions state
     pub fn set_extensions_enabled(&mut self, enabled: bool) {
         self.extensions_enabled = enabled;
@@ -1712,6 +1734,12 @@ impl CapabilitySet {
     #[must_use]
     pub fn localhost_port_ranges(&self) -> &[(u16, u16)] {
         &self.localhost_port_ranges
+    }
+
+    /// Get the localhost port range that serves `bind(2)` to port 0, if any
+    #[must_use]
+    pub fn ephemeral_port_range(&self) -> Option<(u16, u16)> {
+        self.ephemeral_port_range
     }
 
     /// Check if sandbox extensions are enabled for runtime capability expansion
@@ -3162,6 +3190,25 @@ mod tests {
         caps.add_localhost_port_range(8000, 8080)
             .expect("valid range");
         assert_eq!(caps.localhost_port_ranges(), &[(8000, 8080)]);
+    }
+
+    #[test]
+    fn test_ephemeral_port_range_is_also_a_localhost_range() {
+        let mut caps = CapabilitySet::new();
+        assert_eq!(caps.ephemeral_port_range(), None);
+        caps.set_ephemeral_port_range(20000, 20999)
+            .expect("valid range");
+        assert_eq!(caps.ephemeral_port_range(), Some((20000, 20999)));
+        assert_eq!(caps.localhost_port_ranges(), &[(20000, 20999)]);
+    }
+
+    #[test]
+    fn test_ephemeral_port_range_rejects_invalid_range() {
+        let mut caps = CapabilitySet::new();
+        assert!(caps.set_ephemeral_port_range(0, 100).is_err());
+        assert!(caps.set_ephemeral_port_range(5000, 4000).is_err());
+        assert_eq!(caps.ephemeral_port_range(), None);
+        assert!(caps.localhost_port_ranges().is_empty());
     }
 
     #[test]
