@@ -1,8 +1,11 @@
 //! Runtime enforcement tests for the address a sandboxed TCP `bind(2)` may use.
 //!
 //! An open port (`network.open_port`, `open_port_range`) is localhost IPC: in
-//! proxy mode its connect reaches only loopback, and so does its bind. A
-//! listen port (`network.listen_port`) is a server port and binds any address.
+//! proxy mode its connect reaches only loopback, and so does its bind, which
+//! off loopback fails with `EADDRNOTAVAIL` (no such address, for the
+//! sandbox), so port probers skip it. A port with no grant fails with
+//! `EACCES`. A listen port (`network.listen_port`) is a server port and binds
+//! any address.
 //!
 //! Linux only: the address check lives in the proxy-mode seccomp supervisor.
 //! Seatbelt has no loopback-only bind filter (its `localhost` covers every
@@ -69,7 +72,7 @@ fn proxy_mode_open_port_binds_loopback_only() {
         eprintln!("skipping: no system python3 available");
         return;
     };
-    let (open, range_start) = (free_port(), free_port());
+    let (open, range_start, ungranted) = (free_port(), free_port(), free_port());
     let t = nono_test!("tcp-bind-open-port");
     let profile = t.write_profile(
         "tcp-bind-open-port",
@@ -83,6 +86,7 @@ fn proxy_mode_open_port_binds_loopback_only() {
         ("AF_INET", "0.0.0.0", open),
         ("AF_INET", "127.0.0.1", range_start),
         ("AF_INET", "0.0.0.0", range_start),
+        ("AF_INET", "127.0.0.1", ungranted),
     ];
     if ipv6 {
         attempts.push(("AF_INET6", "::", open));
@@ -95,11 +99,12 @@ fn proxy_mode_open_port_binds_loopback_only() {
         .exec(Argv::new(&py).arg("-c").arg(&script))
         .assert_success("the bind probe runs")
         .assert_stdout_contains(&format!("127.0.0.1 {open} OK"))
-        .assert_stdout_contains(&format!("0.0.0.0 {open} EACCES"))
+        .assert_stdout_contains(&format!("0.0.0.0 {open} EADDRNOTAVAIL"))
         .assert_stdout_contains(&format!("127.0.0.1 {range_start} OK"))
-        .assert_stdout_contains(&format!("0.0.0.0 {range_start} EACCES"));
+        .assert_stdout_contains(&format!("0.0.0.0 {range_start} EADDRNOTAVAIL"))
+        .assert_stdout_contains(&format!("127.0.0.1 {ungranted} EACCES"));
     if ipv6 {
-        drop(completed.assert_stdout_contains(&format!(":: {open} EACCES")));
+        drop(completed.assert_stdout_contains(&format!(":: {open} EADDRNOTAVAIL")));
     }
 }
 

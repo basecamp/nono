@@ -773,13 +773,19 @@ fn handle_received_filesystem_notification(
 ///
 /// Split out as an explicit type so the (testable) policy logic is decoupled
 /// from the (untestable) seccomp-notify response plumbing. Callers translate
-/// `Allow` to `continue_notif(…)` and `Deny` to `respond_notif_errno(…, EACCES)`.
+/// `Allow` to `continue_notif(…)`, `Deny` to `respond_notif_errno(…, EACCES)`
+/// and `DenyAddressNotAvailable` to `respond_notif_errno(…, EADDRNOTAVAIL)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum NetworkDecision {
     /// Allow the operation.
     Allow,
     /// Fail the syscall with `EACCES`.
     Deny,
+    /// Fail a bind with `EADDRNOTAVAIL`: the port is open, but only on
+    /// loopback, so to the sandbox no other local address exists for it.
+    /// Port probers (Selenium's `PortProber`) skip an address that answers
+    /// this, where `EACCES` makes them raise.
+    DenyAddressNotAvailable,
     /// A pathname unix socket outside the granted set that the approval
     /// backend may answer; denied when no backend can be consulted.
     Ask {
@@ -954,6 +960,13 @@ pub(super) fn decide_network_notification(
                     port, sockaddr.is_loopback
                 );
                 NetworkDecision::Allow
+            } else if localhost_grant {
+                debug!(
+                    "Proxy seccomp: denying bind on open port {} off loopback \
+                     (EADDRNOTAVAIL)",
+                    port
+                );
+                NetworkDecision::DenyAddressNotAvailable
             } else {
                 debug!(
                     "Proxy seccomp: denying bind on port {} loopback={} (listen ports: {:?}, \
@@ -1459,28 +1472,30 @@ fn handle_received_network_notification(
     }
 
     for sockaddr in &sockaddrs {
-        let approval_denial =
+        let (errno, approval_denial) =
             match decide_network_notification(notif.pid, notif.data.nr, sockaddr, config) {
                 NetworkDecision::Allow => continue,
-                NetworkDecision::Deny => None,
+                NetworkDecision::Deny => (libc::EACCES, None),
+                NetworkDecision::DenyAddressNotAvailable => (libc::EADDRNOTAVAIL, None),
                 NetworkDecision::Ask { path, op } => {
                     match request_unix_socket_approval(config, approval.as_mut(), &path, op) {
                         Ok(decision) => {
                             if !notif_id_valid(notify_fd, notif.id)? {
                                 return Ok(());
                             }
-                            match decision {
+                            let reason = match decision {
                                 ApprovalDecision::Granted | ApprovalDecision::GrantedForSession => {
                                     continue;
                                 }
                                 ApprovalDecision::Denied { reason } => {
-                                    Some(format!("approval denied: {reason}"))
+                                    format!("approval denied: {reason}")
                                 }
                                 ApprovalDecision::DeniedForSession => {
-                                    Some("approval denied for this session".to_string())
+                                    "approval denied for this session".to_string()
                                 }
-                                ApprovalDecision::Timeout => Some("approval timed out".to_string()),
-                            }
+                                ApprovalDecision::Timeout => "approval timed out".to_string(),
+                            };
+                            (libc::EACCES, Some(reason))
                         }
                         Err(e) => {
                             let _ = respond_notif_errno(notify_fd, notif.id, libc::EACCES);
@@ -1503,7 +1518,7 @@ fn handle_received_network_notification(
                 approval_denial.as_deref(),
             );
         }
-        respond_notif_errno(notify_fd, notif.id, libc::EACCES)?;
+        respond_notif_errno(notify_fd, notif.id, errno)?;
         if record
             && let Err(err) = record_network_audit_denial(
                 config,
@@ -3449,8 +3464,9 @@ mod tests {
                 for sockaddr in [inet_external(port), inet6(port, false)] {
                     assert_eq!(
                         decide_network_notification(test_pid(), SYS_BIND, &sockaddr, &config),
-                        NetworkDecision::Deny,
-                        "non-loopback bind on open port {port} (family {}) must be denied",
+                        NetworkDecision::DenyAddressNotAvailable,
+                        "non-loopback bind on open port {port} (family {}) must be refused \
+                         as EADDRNOTAVAIL",
                         sockaddr.family
                     );
                 }
@@ -3465,10 +3481,15 @@ mod tests {
             let config = make_config_with_ranges(&backend, 0, vec![], vec![(49152, 49200)], &[]);
             assert_eq!(
                 decide_network_notification(test_pid(), SYS_BIND, &inet_external(49160), &config),
-                NetworkDecision::Deny
+                NetworkDecision::DenyAddressNotAvailable
             );
             assert_eq!(
                 decide_network_notification(test_pid(), SYS_BIND, &inet6(49160, false), &config),
+                NetworkDecision::DenyAddressNotAvailable
+            );
+            // A port with no grant at all stays EACCES, on any address.
+            assert_eq!(
+                decide_network_notification(test_pid(), SYS_BIND, &inet_external(40000), &config),
                 NetworkDecision::Deny
             );
         }
