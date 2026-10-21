@@ -2817,6 +2817,14 @@ pub fn bind_notif_socket_in_range(
     // SAFETY: pidfd_getfd returned a new fd that nothing else owns.
     let socket = unsafe { OwnedFd::from_raw_fd(socket as libc::c_int) };
 
+    // The descriptor taken must be the calling thread's own: through a
+    // thread-group pidfd (kernels before 6.9) it comes from the leader's
+    // table, which a worker that unshared its table no longer uses.
+    // `/proc/<tid>/fd` always shows the calling thread's table.
+    if !same_socket(socket.as_raw_fd(), pid, child_fd) {
+        return Ok(RangeBindOutcome::Failed(libc::EACCES));
+    }
+
     let mut sock_type: libc::c_int = 0;
     let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
     // SAFETY: getsockopt writes at most `len` bytes into `sock_type`, a
@@ -2888,6 +2896,21 @@ fn open_notif_pidfd(tid: libc::pid_t) -> Result<std::os::fd::OwnedFd> {
         .and_then(|value| value.trim().parse::<libc::pid_t>().ok())
         .ok_or_else(|| NonoError::SandboxInit(format!("no Tgid in /proc/{tid}/status")))?;
     open(tgid, 0).map_err(|err| NonoError::SandboxInit(format!("pidfd_open({tgid}) failed: {err}")))
+}
+
+/// Whether `fd` (in this process) is the socket that thread `tid` holds as
+/// descriptor `child_fd`: `/proc/<tid>/fd/<child_fd>` names `socket:[ino]`
+/// for the inode `fd` has. Any failure to tell is `false`.
+fn same_socket(fd: std::os::fd::RawFd, tid: libc::pid_t, child_fd: libc::c_int) -> bool {
+    // SAFETY: an all-zero `stat` is a valid value for fstat to overwrite.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: fstat writes into `st`, a properly sized stat buffer.
+    if unsafe { libc::fstat(fd, &mut st) } != 0 {
+        return false;
+    }
+    std::fs::read_link(format!("/proc/{tid}/fd/{child_fd}"))
+        .map(|target| target.as_os_str() == format!("socket:[{}]", st.st_ino).as_str())
+        .unwrap_or(false)
 }
 
 /// Bind `fd` on `ip` to the first free port of `start..=end`, trying from
@@ -5970,6 +5993,21 @@ mod tests {
             RangeBindOutcome::Failed(libc::EINVAL),
             "another error is returned as is (an already-bound socket)"
         );
+    }
+
+    #[test]
+    fn test_same_socket_matches_only_the_descriptor_named() {
+        use std::os::fd::AsRawFd;
+        let first = new_tcp_socket();
+        let second = new_tcp_socket();
+        // SAFETY: getpid has no preconditions.
+        let pid = unsafe { libc::getpid() };
+        assert!(same_socket(first.as_raw_fd(), pid, first.as_raw_fd()));
+        assert!(
+            !same_socket(first.as_raw_fd(), pid, second.as_raw_fd()),
+            "another socket at the descriptor number is not the same socket"
+        );
+        assert!(!same_socket(first.as_raw_fd(), pid, 9999), "a closed descriptor is not");
     }
 
     #[test]
