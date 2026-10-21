@@ -129,28 +129,26 @@ fn proxy_mode_listen_port_binds_any_address() {
         .assert_stdout_contains(&format!("0.0.0.0 {listen} OK"));
 }
 
-/// The start of a block of `len` loopback ports below the host's ephemeral
-/// range that are free right now.
-fn free_block_below_host_ephemeral(len: u16) -> u16 {
+/// The start of a block of `len` unprivileged loopback ports outside the
+/// host's ephemeral range that are free right now, or `None` when the host
+/// leaves no such block.
+fn free_block_outside_host_ephemeral(len: u16) -> Option<u16> {
     let raw = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range")
         .expect("read the host's ephemeral port range");
-    let host_start: u16 = raw
-        .split_whitespace()
-        .next()
-        .and_then(|s| s.parse().ok())
-        .expect("parse the host's ephemeral port range");
-    let pid_spread = (std::process::id() % 4000) as u16;
-    for attempt in 0..200u16 {
-        let start = 20000 + (pid_spread + attempt * 37) % 8000;
-        let end = start + len - 1;
-        if end >= host_start {
-            continue;
-        }
-        if (start..=end).all(|port| TcpListener::bind(("127.0.0.1", port)).is_ok()) {
-            return start;
+    let mut bounds = raw.split_whitespace().filter_map(|s| s.parse::<u32>().ok());
+    let (host_start, host_end) = (bounds.next()?, bounds.next()?);
+    let len = u32::from(len);
+    let candidates = (1024..host_start.saturating_sub(len))
+        .chain(host_end + 1..65536u32.saturating_sub(len))
+        .step_by(97);
+    for start in candidates {
+        let all_free =
+            (start..start + len).all(|port| TcpListener::bind(("127.0.0.1", port as u16)).is_ok());
+        if all_free {
+            return Some(start as u16);
         }
     }
-    panic!("no free block of {len} ports below {host_start}");
+    None
 }
 
 /// Python that binds loopback port 0 the way a test server does, connects to
@@ -200,7 +198,10 @@ fn proxy_mode_port_zero_bind_uses_ephemeral_port_range() {
         eprintln!("skipping: no system python3 available");
         return;
     };
-    let start = free_block_below_host_ephemeral(10);
+    let Some(start) = free_block_outside_host_ephemeral(10) else {
+        eprintln!("skipping: no free port block outside the host's ephemeral range");
+        return;
+    };
     let end = start + 9;
     // A host process's own port-0 listener, on the host's ephemeral range.
     let host_listener = TcpListener::bind("127.0.0.1:0").expect("bind a host listener");

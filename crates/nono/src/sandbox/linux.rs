@@ -6007,7 +6007,10 @@ mod tests {
             !same_socket(first.as_raw_fd(), pid, second.as_raw_fd()),
             "another socket at the descriptor number is not the same socket"
         );
-        assert!(!same_socket(first.as_raw_fd(), pid, 9999), "a closed descriptor is not");
+        assert!(
+            !same_socket(first.as_raw_fd(), pid, 9999),
+            "a closed descriptor is not"
+        );
     }
 
     #[test]
