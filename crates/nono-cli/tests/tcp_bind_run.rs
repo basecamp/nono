@@ -28,6 +28,12 @@ fn python3_bin() -> Option<String> {
         .map(str::to_string)
 }
 
+/// Whether this host can open IPv6 TCP sockets on loopback (it can't when
+/// booted with `ipv6.disable=1`).
+fn host_has_ipv6() -> bool {
+    TcpListener::bind("[::1]:0").is_ok()
+}
+
 /// A TCP port that is free on the host right now.
 fn free_port() -> u16 {
     TcpListener::bind("127.0.0.1:0")
@@ -71,23 +77,30 @@ fn proxy_mode_open_port_binds_loopback_only() {
             r#"{{"meta":{{"name":"tcp-bind-open-port"}},"workdir":{{"access":"readwrite"}},"network":{{"allow_domain":["example.com"],"open_port":[{open}],"open_port_range":[[{range_start},{range_start}]]}}}}"#
         ),
     );
-    let script = bind_script(&[
+    let ipv6 = host_has_ipv6();
+    let mut attempts = vec![
         ("AF_INET", "127.0.0.1", open),
         ("AF_INET", "0.0.0.0", open),
-        ("AF_INET6", "::", open),
         ("AF_INET", "127.0.0.1", range_start),
         ("AF_INET", "0.0.0.0", range_start),
-    ]);
+    ];
+    if ipv6 {
+        attempts.push(("AF_INET6", "::", open));
+    }
+    let script = bind_script(&attempts);
 
-    t.run()
+    let completed = t
+        .run()
         .profile(&profile)
         .exec(Argv::new(&py).arg("-c").arg(&script))
         .assert_success("the bind probe runs")
         .assert_stdout_contains(&format!("127.0.0.1 {open} OK"))
         .assert_stdout_contains(&format!("0.0.0.0 {open} EACCES"))
-        .assert_stdout_contains(&format!(":: {open} EACCES"))
         .assert_stdout_contains(&format!("127.0.0.1 {range_start} OK"))
         .assert_stdout_contains(&format!("0.0.0.0 {range_start} EACCES"));
+    if ipv6 {
+        drop(completed.assert_stdout_contains(&format!(":: {open} EACCES")));
+    }
 }
 
 #[test]
