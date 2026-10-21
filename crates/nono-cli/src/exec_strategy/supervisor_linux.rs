@@ -753,13 +753,30 @@ fn handle_received_filesystem_notification(
 ///
 /// Split out as an explicit type so the (testable) policy logic is decoupled
 /// from the (untestable) seccomp-notify response plumbing. Callers translate
-/// `Allow` to `continue_notif(…)` and `Deny` to `respond_notif_errno(…, EACCES)`.
+/// `Allow` to `continue_notif(…)`, `Deny` to `respond_notif_errno(…, EACCES)`
+/// and `DenyAddressNotAvailable` to `respond_notif_errno(…, EADDRNOTAVAIL)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum NetworkDecision {
     /// Allow the operation.
     Allow,
     /// Fail the syscall with `EACCES`.
     Deny,
+    /// Fail a bind with `EADDRNOTAVAIL`: the port is open, but only on
+    /// loopback, so to the sandbox no other local address exists for it.
+    /// Port probers (Selenium's `PortProber`) skip an address that answers
+    /// this, where `EACCES` makes them raise.
+    DenyAddressNotAvailable,
+}
+
+impl NetworkDecision {
+    /// The errno a denial returns to the child, or `None` for `Allow`.
+    fn errno(self) -> Option<i32> {
+        match self {
+            Self::Allow => None,
+            Self::Deny => Some(libc::EACCES),
+            Self::DenyAddressNotAvailable => Some(libc::EADDRNOTAVAIL),
+        }
+    }
 }
 
 /// Whether a trapped network syscall on address `family` carries no policy
@@ -924,6 +941,13 @@ pub(super) fn decide_network_notification(
                     port, sockaddr.is_loopback
                 );
                 NetworkDecision::Allow
+            } else if localhost_grant {
+                debug!(
+                    "Proxy seccomp: denying bind on open port {} off loopback \
+                     (EADDRNOTAVAIL)",
+                    port
+                );
+                NetworkDecision::DenyAddressNotAvailable
             } else {
                 debug!(
                     "Proxy seccomp: denying bind on port {} loopback={} (listen ports: {:?}, \
@@ -1328,9 +1352,10 @@ fn handle_received_network_notification(
     }
 
     for sockaddr in &sockaddrs {
-        match decide_network_notification(notif.pid, notif.data.nr, sockaddr, config) {
-            NetworkDecision::Allow => {}
-            NetworkDecision::Deny => {
+        let decision = decide_network_notification(notif.pid, notif.data.nr, sockaddr, config);
+        match decision.errno() {
+            None => {}
+            Some(errno) => {
                 // Enforcement is unconditional: the throttle only bounds how
                 // much bookkeeping this denial may create.
                 let record = network_throttle.admit();
@@ -1344,7 +1369,7 @@ fn handle_received_network_notification(
                         ipc_denials,
                     );
                 }
-                respond_notif_errno(notify_fd, notif.id, libc::EACCES)?;
+                respond_notif_errno(notify_fd, notif.id, errno)?;
                 if record
                     && let Err(err) = record_network_audit_denial(config, sockaddr, notif.data.nr)
                 {
@@ -2816,8 +2841,9 @@ mod tests {
                 for sockaddr in [inet_external(port), inet6(port, false)] {
                     assert_eq!(
                         decide_network_notification(test_pid(), SYS_BIND, &sockaddr, &config),
-                        NetworkDecision::Deny,
-                        "non-loopback bind on open port {port} (family {}) must be denied",
+                        NetworkDecision::DenyAddressNotAvailable,
+                        "non-loopback bind on open port {port} (family {}) must be refused \
+                         as EADDRNOTAVAIL",
                         sockaddr.family
                     );
                 }
@@ -2832,10 +2858,15 @@ mod tests {
             let config = make_config_with_ranges(&backend, 0, vec![], vec![(49152, 49200)], &[]);
             assert_eq!(
                 decide_network_notification(test_pid(), SYS_BIND, &inet_external(49160), &config),
-                NetworkDecision::Deny
+                NetworkDecision::DenyAddressNotAvailable
             );
             assert_eq!(
                 decide_network_notification(test_pid(), SYS_BIND, &inet6(49160, false), &config),
+                NetworkDecision::DenyAddressNotAvailable
+            );
+            // A port with no grant at all stays EACCES, on any address.
+            assert_eq!(
+                decide_network_notification(test_pid(), SYS_BIND, &inet_external(40000), &config),
                 NetworkDecision::Deny
             );
         }
