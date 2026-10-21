@@ -493,22 +493,6 @@ fn push_localhost_tcp_outbound_seatbelt_rules(
     }
 }
 
-/// Emit the Seatbelt bind/inbound rules for TCP port grants.
-///
-/// Seatbelt cannot filter `network-bind` by port, only by address. A listen
-/// port (`bind_ports`) is a server port and binds on any address; localhost
-/// IPC ports (`localhost_ports`, `localhost_port_ranges`) bind only on a
-/// loopback address, as their `connect` reaches only `localhost`, so a dev
-/// server binding `0.0.0.0` or a LAN address is refused rather than exposed.
-fn push_localhost_bind_seatbelt_rules(profile: &mut String, any_address: bool) {
-    if any_address {
-        profile.push_str("(allow network-bind)\n");
-    } else {
-        profile.push_str("(allow network-bind (local ip \"localhost:*\"))\n");
-    }
-    profile.push_str("(allow network-inbound)\n");
-}
-
 /// Generate a Seatbelt profile from capabilities
 ///
 /// This is a pure primitive - it generates rules ONLY for paths in the CapabilitySet.
@@ -874,7 +858,9 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
                     localhost_ports,
                     &merged_ranges,
                 );
-                push_localhost_bind_seatbelt_rules(&mut profile, false);
+                // Seatbelt cannot filter bind/inbound by port
+                profile.push_str("(allow network-bind)\n");
+                profile.push_str("(allow network-inbound)\n");
             }
         }
         NetworkMode::ProxyOnly { port, bind_ports } => {
@@ -903,10 +889,10 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
             );
             // If bind ports or localhost IPC ports are specified, allow network-bind
             // and network-inbound. Seatbelt cannot filter bind/inbound by port,
-            // so a listen port binds any port on any address, and localhost IPC
-            // ports alone bind any port on loopback only.
+            // so this is a blanket allow.
             if !bind_ports.is_empty() || has_localhost_tcp {
-                push_localhost_bind_seatbelt_rules(&mut profile, !bind_ports.is_empty());
+                profile.push_str("(allow network-bind)\n");
+                profile.push_str("(allow network-inbound)\n");
             }
         }
         NetworkMode::AllowAll => {
@@ -2188,9 +2174,7 @@ mod tests {
         assert!(profile.contains("(deny network*)"));
         assert!(profile.contains("(allow network-outbound (remote tcp \"localhost:3000\"))"));
         assert!(profile.contains("(allow network-outbound (remote tcp \"localhost:5000\"))"));
-        // Localhost IPC ports bind on loopback only, never 0.0.0.0 or a LAN address
-        assert!(profile.contains("(allow network-bind (local ip \"localhost:*\"))"));
-        assert!(!profile.contains("(allow network-bind)"));
+        assert!(profile.contains("(allow network-bind)"));
         assert!(profile.contains("(allow network-inbound)"));
         assert!(profile.contains("(allow system-socket"));
         // Should allow DNS via mDNSResponder Unix socket (#588)
@@ -2213,8 +2197,7 @@ mod tests {
         assert!(profile.contains("(deny network*)"));
         assert!(profile.contains("(allow network-outbound (remote tcp \"localhost:*\"))"));
         assert!(!profile.contains("(allow network-outbound (remote tcp \"localhost:0\"))"));
-        assert!(profile.contains("(allow network-bind (local ip \"localhost:*\"))"));
-        assert!(!profile.contains("(allow network-bind)"));
+        assert!(profile.contains("(allow network-bind)"));
         assert!(profile.contains("(allow network-inbound)"));
     }
 
@@ -2243,9 +2226,8 @@ mod tests {
         assert!(profile.contains("(allow network-outbound (remote tcp \"localhost:54321\"))"));
         // Localhost IPC port
         assert!(profile.contains("(allow network-outbound (remote tcp \"localhost:3000\"))"));
-        // Bind/inbound enabled because localhost_ports is non-empty, bind on loopback only
-        assert!(profile.contains("(allow network-bind (local ip \"localhost:*\"))"));
-        assert!(!profile.contains("(allow network-bind)"));
+        // Bind/inbound enabled because localhost_ports is non-empty
+        assert!(profile.contains("(allow network-bind)"));
         assert!(profile.contains("(allow network-inbound)"));
     }
 
@@ -2402,9 +2384,8 @@ mod tests {
         assert!(profile.contains("(allow network-outbound (remote tcp \"localhost:3000\"))"));
         assert!(profile.contains("(allow network-outbound (remote tcp \"localhost:3001\"))"));
         assert!(profile.contains("(allow network-outbound (remote tcp \"localhost:3002\"))"));
-        assert!(!profile.contains("(remote tcp \"localhost:*\")"));
-        assert!(profile.contains("(allow network-bind (local ip \"localhost:*\"))"));
-        assert!(!profile.contains("(allow network-bind)"));
+        assert!(!profile.contains("localhost:*"));
+        assert!(profile.contains("(allow network-bind)"));
     }
 
     #[test]
@@ -2417,7 +2398,7 @@ mod tests {
 
         assert!(profile.contains("(allow network-outbound (remote tcp \"localhost:1000\"))"));
         assert!(profile.contains("(allow network-outbound (remote tcp \"localhost:1999\"))"));
-        assert!(!profile.contains("(remote tcp \"localhost:*\")"));
+        assert!(!profile.contains("localhost:*"));
     }
 
     #[test]
@@ -2468,7 +2449,7 @@ mod tests {
         assert!(profile.contains("(allow network-outbound (remote tcp \"localhost:3001\"))"));
         assert!(profile.contains("(allow network-outbound (remote tcp \"localhost:8000\"))"));
         assert!(profile.contains("(allow network-outbound (remote tcp \"localhost:8001\"))"));
-        assert!(!profile.contains("(remote tcp \"localhost:*\")"));
+        assert!(!profile.contains("localhost:*"));
     }
 
     #[test]
@@ -2482,21 +2463,6 @@ mod tests {
         assert!(profile.contains("(allow network-outbound (remote tcp \"localhost:4000\"))"));
         assert!(profile.contains("(allow network-outbound (remote tcp \"localhost:4001\"))"));
         assert!(profile.contains("(allow network-outbound (remote tcp \"localhost:4002\"))"));
-        assert!(profile.contains("(allow network-bind (local ip \"localhost:*\"))"));
-        assert!(!profile.contains("(allow network-bind)"));
-    }
-
-    /// A listen port is a server port and keeps its any-address bind, also
-    /// when localhost IPC ports are granted beside it.
-    #[test]
-    fn test_generate_profile_proxy_listen_port_with_localhost_ports_binds_any_address() {
-        let caps = CapabilitySet::new()
-            .proxy_only_with_bind(54321, vec![18789])
-            .allow_localhost_port(3000);
-        let profile = generate_profile(&caps).unwrap();
-
-        assert!(profile.contains("(allow network-bind)\n"));
-        assert!(!profile.contains("(local ip \"localhost:*\")"));
-        assert!(profile.contains("(allow network-inbound)"));
+        assert!(profile.contains("(allow network-bind)"));
     }
 }

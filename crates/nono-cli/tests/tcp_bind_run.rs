@@ -5,8 +5,8 @@
 //! listen port (`network.listen_port`) is a server port and binds any address.
 //!
 //! Linux only: the address check lives in the proxy-mode seccomp supervisor.
-//! macOS gets the same rule from its generated Seatbelt profile, which the
-//! `sandbox::macos` unit tests cover.
+//! Seatbelt has no loopback-only bind filter (its `localhost` covers every
+//! address the machine owns), so macOS keeps an any-address bind.
 
 #![cfg(target_os = "linux")]
 
