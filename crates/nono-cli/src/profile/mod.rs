@@ -1324,6 +1324,11 @@ fn validate_profile_domain_patterns(profile: &Profile) -> Result<()> {
             NonoError::ProfileParse(format!("network.deny_domain entry invalid: {err}"))
         })?;
     }
+    profile
+        .network
+        .resolved_addresses
+        .validate()
+        .map_err(|err| NonoError::ProfileParse(format!("network.{err}")))?;
     Ok(())
 }
 
@@ -1843,6 +1848,17 @@ pub struct NetworkConfig {
     /// Hosts to bypass the upstream proxy and route directly.
     #[serde(default, rename = "upstream_bypass")]
     pub upstream_bypass: Vec<String>,
+    /// Which addresses a host the proxy resolves may connect to.
+    ///
+    /// With `public_only`, an allowed name that resolves to a loopback,
+    /// private, shared (CGNAT) or unspecified address is refused unless
+    /// `exceptions` permits that class for it. Merged: `public_only` holds if
+    /// any layer sets it; exception classes accumulate.
+    #[serde(
+        default,
+        skip_serializing_if = "nono_proxy::config::ResolvedAddressPolicy::is_default"
+    )]
+    pub resolved_addresses: nono_proxy::config::ResolvedAddressPolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3819,6 +3835,10 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
                 &base.network.upstream_bypass,
                 &child.network.upstream_bypass,
             ),
+            resolved_addresses: base
+                .network
+                .resolved_addresses
+                .merged_with(&child.network.resolved_addresses),
         },
         linux: LinuxConfig {
             af_unix_mediation: child
@@ -6850,6 +6870,7 @@ mod tests {
                 tls_intercept: None,
                 upstream_proxy: None,
                 upstream_bypass: Vec::new(),
+                resolved_addresses: Default::default(),
             },
             diagnostics: DiagnosticsConfig::default(),
             linux: LinuxConfig::default(),
@@ -6941,6 +6962,7 @@ mod tests {
                 tls_intercept: None,
                 upstream_proxy: None,
                 upstream_bypass: Vec::new(),
+                resolved_addresses: Default::default(),
             },
             diagnostics: DiagnosticsConfig::default(),
             linux: LinuxConfig::default(),
@@ -8961,6 +8983,61 @@ mod tests {
         assert!(network.contains_key("no_proxy"));
         assert!(network.contains_key("upstream_proxy"));
         assert!(network.contains_key("upstream_bypass"));
+    }
+
+    #[test]
+    fn test_network_resolved_addresses_parse_merge_and_validate() -> Result<()> {
+        let base = parse_profile_bytes(
+            br#"{
+                "meta": { "name": "addresses-base" },
+                "network": { "resolved_addresses": { "public_only": true } }
+            }"#,
+        )?;
+        let child = parse_profile_bytes(
+            br#"{
+                "meta": { "name": "addresses-child" },
+                "network": {
+                    "allow_domain": ["console.int.example"],
+                    "resolved_addresses": { "exceptions": { "console.int.example": ["private"] } }
+                }
+            }"#,
+        )?;
+        assert!(!child.network.resolved_addresses.public_only);
+        let merged = merge_profiles(base, child);
+        assert!(
+            merged.network.resolved_addresses.public_only,
+            "public_only from any layer holds"
+        );
+        assert_eq!(
+            merged.network.resolved_addresses.exceptions["console.int.example"],
+            vec![nono::net_filter::AddressClass::Private]
+        );
+        let serialized = serde_json::to_value(&merged).expect("serialize profile");
+        assert_eq!(
+            serialized["network"]["resolved_addresses"]["public_only"],
+            serde_json::Value::Bool(true)
+        );
+        // The default is left out of serialized profiles.
+        let plain = parse_profile_bytes(br#"{ "meta": { "name": "plain" } }"#)?;
+        let serialized = serde_json::to_value(&plain).expect("serialize profile");
+        assert!(serialized["network"].get("resolved_addresses").is_none());
+
+        for bad in [
+            r#"{"public_only": true, "exceptions": {"a.example": ["link_local"]}}"#,
+            r#"{"exceptions": {"a.example": []}}"#,
+            r#"{"exceptions": {"*a.example": ["private"]}}"#,
+            r#"{"exceptions": {"a.example": ["public"]}}"#,
+            r#"{"public_only": true, "allow": {}}"#,
+        ] {
+            let json = format!(
+                r#"{{ "meta": {{ "name": "bad" }}, "network": {{ "resolved_addresses": {bad} }} }}"#
+            );
+            assert!(
+                parse_profile_bytes(json.as_bytes()).is_err(),
+                "must refuse resolved_addresses {bad}"
+            );
+        }
+        Ok(())
     }
 
     #[test]
