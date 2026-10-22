@@ -966,13 +966,15 @@ pub struct CapabilitySet {
     /// TCP ports allowed for bidirectional IPC (connect + bind).
     /// These apply regardless of NetworkMode.
     ///
-    /// On macOS (Seatbelt), outbound is scoped to localhost per-port.
+    /// On macOS (Seatbelt), outbound is scoped to localhost per-port; bind is
+    /// unrestricted, as Seatbelt's `localhost` local-address filter covers
+    /// every address the machine owns, not only loopback.
     /// On Linux (Landlock), ConnectTcp/BindTcp filter by port only, not by
     /// destination or bind address, and `--block-net` doesn't narrow this
     /// grant to localhost either. `NetworkMode::ProxyOnly` gets real
-    /// destination-host enforcement from nono-cli's seccomp-notify layer
-    /// (`SeccompPolicy::proxy_fallback`); this port grant has no such layer
-    /// and stays port-only on Linux.
+    /// destination-host enforcement, and a loopback-only bind, from
+    /// nono-cli's seccomp-notify layer (`SeccompPolicy::proxy_fallback`);
+    /// outside it this port grant stays port-only on Linux.
     localhost_ports: Vec<u16>,
     /// Inclusive port ranges for bidirectional localhost IPC (connect + bind).
     ///
