@@ -461,6 +461,7 @@ The `network` section controls network access and credential injection.
 | `custom_credentials` | Custom credential service definitions for APIs not in the built-in list |
 | `upstream_proxy` | Upstream (enterprise) proxy address, e.g., `squid.corp:3128` |
 | `upstream_bypass` | Domains to bypass the upstream proxy (exact hostnames and `*.` wildcards) |
+| `resolved_addresses` | `public_only: true` refuses an allowed name that resolves to a loopback, private, shared (CGNAT) or unspecified address; `exceptions` names the classes (`loopback`, `private`, `cgnat`) a host may resolve to. See [Public Addresses Only](/cli/features/networking#public-addresses-only) |
 
 #### Custom Credentials
 

@@ -1050,7 +1050,8 @@ pub(crate) fn cmd_show(args: ProfileShowArgs) -> Result<()> {
         || !net.listen_port.is_empty()
         || !net.no_proxy.is_empty()
         || net.upstream_proxy.is_some()
-        || !net.upstream_bypass.is_empty();
+        || !net.upstream_bypass.is_empty()
+        || !net.resolved_addresses.is_default();
 
     if has_net {
         println!();
@@ -1148,6 +1149,13 @@ pub(crate) fn cmd_show(args: ProfileShowArgs) -> Result<()> {
                 "    {}: {}",
                 theme::fg("upstream_bypass", t.subtext),
                 net.upstream_bypass.join(", ")
+            );
+        }
+        if !net.resolved_addresses.is_default() {
+            println!(
+                "    {}: {}",
+                theme::fg("resolved_addresses", t.subtext),
+                resolved_address_lines(&net.resolved_addresses).join("; ")
             );
         }
     }
@@ -1359,6 +1367,7 @@ fn profile_to_json(
         "no_proxy": profile.network.no_proxy,
         "upstream_proxy": profile.network.upstream_proxy,
         "upstream_bypass": profile.network.upstream_bypass,
+        "resolved_addresses": profile.network.resolved_addresses,
     });
 
     // Workdir. Serde renders WorkdirAccess as lowercase via rename_all.
@@ -1639,6 +1648,11 @@ pub(crate) fn cmd_diff(args: ProfileDiffArgs) -> Result<()> {
             "upstream_bypass",
             &p1.network.upstream_bypass,
             &p2.network.upstream_bypass,
+        ),
+        (
+            "resolved_addresses",
+            &resolved_address_lines(&p1.network.resolved_addresses),
+            &resolved_address_lines(&p2.network.resolved_addresses),
         ),
     ]);
 
@@ -2051,6 +2065,20 @@ fn diff_scalar_option(
     true
 }
 
+/// `network.resolved_addresses` as display lines: `public_only`, then one
+/// `exception <pattern>: <classes>` line per exception.
+fn resolved_address_lines(policy: &nono_proxy::config::ResolvedAddressPolicy) -> Vec<String> {
+    let mut lines = Vec::new();
+    if policy.public_only {
+        lines.push("public_only".to_string());
+    }
+    for (pattern, classes) in &policy.exceptions {
+        let classes: Vec<&str> = classes.iter().map(|c| c.as_str()).collect();
+        lines.push(format!("exception {pattern}: {}", classes.join(", ")));
+    }
+    lines
+}
+
 fn diff_string_vecs<'a>(
     pairs: &[(&'a str, &[String], &[String])],
 ) -> Vec<(&'a str, &'static str, String)> {
@@ -2180,6 +2208,11 @@ fn diff_to_json(name1: &str, name2: &str, p1: &Profile, p2: &Profile) -> serde_j
                 &p1.network.no_proxy,
                 &p2.network.no_proxy,
             ),
+            "resolved_addresses": {
+                "profile1": p1.network.resolved_addresses,
+                "profile2": p2.network.resolved_addresses,
+                "changed": p1.network.resolved_addresses != p2.network.resolved_addresses,
+            },
             "custom_credentials": diff_custom_credentials_json(
                 &p1.network.custom_credentials,
                 &p2.network.custom_credentials,
