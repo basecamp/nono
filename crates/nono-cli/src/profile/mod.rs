@@ -2331,8 +2331,12 @@ pub enum LinuxSandboxPolicy {
     /// Landlock only. Returns an error at startup if the kernel cannot
     /// satisfy network restrictions via Landlock alone.
     ///
-    /// Never installs a seccomp-notify listener. Since Landlock's TCP rules
-    /// filter by port only, `NetworkMode::ProxyOnly` under this policy cannot
+    /// Installs none of nono's network seccomp: no static baseline and no
+    /// proxy-mode notify layer. A seccomp-notify listener is still installed
+    /// for an opt-in feature that needs one: `linux.af_unix_mediation`,
+    /// `linux.metadata_mediation`, capability elevation, or GPU thread-name
+    /// mediation (`--allow-gpu`). Since Landlock's TCP rules filter by port
+    /// only, `NetworkMode::ProxyOnly` under this policy cannot
     /// restrict the child to 127.0.0.1:<port> — any host on that port is
     /// reachable. Use `Auto` for real destination-host enforcement.
     Landlock,

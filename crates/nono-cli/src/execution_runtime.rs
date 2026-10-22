@@ -638,8 +638,10 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
     #[cfg(target_os = "linux")]
     let seccomp_proxy_fallback = {
         let needs_proxy = matches!(caps.network_mode(), nono::NetworkMode::ProxyOnly { .. });
-        // Landlock policy opts out of seccomp-notify entirely (see its docs);
-        // honor that even though it leaves ProxyOnly's destination check unenforced.
+        // Landlock policy opts out of nono's network seccomp, the proxy-mode
+        // notify layer included (see its docs); honor that even though it
+        // leaves ProxyOnly's destination check unenforced. Opt-in mediations
+        // (AF_UNIX, file metadata) still install their listener.
         let no_seccomp_fallback = matches!(
             flags.sandbox_policy,
             crate::profile::LinuxSandboxPolicy::External
