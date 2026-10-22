@@ -4124,6 +4124,8 @@ mod tests {
             #[cfg(target_os = "linux")]
             af_unix_mediation: crate::profile::LinuxAfUnixMediation::Off,
             #[cfg(target_os = "linux")]
+            metadata_mediation: crate::profile::LinuxMetadataMediation::Off,
+            #[cfg(target_os = "linux")]
             sandbox_policy: crate::profile::LinuxSandboxPolicy::Auto,
             #[cfg(target_os = "linux")]
             explicit_sandbox_policy: None,
@@ -4203,6 +4205,8 @@ mod tests {
             #[cfg(target_os = "linux")]
             af_unix_mediation: crate::profile::LinuxAfUnixMediation::Off,
             #[cfg(target_os = "linux")]
+            metadata_mediation: crate::profile::LinuxMetadataMediation::Off,
+            #[cfg(target_os = "linux")]
             sandbox_policy: crate::profile::LinuxSandboxPolicy::Auto,
             #[cfg(target_os = "linux")]
             explicit_sandbox_policy: None,
@@ -4276,6 +4280,8 @@ mod tests {
             wsl2_proxy_policy: crate::profile::Wsl2ProxyPolicy::Error,
             #[cfg(target_os = "linux")]
             af_unix_mediation: crate::profile::LinuxAfUnixMediation::Off,
+            #[cfg(target_os = "linux")]
+            metadata_mediation: crate::profile::LinuxMetadataMediation::Off,
             #[cfg(target_os = "linux")]
             sandbox_policy: crate::profile::LinuxSandboxPolicy::Auto,
             #[cfg(target_os = "linux")]

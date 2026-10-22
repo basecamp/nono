@@ -184,6 +184,56 @@ need.
   agent.
 </Warning>
 
+## File Mode and Timestamp Mediation
+
+Landlock mediates reading, writing, creating, removing, linking, renaming and
+truncating files. It does not mediate changes to a file's mode bits
+(`chmod(2)`, `fchmod(2)`, `fchmodat(2)`, `fchmodat2(2)`) or timestamps
+(`utime(2)`, `utimes(2)`, `futimesat(2)`, `utimensat(2)`). Without further
+mediation, a sandboxed process can make any file it can name unreadable,
+executable or world-writable (within what its user may do anyway), and can
+back-date or forward-date it, including files it has no grant to read.
+
+This mediation is off by default. Profiles can opt in:
+
+```json
+{
+  "linux": {
+    "metadata_mediation": "write_grants"
+  }
+}
+```
+
+When enabled, those calls succeed only where Landlock would allow a write: the
+target lies within a write grant (a directory grant covers its subtree, a file
+grant only that file), or the process names it through a descriptor it holds
+open for writing. Anything else returns `EACCES`.
+
+The supervisor resolves each call's target itself, from the calling thread's
+working directory, root and descriptor table, decides on the inode it opened,
+and applies the change to that same inode. The original syscall never runs, so
+a multi-threaded process cannot race the decision by rewriting the pathname,
+swapping a symlink or reassigning a descriptor number. Procfs magic links other
+than the caller's own `/proc/self/fd/N` are refused, since they would resolve
+in the supervisor's context.
+
+`flock(2)` is not mediated. It needs an open descriptor, and Landlock already
+requires read access to open one (an `O_PATH` descriptor cannot be locked), so
+a process can only lock files it may read. Shared locks on read-only files are
+common (package managers and build tools take them on read-only caches);
+requiring a write grant would break them, and gating only exclusive locks
+would not stop a reader from holding a shared lock that blocks a writer.
+
+Mode and timestamp changes become a supervisor round trip each. `cp -p`, `tar`
+and `rsync -t` issue one or two per file. Like pathname AF_UNIX mediation, this
+mode needs seccomp user notification (unavailable on WSL2), is not available to
+`nono wrap`, and denies syscalls made through a non-native ABI (32-bit
+binaries on a 64-bit kernel).
+
+Ownership changes (`chown(2)` to a group the user belongs to) and extended
+attributes (`setxattr(2)`, including through io_uring) are likewise outside
+Landlock and are not covered by this mode.
+
 ## Enforcement Status
 
 nono reports the enforcement status after applying the sandbox:
