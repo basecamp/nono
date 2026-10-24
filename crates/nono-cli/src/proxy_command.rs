@@ -371,6 +371,9 @@ fn build_launch_options(args: &ProxyArgs) -> Result<ProxyLaunchOptions> {
         credential_routes,
         session_id: crate::session::generate_session_id(),
         enable_h2,
+        resolved_addresses: network
+            .map(|n| n.resolved_addresses.clone())
+            .unwrap_or_default(),
         ..ProxyLaunchOptions::default()
     })
 }
@@ -584,6 +587,39 @@ mod tests {
         let args = parse_args(&["--profile", profile_path.to_str().expect("valid utf8")]);
         let opts = build_launch_options(&args).expect("profile with allow_http2 is valid");
         assert!(opts.enable_h2);
+    }
+
+    #[test]
+    fn profile_resolved_addresses_reach_the_proxy_config() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _env = cleared_env();
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let profile_path = dir.path().join("addresses.json");
+        std::fs::write(
+            &profile_path,
+            r#"{
+                "meta": { "name": "addresses-test" },
+                "network": {
+                    "allow_domain": ["console.int.example"],
+                    "resolved_addresses": {
+                        "public_only": true,
+                        "exceptions": { "console.int.example": ["private"] }
+                    }
+                }
+            }"#,
+        )
+        .expect("write profile");
+
+        let args = parse_args(&["--profile", profile_path.to_str().expect("valid utf8")]);
+        let opts = build_launch_options(&args).expect("profile with resolved_addresses is valid");
+        assert!(opts.resolved_addresses.public_only);
+        let config = crate::proxy_runtime::build_proxy_config_from_flags(&opts)
+            .expect("build_proxy_config_from_flags");
+        assert_eq!(config.resolved_addresses, opts.resolved_addresses);
+        assert_eq!(
+            config.resolved_addresses.exceptions["console.int.example"],
+            vec![nono::net_filter::AddressClass::Private]
+        );
     }
 
     #[test]
