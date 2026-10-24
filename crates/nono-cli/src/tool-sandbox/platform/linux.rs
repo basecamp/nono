@@ -5725,7 +5725,8 @@ const ELF_MAX_INTERP_BYTES: usize = libc::PATH_MAX as usize;
 /// `PT_DYNAMIC`: 65,536 64-bit entries; real objects have well under a hundred.
 const ELF_MAX_DYNAMIC_BYTES: usize = 1024 * 1024;
 /// The dynamic string table: large C++ libraries reach a few MiB
-/// (`libclang-cpp.so`: 3.7 MiB).
+/// (`libclang-cpp.so`: 3.7 MiB). It bounds an explicit `DT_STRSZ`, and how much
+/// of the file is read as the table when `DT_STRSZ` is absent.
 const ELF_MAX_DYNSTR_BYTES: usize = 64 * 1024 * 1024;
 
 /// Reads the ELF header, program headers, `PT_INTERP`, `PT_DYNAMIC` and the
@@ -5929,6 +5930,9 @@ fn parse_dynamic(
             search_dirs: Vec::new(),
         });
     }
+    // An explicit `DT_STRSZ` over the limit is refused below. Without one the
+    // table runs to the end of the file, as it did, but only the limit's worth
+    // is read: a string past that fails its lookup like one past a short region.
     let strsz = match strsz {
         Some(strsz) => strsz,
         None => {
@@ -5942,6 +5946,7 @@ fn parse_dynamic(
             usize::try_from(len)
                 .unwrap_or(usize::MAX)
                 .saturating_sub(strtab)
+                .min(ELF_MAX_DYNSTR_BYTES)
         }
     };
     let strings = read_elf_region(file, path, strtab as u64, strsz, ELF_MAX_DYNSTR_BYTES)?;
@@ -8255,7 +8260,8 @@ mod tests {
             }
         }
 
-        // Without DT_STRSZ the table runs to the end of the file.
+        // Without DT_STRSZ the table runs to the end of the file (here well
+        // within ELF_MAX_DYNSTR_BYTES).
         for is64 in [true, false] {
             let mut bytes = build_test_elf(&TestElf {
                 is64,
@@ -8374,6 +8380,65 @@ mod tests {
             }),
         )?;
         assert!(parse_elf(&fixture).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn parse_elf_reads_a_table_without_dt_strsz_up_to_its_limit() -> Result<()> {
+        let tmp = test_tempdir()?;
+        let fixture = tmp.path().join("fixture");
+        let mut bytes = build_test_elf(&TestElf {
+            is64: true,
+            interpreter: None,
+            dynamic: true,
+            needed: &["libone.so.1"],
+            rpath: None,
+            runpath: Some("/opt/runpath"),
+        });
+        // Entries: DT_NEEDED, DT_RUNPATH, DT_STRTAB, DT_STRSZ, DT_NULL. Make
+        // DT_STRSZ a DT_DEBUG.
+        let needed_at = bytes.len() - 5 * 16 + 8;
+        let strtab_at = bytes.len() - 3 * 16 + 8;
+        let strsz_tag_at = bytes.len() - 2 * 16;
+        put_le(&mut bytes, strsz_tag_at, 8, 21);
+        let strtab = le_u64(&bytes, strtab_at)? - TEST_ELF_BASE;
+        let limit = ELF_MAX_DYNSTR_BYTES as u64;
+        // A sparse file, so the rest of the file past `DT_STRTAB` is over the
+        // limit without the test writing it.
+        let write_sparse = |bytes: &[u8], extra: Option<(u64, &[u8])>| -> Result<()> {
+            write_test_file(&fixture, bytes)?;
+            File::options()
+                .write(true)
+                .open(&fixture)
+                .and_then(|file| {
+                    file.set_len(strtab + limit + 4096)?;
+                    match extra {
+                        Some((offset, data)) => file.write_all_at(data, strtab + offset),
+                        None => Ok(()),
+                    }
+                })
+                .map_err(|source| NonoError::ConfigWrite {
+                    path: fixture.clone(),
+                    source,
+                })
+        };
+
+        write_sparse(&bytes, None)?;
+        let parsed = parse_elf(&fixture)?;
+        assert_eq!(parsed.needed, ["libone.so.1"]);
+        assert_eq!(parsed.search_dirs, ["/opt/runpath"]);
+
+        // A string at or across the limit is in the file, and the whole-file
+        // parse would find it, but it is past what is read: the lookup fails.
+        for offset in [limit, limit - 4] {
+            let mut far = bytes.clone();
+            put_le(&mut far, needed_at, 8, offset);
+            write_sparse(&far, Some((offset, b"libfar.so.1\0")))?;
+            assert!(
+                parse_elf(&fixture).is_err(),
+                "a string at table offset {offset} must not be found"
+            );
+        }
         Ok(())
     }
 
