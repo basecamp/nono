@@ -11,6 +11,7 @@ mod audit_event_reader;
 mod audit_integrity;
 mod audit_ledger;
 mod audit_session;
+mod broken_pipe;
 mod capability_ext;
 mod cli;
 mod cli_bootstrap;
@@ -118,6 +119,7 @@ const DETACHED_SESSION_ID_ENV: &str = "NONO_DETACHED_SESSION_ID";
 pub(crate) use launch_runtime::rollback_base_exclusions;
 
 fn main() {
+    broken_pipe::install();
     if tool_sandbox::maybe_run_internal_tool_sandbox_entrypoint() {
         return;
     }
