@@ -1008,6 +1008,31 @@
           "type": "array",
           "items": { "type": "string" },
           "description": "Hosts to bypass the upstream proxy and route directly. Supports exact hostnames and wildcard suffixes (e.g., *.example.com)."
+        },
+        "resolved_addresses": {
+          "$ref": "#/$defs/ResolvedAddressesConfig",
+          "description": "Which addresses a host the proxy resolves may connect to. The proxy resolves each host once and connects only to the addresses it checked; link-local addresses are always refused. With public_only, an allowed name that resolves to a loopback, private, shared (CGNAT) or unspecified address is refused unless exceptions permit that class for it. Merged across extends: public_only holds if any layer sets it; exception classes accumulate."
+        }
+      }
+    },
+    "ResolvedAddressesConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "public_only": {
+          "type": "boolean",
+          "default": false,
+          "description": "Refuse a host when any address it resolves to is loopback (127.0.0.0/8, ::1), private (RFC 1918, fc00::/7), shared (100.64.0.0/10) or unspecified (0.0.0.0/8, ::), unless exceptions permits that class for the host. IPv4-mapped, IPv4-compatible and NAT64 IPv6 forms are classified by the IPv4 address they carry. An IP-literal allow_domain entry permits its own address."
+        },
+        "exceptions": {
+          "type": "object",
+          "default": {},
+          "additionalProperties": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "type": "string", "enum": ["loopback", "private", "cgnat"] }
+          },
+          "description": "Host patterns (exact name, IP literal or wildcard, in allow_domain's grammar) mapped to the non-public address classes each may resolve to. An exception allows no host by itself: the host must still be allowed by allow_domain or a credential route. link_local and unspecified are never permitted."
         }
       }
     },
