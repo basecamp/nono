@@ -249,7 +249,7 @@ By default the proxy refuses a host outside the allowlist with `403 Forbidden: h
 }
 ```
 
-`{host}` is replaced by the refused host (reduced to printable ASCII and at most 253 characters), the result is cut at 1024 characters, and ` [rule: net.allowlist]` is appended. The result becomes the 403's reason phrase, since many CONNECT clients surface only the status line, and its plain-text body, which forward-HTTP clients such as curl print. An `X-Nono-Denied-By: net.allowlist` header names the rule:
+`{host}` is replaced by the refused host (reduced to printable ASCII and at most 253 characters), the result is cut at 1024 characters, and ` [rule: net.allowlist]` is appended. The result becomes the 403's reason phrase, since many CONNECT clients surface only the status line, and its plain-text body, which forward-HTTP clients such as curl print (a `HEAD` request gets the headers and no body). An `X-Nono-Denied-By: net.allowlist` header names the rule:
 
 ```
 HTTP/1.1 403 Forbidden: refused: example.com is not reachable from the sandbox. Say what you needed it for, and ask the person running you to allow it. [rule: net.allowlist]

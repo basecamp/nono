@@ -2115,6 +2115,7 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
                 state.config.allowlist_denial_message.as_deref(),
                 &host,
                 &check.result,
+                crate::denial::is_head(first_line),
             );
             stream.write_all(response.as_bytes()).await?;
         } else {
@@ -2254,6 +2255,7 @@ async fn handle_forward_http(
             state.config.allowlist_denial_message.as_deref(),
             &host,
             &check.result,
+            crate::denial::is_head(first_line),
         );
         stream.write_all(response.as_bytes()).await?;
         return Ok(());
@@ -3612,6 +3614,39 @@ mod tests {
         )
         .await;
         assert_eq!(response, expected_allowlist_denial("denied.invalid"));
+        handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_forward_http_head_allowlist_denial_has_no_body() {
+        let config = ProxyConfig {
+            allowed_hosts: vec!["allowed.invalid".to_string()],
+            require_auth: false,
+            allowlist_denial_message: Some(ALLOWLIST_DENIAL_MESSAGE.to_string()),
+            ..Default::default()
+        };
+        let handle = start(config).await.unwrap();
+        let mut client = tokio::net::TcpStream::connect(("127.0.0.1", handle.port))
+            .await
+            .unwrap();
+        client
+            .write_all(b"HEAD http://denied.invalid/ HTTP/1.1\r\nHost: denied.invalid\r\n\r\n")
+            .await
+            .unwrap();
+        let mut bytes = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.read_to_end(&mut bytes),
+        )
+        .await
+        .expect("the proxy closes the connection after the 403")
+        .unwrap();
+        let response = String::from_utf8_lossy(&bytes);
+        let expected = expected_allowlist_denial("denied.invalid");
+        let (headers, _) = expected.split_once("\r\n\r\n").unwrap();
+        // Nothing follows the header terminator, and the proxy closes the
+        // connection, so no stray bytes can be read as a next response.
+        assert_eq!(response, format!("{headers}\r\n\r\n"));
         handle.shutdown();
     }
 
