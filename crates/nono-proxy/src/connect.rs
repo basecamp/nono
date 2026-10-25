@@ -108,7 +108,8 @@ pub async fn handle_connect(
             port,
             &reason,
         );
-        let response = crate::denial::host_denial_response(denial_message, &host, &check.result);
+        let response =
+            crate::denial::host_denial_response(denial_message, &host, &check.result, false);
         stream.write_all(response.as_bytes()).await?;
         stream.flush().await?;
         return Err(ProxyError::HostDenied { host, reason });
