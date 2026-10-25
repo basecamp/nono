@@ -63,20 +63,40 @@ pub fn validate_message(message: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Whether `request_line` is a `HEAD` request, whose response must end after
+/// its headers.
+#[must_use]
+pub fn is_head(request_line: &str) -> bool {
+    request_line.split_whitespace().next() == Some("HEAD")
+}
+
 /// The full `403` response for a host denial: the configured message for an
 /// allowlist refusal, otherwise exactly the default response.
+///
+/// For a `HEAD` request (`head`) the configured response keeps its headers,
+/// `Content-Length` included, and has no body (RFC 9110 section 9.3.2).
 #[must_use]
-pub fn host_denial_response(message: Option<&str>, host: &str, result: &FilterResult) -> String {
+pub fn host_denial_response(
+    message: Option<&str>,
+    host: &str,
+    result: &FilterResult,
+    head: bool,
+) -> String {
     match message {
         Some(message) if matches!(result, FilterResult::DenyNotAllowed { .. }) => {
             let text = render(message, host);
+            let body = if head {
+                String::new()
+            } else {
+                format!("{text}\n")
+            };
             format!(
                 "HTTP/1.1 403 Forbidden: {text}\r\n\
                  X-Nono-Denied-By: {ALLOWLIST_RULE}\r\n\
                  Content-Type: text/plain; charset=utf-8\r\n\
                  Content-Length: {}\r\n\
                  Connection: close\r\n\r\n\
-                 {text}\n",
+                 {body}",
                 text.len() + 1
             )
         }
@@ -130,15 +150,19 @@ mod tests {
     fn without_a_message_the_response_is_the_default() {
         let result = not_allowed("example.com");
         assert_eq!(
-            host_denial_response(None, "example.com", &result),
+            host_denial_response(None, "example.com", &result, false),
             "HTTP/1.1 403 Forbidden: host example.com is not in the allowlist\r\n\r\n"
         );
     }
 
     #[test]
     fn an_allowlist_refusal_carries_the_message_header_and_body() {
-        let response =
-            host_denial_response(Some(MESSAGE), "example.com", &not_allowed("example.com"));
+        let response = host_denial_response(
+            Some(MESSAGE),
+            "example.com",
+            &not_allowed("example.com"),
+            false,
+        );
         let text = "refused: example.com is not reachable from the sandbox. Instead: say what \
                     you needed it for, and ask your person to allow it. Don't retry or work \
                     around it. [rule: net.allowlist]";
@@ -157,20 +181,47 @@ mod tests {
     }
 
     #[test]
+    fn a_head_response_has_the_headers_and_no_body() {
+        let result = not_allowed("example.com");
+        let get = host_denial_response(Some(MESSAGE), "example.com", &result, false);
+        let head = host_denial_response(Some(MESSAGE), "example.com", &result, true);
+        let (get_head, get_body) = get.split_once("\r\n\r\n").unwrap();
+        assert!(!get_body.is_empty());
+        assert_eq!(head, format!("{get_head}\r\n\r\n"));
+        assert_eq!(
+            host_denial_response(None, "example.com", &result, true),
+            host_denial_response(None, "example.com", &result, false)
+        );
+    }
+
+    #[test]
+    fn only_a_head_request_line_is_head() {
+        assert!(is_head("HEAD http://example.com/ HTTP/1.1"));
+        for line in [
+            "GET http://example.com/ HTTP/1.1",
+            "head http://example.com/ HTTP/1.1",
+            "CONNECT example.com:443 HTTP/1.1",
+            "",
+        ] {
+            assert!(!is_head(line), "{line:?}");
+        }
+    }
+
+    #[test]
     fn other_denials_keep_the_default_response() {
         let deny_host = FilterResult::DenyHost {
             host: "blocked.example".to_string(),
         };
         assert_eq!(
-            host_denial_response(Some(MESSAGE), "blocked.example", &deny_host),
-            host_denial_response(None, "blocked.example", &deny_host)
+            host_denial_response(Some(MESSAGE), "blocked.example", &deny_host, false),
+            host_denial_response(None, "blocked.example", &deny_host, false)
         );
         let link_local = FilterResult::DenyLinkLocal {
             ip: "169.254.169.254".parse::<IpAddr>().unwrap(),
         };
         assert_eq!(
-            host_denial_response(Some(MESSAGE), "metadata", &link_local),
-            host_denial_response(None, "metadata", &link_local)
+            host_denial_response(Some(MESSAGE), "metadata", &link_local, false),
+            host_denial_response(None, "metadata", &link_local, false)
         );
     }
 

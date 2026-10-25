@@ -275,7 +275,7 @@ pub async fn handle_connect(
                 // The filter's own refusal: the profile may word it.
                 Some(result) => {
                     let response =
-                        crate::denial::host_denial_response(denial_message, &host, &result);
+                        crate::denial::host_denial_response(denial_message, &host, &result, false);
                     stream.write_all(response.as_bytes()).await?;
                     stream.flush().await?;
                 }
