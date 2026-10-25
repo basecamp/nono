@@ -862,13 +862,30 @@ fn handle_received_filesystem_notification(
 ///
 /// Split out as an explicit type so the (testable) policy logic is decoupled
 /// from the (untestable) seccomp-notify response plumbing. Callers translate
-/// `Allow` to `continue_notif(…)` and `Deny` to `respond_notif_errno(…, EACCES)`.
+/// `Allow` to `continue_notif(…)`, `Deny` to `respond_notif_errno(…, EACCES)`
+/// and `DenyAddressNotAvailable` to `respond_notif_errno(…, EADDRNOTAVAIL)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum NetworkDecision {
     /// Allow the operation.
     Allow,
     /// Fail the syscall with `EACCES`.
     Deny,
+    /// Fail a bind with `EADDRNOTAVAIL`: the port is open, but only on
+    /// loopback, so to the sandbox no other local address exists for it.
+    /// Port probers (Selenium's `PortProber`) skip an address that answers
+    /// this, where `EACCES` makes them raise.
+    DenyAddressNotAvailable,
+}
+
+impl NetworkDecision {
+    /// The errno a denial returns to the child, or `None` for `Allow`.
+    fn errno(self) -> Option<i32> {
+        match self {
+            Self::Allow => None,
+            Self::Deny => Some(libc::EACCES),
+            Self::DenyAddressNotAvailable => Some(libc::EADDRNOTAVAIL),
+        }
+    }
 }
 
 /// Whether a trapped network syscall on address `family` carries no policy
@@ -928,8 +945,10 @@ pub(super) fn network_notification_out_of_scope(policy: SeccompPolicy, family: u
 ///    - `connect()` is allowed to `127.0.0.1:proxy_port` (the nono proxy), to
 ///      an explicitly granted `connect_port`, or to an explicitly granted
 ///      localhost IPC port (the latter only on loopback).
-///    - `bind()` is allowed on ports in `proxy_bind_ports` or explicitly
-///      granted localhost IPC ports and ranges.
+///    - `bind()` is allowed on any local address for ports in
+///      `proxy_bind_ports` (`--listen-port`), and on a loopback address only
+///      for explicitly granted localhost IPC ports and ranges (`--open-port`,
+///      `open_port_range`).
 ///    - Everything else is denied.
 pub(super) fn decide_network_notification(
     child_pid: u32,
@@ -1011,8 +1030,15 @@ pub(super) fn decide_network_notification(
         }
         SYS_BIND => {
             let port = sockaddr.port;
-            let allowed = config.proxy_bind_ports.contains(&port)
-                || config.caps.localhost_ports().contains(&port)
+            // `--listen-port` / `listen_port` grants a server port: bind on
+            // any local address, as documented.
+            let listen_grant = config.proxy_bind_ports.contains(&port);
+            // `--open-port` / `open_port` / `open_port_range` grants
+            // localhost IPC, so its bind is held to loopback exactly as its
+            // connect is above: a dev server binding 0.0.0.0 or a LAN
+            // address on an open port would otherwise be reachable from the
+            // network.
+            let localhost_grant = config.caps.localhost_ports().contains(&port)
                 || config
                     .caps
                     .localhost_port_ranges()
@@ -1022,13 +1048,27 @@ pub(super) fn decide_network_notification(
                     .proxy_bind_port_ranges
                     .iter()
                     .any(|&(s, e)| port >= s && port <= e);
-            if allowed {
-                debug!("Proxy seccomp: allowing bind on port {}", port);
+            if listen_grant || (localhost_grant && sockaddr.is_loopback) {
+                debug!(
+                    "Proxy seccomp: allowing bind on port {} (loopback={})",
+                    port, sockaddr.is_loopback
+                );
                 NetworkDecision::Allow
+            } else if localhost_grant {
+                debug!(
+                    "Proxy seccomp: denying bind on open port {} off loopback \
+                     (EADDRNOTAVAIL)",
+                    port
+                );
+                NetworkDecision::DenyAddressNotAvailable
             } else {
                 debug!(
-                    "Proxy seccomp: denying bind on port {} (allowed ports: {:?}, ranges: {:?})",
-                    port, config.proxy_bind_ports, config.proxy_bind_port_ranges
+                    "Proxy seccomp: denying bind on port {} loopback={} (listen ports: {:?}, \
+                     localhost ranges: {:?})",
+                    port,
+                    sockaddr.is_loopback,
+                    config.proxy_bind_ports,
+                    config.proxy_bind_port_ranges
                 );
                 NetworkDecision::Deny
             }
@@ -1537,9 +1577,10 @@ fn handle_received_network_notification(
     }
 
     for sockaddr in &sockaddrs {
-        match decide_network_notification(notif.pid, notif.data.nr, sockaddr, config) {
-            NetworkDecision::Allow => {}
-            NetworkDecision::Deny => {
+        let decision = decide_network_notification(notif.pid, notif.data.nr, sockaddr, config);
+        match decision.errno() {
+            None => {}
+            Some(errno) => {
                 // Enforcement is unconditional: the throttle only bounds how
                 // much bookkeeping this denial may create.
                 let record = network_throttle.admit();
@@ -1553,7 +1594,7 @@ fn handle_received_network_notification(
                         ipc_denials,
                     );
                 }
-                respond_notif_errno(notify_fd, notif.id, libc::EACCES)?;
+                respond_notif_errno(notify_fd, notif.id, errno)?;
                 if record
                     && let Err(err) = record_network_audit_denial(config, sockaddr, notif.data.nr)
                 {
@@ -3167,6 +3208,93 @@ mod tests {
                 decide_network_notification(test_pid(), SYS_BIND, &inet_loopback(49160), &config),
                 NetworkDecision::Allow
             );
+        }
+
+        fn inet6(port: u16, is_loopback: bool) -> SockaddrInfo {
+            SockaddrInfo {
+                family: libc::AF_INET6 as u16,
+                ..if is_loopback {
+                    inet_loopback(port)
+                } else {
+                    inet_external(port)
+                }
+            }
+        }
+
+        /// An open port (`--open-port`, `open_port_range`) is localhost IPC:
+        /// its bind is held to loopback, as its connect is. A bind to the
+        /// unspecified or a LAN address on that port (what a dev server does
+        /// with `-b 0.0.0.0`) would put it on the network.
+        #[test]
+        fn open_port_bind_requires_loopback_address() {
+            let backend = DenyAllBackend;
+            let mut caps = nono::CapabilitySet::default();
+            caps.add_localhost_port(3001);
+            caps.add_localhost_port_range(4000, 4002)
+                .expect("valid localhost port range");
+            let mut config = make_proxy_only_config(&backend, 8080, Vec::new());
+            config.caps = &caps;
+
+            for port in [3001, 4000, 4002] {
+                for sockaddr in [inet_loopback(port), inet6(port, true)] {
+                    assert_eq!(
+                        decide_network_notification(test_pid(), SYS_BIND, &sockaddr, &config),
+                        NetworkDecision::Allow,
+                        "loopback bind on open port {port} (family {}) must be allowed",
+                        sockaddr.family
+                    );
+                }
+                for sockaddr in [inet_external(port), inet6(port, false)] {
+                    assert_eq!(
+                        decide_network_notification(test_pid(), SYS_BIND, &sockaddr, &config),
+                        NetworkDecision::DenyAddressNotAvailable,
+                        "non-loopback bind on open port {port} (family {}) must be refused \
+                         as EADDRNOTAVAIL",
+                        sockaddr.family
+                    );
+                }
+            }
+        }
+
+        /// `proxy_bind_port_ranges` carries `open_port_range` into the
+        /// supervisor, so it is loopback-only too.
+        #[test]
+        fn open_port_range_bind_requires_loopback_address() {
+            let backend = DenyAllBackend;
+            let config = make_config_with_ranges(&backend, 0, vec![], vec![(49152, 49200)], &[]);
+            assert_eq!(
+                decide_network_notification(test_pid(), SYS_BIND, &inet_external(49160), &config),
+                NetworkDecision::DenyAddressNotAvailable
+            );
+            assert_eq!(
+                decide_network_notification(test_pid(), SYS_BIND, &inet6(49160, false), &config),
+                NetworkDecision::DenyAddressNotAvailable
+            );
+            // A port with no grant at all stays EACCES, on any address.
+            assert_eq!(
+                decide_network_notification(test_pid(), SYS_BIND, &inet_external(40000), &config),
+                NetworkDecision::Deny
+            );
+        }
+
+        /// A listen port (`--listen-port`) is a server port and keeps its
+        /// documented any-address bind, also when the same port is open.
+        #[test]
+        fn listen_port_bind_allows_any_address() {
+            let backend = DenyAllBackend;
+            let mut caps = nono::CapabilitySet::default();
+            caps.add_localhost_port(3000);
+            let mut config = make_proxy_only_config(&backend, 8080, vec![3000, 5000]);
+            config.caps = &caps;
+            for port in [3000, 5000] {
+                for sockaddr in [inet_external(port), inet6(port, false), inet_loopback(port)] {
+                    assert_eq!(
+                        decide_network_notification(test_pid(), SYS_BIND, &sockaddr, &config),
+                        NetworkDecision::Allow,
+                        "bind on listen port {port} must be allowed on any address"
+                    );
+                }
+            }
         }
     }
 }
