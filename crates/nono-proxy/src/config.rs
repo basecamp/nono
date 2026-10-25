@@ -212,6 +212,14 @@ pub struct ProxyConfig {
     #[serde(default)]
     pub enable_h2: bool,
 
+    /// What to answer a host refused for not being in the allowlist with,
+    /// in place of the default `403 Forbidden: host … is not in the
+    /// allowlist`. `{host}` is replaced by the refused host. See
+    /// [`crate::denial`] for the response. `None` (default) keeps the
+    /// default response byte for byte.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowlist_denial_message: Option<String>,
+
     /// Collect in-memory network audit events for later drain.
     ///
     /// Defaults to `true`. Set `false` when the CLI user passed `--no-audit`
@@ -291,6 +299,7 @@ impl Default for ProxyConfig {
             ca_validity: None,
             leaf_validity: None,
             enable_h2: false,
+            allowlist_denial_message: None,
             enable_network_audit: default_enable_network_audit(),
             outer_caps: None,
         }

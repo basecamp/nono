@@ -77,6 +77,7 @@ fn test_schema_network_config_matches_rust_model() {
             "no_proxy",
             "custom_credentials",
             "tls_intercept",
+            "allowlist_denial_message",
             "upstream_proxy",
             "upstream_bypass",
             "resolved_addresses",
