@@ -164,6 +164,32 @@ A `*` that only occupies part of a label (`foo*bar.com`), or a leading `*.` comb
 
 `--deny-domain` is the CLI equivalent. `deny_domain` is additive across profile inheritance, same as `allow_domain`.
 
+### Denial Message
+
+By default the proxy refuses a host outside the allowlist with `403 Forbidden: host example.com:443 is not in the allowlist`, with no headers and no body. When an agent is the one reading the refusal, `network.allowlist_denial_message` lets the profile say what it should do next:
+
+```json
+{
+  "network": {
+    "allowlist_denial_message": "refused: {host} is not reachable from the sandbox. Say what you needed it for, and ask the person running you to allow it."
+  }
+}
+```
+
+`{host}` is replaced by the refused host (reduced to printable ASCII and at most 253 characters), the result is cut at 1024 characters, and ` [rule: net.allowlist]` is appended. The result becomes the 403's reason phrase, since many CONNECT clients surface only the status line, and its plain-text body, which forward-HTTP clients such as curl print. An `X-Nono-Denied-By: net.allowlist` header names the rule:
+
+```
+HTTP/1.1 403 Forbidden: refused: example.com is not reachable from the sandbox. Say what you needed it for, and ask the person running you to allow it. [rule: net.allowlist]
+X-Nono-Denied-By: net.allowlist
+Content-Type: text/plain; charset=utf-8
+Content-Length: 150
+Connection: close
+
+refused: example.com is not reachable from the sandbox. Say what you needed it for, and ask the person running you to allow it. [rule: net.allowlist]
+```
+
+The message changes only the wording: what is allowed or denied, and the audit event, are the same with or without it. It applies to CONNECT tunnels, forward-proxied `http://` requests and the external-proxy CONNECT path. Other refusals keep the default response, because advice to ask for a host to be allowed is wrong for them: `deny_domain` matches, [always-denied destinations](#always-denied-destinations), link-local and other refused addresses, and endpoint-rule denials. The message must be one line of printable ASCII, at most 512 characters, and `{host}` is the only placeholder; anything else fails at profile load. A child profile's message replaces its base's.
+
 ### Client-Side Proxy Bypass
 
 Profiles can add host patterns to the generated `NO_PROXY` and `no_proxy` environment variables with `network.no_proxy`. nono still emits loopback defaults and any safe direct-connect bypasses first; parent-shell `NO_PROXY` values are not inherited. These entries do not grant network access; on macOS ProxyOnly and other restricted modes, direct connections still require matching sandbox permissions.

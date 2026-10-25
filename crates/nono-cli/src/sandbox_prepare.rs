@@ -612,6 +612,9 @@ pub(crate) struct PreparedSandbox {
     /// True when the profile or CLI requested HTTP/2 to upstream servers
     /// (`network.allow_http2` or `--allow-http2`).
     pub(crate) allow_http2_requested: bool,
+    /// Profile `network.allowlist_denial_message`: the proxy's answer to a
+    /// host refused for not being in the allowlist.
+    pub(crate) allowlist_denial_message: Option<String>,
 }
 
 fn resolved_workdir(args: &SandboxArgs) -> PathBuf {
@@ -1594,6 +1597,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
                 set_vars: None,
                 profile_network_block: false,
                 allow_http2_requested: args.allow_http2,
+                allowlist_denial_message: None,
             },
             &[],
             args,
@@ -1932,6 +1936,9 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         .map(|p| p.network.allow_http2)
         .unwrap_or(false);
     let allow_http2_requested = args.allow_http2 || profile_allow_http2;
+    let allowlist_denial_message = loaded_profile
+        .as_ref()
+        .and_then(|p| p.network.allowlist_denial_message.clone());
 
     let profile_secrets = loaded_profile
         .as_ref()
@@ -2002,6 +2009,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
             set_vars: profile_set_vars,
             profile_network_block,
             allow_http2_requested,
+            allowlist_denial_message,
         },
         &blocked_grants,
         args,
@@ -3060,6 +3068,7 @@ mod tests {
             set_vars: None,
             profile_network_block: false,
             allow_http2_requested: false,
+            allowlist_denial_message: None,
         }
     }
 

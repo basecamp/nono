@@ -63,6 +63,9 @@ where
 ///
 /// `first_line` is the already-read CONNECT line (e.g., "CONNECT api.openai.com:443 HTTP/1.1").
 /// `stream` is the raw TCP stream from the client.
+/// `denial_message` is the profile's allowlist denial message (see
+/// [`crate::denial`]).
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_connect(
     first_line: &str,
     stream: &mut TcpStream,
@@ -71,6 +74,7 @@ pub async fn handle_connect(
     remaining_header: &[u8],
     auth_mode: ConnectAuthMode,
     audit_log: Option<&audit::SharedAuditLog>,
+    denial_message: Option<&str>,
 ) -> Result<()> {
     // Parse host:port from CONNECT line
     let (host, port) = parse_connect_target(first_line)?;
@@ -104,7 +108,9 @@ pub async fn handle_connect(
             port,
             &reason,
         );
-        send_response(stream, 403, &format!("Forbidden: {}", reason)).await?;
+        let response = crate::denial::host_denial_response(denial_message, &host, &check.result);
+        stream.write_all(response.as_bytes()).await?;
+        stream.flush().await?;
         return Err(ProxyError::HostDenied { host, reason });
     }
 
