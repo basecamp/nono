@@ -1555,6 +1555,15 @@ fn validate_credential_capture_resolved(profile: &Profile) -> Result<()> {
     validate_credential_capture_references(profile)
 }
 
+fn validate_profile_allowlist_denial_message(profile: &Profile) -> Result<()> {
+    match &profile.network.allowlist_denial_message {
+        Some(message) => nono_proxy::denial::validate_message(message).map_err(|err| {
+            NonoError::ProfileParse(format!("network.allowlist_denial_message {err}"))
+        }),
+        None => Ok(()),
+    }
+}
+
 fn validate_profile_tls_intercept(profile: &Profile) -> Result<()> {
     let Some(tls) = &profile.network.tls_intercept else {
         return Ok(());
@@ -1837,6 +1846,14 @@ pub struct NetworkConfig {
     /// TLS interception controls for L7 proxy routes.
     #[serde(default)]
     pub tls_intercept: Option<TlsInterceptConfig>,
+    /// What the proxy answers a host refused for not being in the allowlist
+    /// with, in place of `403 Forbidden: host … is not in the allowlist`.
+    /// `{host}` is replaced by the refused host and ` [rule: net.allowlist]`
+    /// is appended. Wording only: nothing more or less is allowed. One line
+    /// of printable ASCII, at most 512 bytes; `{host}` is the only
+    /// placeholder.
+    #[serde(default)]
+    pub allowlist_denial_message: Option<String>,
     /// Upstream proxy address (host:port) for enterprise proxy passthrough.
     #[serde(default, rename = "upstream_proxy")]
     pub upstream_proxy: Option<String>,
@@ -3271,6 +3288,7 @@ pub(crate) fn finalize_profile(mut profile: Profile) -> Result<Profile> {
     validate_credential_capture_resolved(&profile)?;
     validate_credential_provider_resolved(&profile)?;
     validate_profile_tls_intercept(&profile)?;
+    validate_profile_allowlist_denial_message(&profile)?;
     validate_command_policies(
         profile.command_policies.as_ref(),
         CommandPolicyValidationScope::Resolved,
@@ -3393,6 +3411,7 @@ pub(crate) fn parse_profile_bytes(content: &[u8]) -> Result<Profile> {
     validate_credential_capture_entries(&profile)?;
     validate_credential_provider_entries(&profile)?;
     validate_profile_tls_intercept(&profile)?;
+    validate_profile_allowlist_denial_message(&profile)?;
 
     // Validate env_credentials keys (URI entries need structural validation)
     validate_env_credential_keys(&profile)?;
@@ -3812,6 +3831,10 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
                 merged
             },
             tls_intercept: child.network.tls_intercept.or(base.network.tls_intercept),
+            allowlist_denial_message: child
+                .network
+                .allowlist_denial_message
+                .or(base.network.allowlist_denial_message),
             // Child overrides base upstream proxy; if child has None, inherit base
             upstream_proxy: child.network.upstream_proxy.or(base.network.upstream_proxy),
             upstream_bypass: dedup_append(
@@ -4486,6 +4509,56 @@ mod tests {
             err.to_string()
                 .contains("network.tls_intercept.ca_validity"),
             "{err}"
+        );
+    }
+
+    #[test]
+    fn test_network_allowlist_denial_message_deserializes() {
+        let json = br#"{
+            "meta": {"name": "t"},
+            "network": {
+                "allowlist_denial_message": "refused: {host} is not reachable. Ask your person."
+            }
+        }"#;
+        let profile = parse_profile_bytes(json).expect("parse");
+        assert_eq!(
+            profile.network.allowlist_denial_message.as_deref(),
+            Some("refused: {host} is not reachable. Ask your person.")
+        );
+    }
+
+    #[test]
+    fn test_network_allowlist_denial_message_rejects_invalid_messages() {
+        for message in [r#""""#, r#""two\nlines""#, r#""{port} is closed""#] {
+            let json = format!(
+                r#"{{"meta": {{"name": "t"}}, "network": {{"allowlist_denial_message": {message}}}}}"#
+            );
+            let err = parse_profile_bytes(json.as_bytes())
+                .expect_err("invalid allowlist_denial_message should fail");
+            assert!(
+                err.to_string().contains("network.allowlist_denial_message"),
+                "{message}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_merge_profiles_child_allowlist_denial_message_overrides_base() {
+        let mut base = base_profile();
+        base.network.allowlist_denial_message = Some("base".to_string());
+        let child = child_profile();
+        let merged = merge_profiles(base.clone(), child.clone());
+        assert_eq!(
+            merged.network.allowlist_denial_message.as_deref(),
+            Some("base")
+        );
+
+        let mut child = child;
+        child.network.allowlist_denial_message = Some("child".to_string());
+        let merged = merge_profiles(base, child);
+        assert_eq!(
+            merged.network.allowlist_denial_message.as_deref(),
+            Some("child")
         );
     }
 
@@ -6854,6 +6927,7 @@ mod tests {
                 credentials: Some(vec!["base_cred".to_string()]),
                 custom_credentials: HashMap::new(),
                 tls_intercept: None,
+                allowlist_denial_message: None,
                 upstream_proxy: None,
                 upstream_bypass: Vec::new(),
                 approval_backends: BTreeMap::new(),
@@ -6947,6 +7021,7 @@ mod tests {
                 credentials: None,
                 custom_credentials: HashMap::new(),
                 tls_intercept: None,
+                allowlist_denial_message: None,
                 upstream_proxy: None,
                 upstream_bypass: Vec::new(),
                 approval_backends: BTreeMap::new(),

@@ -985,6 +985,18 @@
           "$ref": "#/$defs/TlsInterceptConfig",
           "description": "TLS interception certificate lifecycle controls for L7 proxy routes."
         },
+        "allowlist_denial_message": {
+          "oneOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512,
+              "pattern": "^[ -z|~]*(\\{host\\}[ -z|~]*)*$"
+            },
+            { "type": "null" }
+          ],
+          "description": "What the proxy answers a host refused for not being in the allowlist with, in place of '403 Forbidden: host <host:port> is not in the allowlist'. {host} is replaced by the refused host and ' [rule: net.allowlist]' is appended; the message becomes the 403's reason phrase and its plain-text body, and an X-Nono-Denied-By: net.allowlist header is added. Wording only: what is allowed or denied does not change, and other denials (deny list, link-local and other refused addresses) keep the default response. One line of printable ASCII, at most 512 characters; {host} is the only placeholder. A child profile's message replaces its base's."
+        },
         "upstream_proxy": {
           "oneOf": [
             { "type": "string" },

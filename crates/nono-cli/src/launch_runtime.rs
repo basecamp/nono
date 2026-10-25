@@ -178,6 +178,8 @@ pub(crate) struct ProxyLaunchOptions {
         std::collections::BTreeMap<String, crate::command_policy::ApprovalBackendConfig>,
     /// Default routing for `network_approval_backends`.
     pub(crate) network_approval_defaults: Option<crate::command_policy::ApprovalDefaultsConfig>,
+    /// Profile `network.allowlist_denial_message`, passed to the proxy.
+    pub(crate) allowlist_denial_message: Option<String>,
 }
 
 impl ProxyLaunchOptions {
