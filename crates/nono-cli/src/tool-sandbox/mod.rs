@@ -28,6 +28,118 @@ pub(crate) fn maybe_run_internal_tool_sandbox_entrypoint() -> bool {
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub(crate) fn record_main_start() {}
 
+/// One sandbox a brokered command can run under, as the launch builds it
+/// (`build_child_launch_spec`, the code a run uses) for a run of the command
+/// from the working directory: `PreparedToolSandboxRuntime::dry_run_children`.
+pub(crate) struct DryRunChild {
+    pub(crate) command: String,
+    /// `session`, or the command whose run selects this sandbox.
+    pub(crate) caller: String,
+    /// The intercept rule whose launch this is, if any.
+    pub(crate) intercept: Option<usize>,
+    /// The command sandbox the launch selected.
+    pub(crate) sandbox: crate::command_policy::CommandSandboxConfig,
+    /// What the launch builds, or why it would not launch from there.
+    pub(crate) launch: std::result::Result<DryRunLaunch, String>,
+}
+
+/// The child's launch, as the child itself applies it: its capability set
+/// read back from the launch spec, the binary it runs, and (Linux) its
+/// execute allowlist.
+pub(crate) struct DryRunLaunch {
+    pub(crate) executable: std::path::PathBuf,
+    pub(crate) caps: nono::CapabilitySet,
+    pub(crate) exec_paths: Vec<std::path::PathBuf>,
+}
+
+/// One credential of the command policies, as declared and as the launch
+/// resolves it on its own (`resolve_credentials`): for a dry run, which reports
+/// each one and keeps going when one doesn't resolve.
+pub(crate) struct DryRunCredential {
+    pub(crate) name: String,
+    /// `raw-file`, `local-socket`, `proxy` or `ambient`.
+    pub(crate) kind: &'static str,
+    /// The path as declared (a raw file's or a local socket's).
+    pub(crate) declared: Option<String>,
+    /// Where it resolves, for a file or socket credential that does.
+    pub(crate) resolved: Option<std::path::PathBuf>,
+    /// Why it doesn't resolve, or isn't available, as declared.
+    pub(crate) unresolved: Option<String>,
+}
+
+/// Each credential of `config` resolved on its own, by the launch's own
+/// `resolve_credentials`, which reads no credential source.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn dry_run_credentials(
+    config: &crate::command_policy::CommandPoliciesConfig,
+    proxy_credentials: &std::collections::BTreeSet<String>,
+) -> Vec<DryRunCredential> {
+    use crate::command_policy::CommandCredentialType;
+    config
+        .credentials
+        .iter()
+        .map(|(name, credential)| {
+            let one = std::collections::BTreeMap::from([(name.clone(), credential.clone())]);
+            let (resolved, unresolved) =
+                match credentials::resolve_credentials(&one, proxy_credentials)
+                    .map(|mut map| map.remove(name))
+                {
+                    Ok(Some(credentials::ResolvedCredential::RawFile { path })) => {
+                        (Some(path), None)
+                    }
+                    Ok(Some(credentials::ResolvedCredential::LocalSocket {
+                        path,
+                        unavailable_reason,
+                        ..
+                    })) => (path, unavailable_reason),
+                    Ok(_) => (None, None),
+                    Err(err) => (None, Some(err.to_string())),
+                };
+            DryRunCredential {
+                name: name.clone(),
+                kind: match credential.credential_type {
+                    CommandCredentialType::RawFile => "raw-file",
+                    CommandCredentialType::LocalSocket => "local-socket",
+                    CommandCredentialType::Proxy => "proxy",
+                    CommandCredentialType::Ambient => "ambient",
+                },
+                declared: credential.path.clone(),
+                resolved,
+                unresolved,
+            }
+        })
+        .collect()
+}
+
+/// One path a command sandbox's policy declares.
+pub(crate) struct DeclaredGrant {
+    /// The policy field: `fs_read`, `fs_write`, `exec_paths`, ...
+    pub(crate) field: &'static str,
+    /// The entry as written.
+    pub(crate) entry: String,
+    /// The entry expanded (dynamic tokens and variables filled, a relative entry
+    /// joined to the command's working directory), no link followed; none when a
+    /// dynamic token expands to nothing from this working directory (it may
+    /// expand to something where the command runs).
+    pub(crate) expanded: Option<std::path::PathBuf>,
+    /// Whether what it grants depends on the command's working directory: a
+    /// dynamic token, or an entry still relative once its variables are filled.
+    pub(crate) cwd_dependent: bool,
+}
+
+/// No command mediation on this platform: a command sandbox cannot be resolved.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn declared_policy_paths(
+    _policy: &crate::command_policy::CommandSandboxConfig,
+    _policy_root: &std::path::Path,
+    _cwd: &std::path::Path,
+    _outer_caps: &nono::CapabilitySet,
+) -> nono::Result<Vec<DeclaredGrant>> {
+    Err(nono::NonoError::UnsupportedPlatform(
+        "command sandboxes are not mediated on this platform".to_string(),
+    ))
+}
+
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub(crate) fn log_main_total() {}
 
@@ -643,8 +755,8 @@ mod linux;
 
 #[cfg(target_os = "linux")]
 pub(crate) use linux::{
-    PreparedToolSandboxRuntime, TOOL_SANDBOX_PARENT_MONOTONIC_ENV, log_main_total,
-    maybe_run_internal_tool_sandbox_entrypoint, record_main_start,
+    PreparedToolSandboxRuntime, TOOL_SANDBOX_PARENT_MONOTONIC_ENV, declared_policy_paths,
+    log_main_total, maybe_run_internal_tool_sandbox_entrypoint, record_main_start,
 };
 
 #[cfg(target_os = "macos")]
@@ -653,7 +765,8 @@ mod macos;
 
 #[cfg(target_os = "macos")]
 pub(crate) use macos::{
-    PreparedToolSandboxRuntime, log_main_total, maybe_run_internal_tool_sandbox_entrypoint,
-    record_main_start, resume_mediated_children, signal_active_children_in_pgroup,
-    signal_relay_write_fd, stop_active_children_in_pgroup, stop_signal_relay,
+    PreparedToolSandboxRuntime, declared_policy_paths, log_main_total,
+    maybe_run_internal_tool_sandbox_entrypoint, record_main_start, resume_mediated_children,
+    signal_active_children_in_pgroup, signal_relay_write_fd, stop_active_children_in_pgroup,
+    stop_signal_relay,
 };
