@@ -433,7 +433,24 @@ The following destinations are always blocked by the proxy, regardless of config
 | `169.254.0.0/16` (resolved IP) | IPv4 link-local — DNS rebinding protection |
 | `fe80::/10` (resolved IP) | IPv6 link-local — DNS rebinding protection |
 
-Private network addresses (RFC1918: 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16) are allowed to support enterprise environments.
+Private network addresses (RFC1918: 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16) are allowed by default to support enterprise environments.
+
+## Public Addresses Only
+
+A profile can refuse every allowed name that resolves to the local host, the LAN or a tailnet:
+
+```json
+{
+  "network": {
+    "resolved_addresses": {
+      "public_only": true,
+      "exceptions": { "console.int.example.com": ["private"] }
+    }
+  }
+}
+```
+
+With `public_only`, a host is refused when any address it resolves to is loopback (`127.0.0.0/8`, `::1`), private (RFC 1918, `fc00::/7`), shared/CGNAT (`100.64.0.0/10`, which tailnets use) or unspecified (`0.0.0.0/8`, `::`). IPv4-mapped, IPv4-compatible and NAT64 (`64:ff9b::/96`) IPv6 answers are classified by the IPv4 address they carry. `exceptions` names the classes (`loopback`, `private`, `cgnat`) a host pattern may resolve to; it allows no host by itself. An IP-literal `allow_domain` entry permits its own address. Route upstreams are checked the same way, and command-scoped proxies inherit the policy.
 
 ## Platform Behavior
 

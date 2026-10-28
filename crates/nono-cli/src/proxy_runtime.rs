@@ -1597,6 +1597,7 @@ pub(crate) fn prepare_proxy_launch_options(
         credential_routes: prepared.credential_routes.clone(),
         enable_h2: prepared.allow_http2_requested,
         no_proxy,
+        resolved_addresses: prepared.resolved_addresses.clone(),
         audit_disabled: false,
     };
 
@@ -2504,6 +2505,7 @@ pub(crate) fn build_proxy_config_from_flags(
     proxy_config.leaf_validity = proxy.proxy_leaf_validity;
     proxy_config.enable_h2 = proxy.enable_h2;
     proxy_config.no_proxy = proxy.no_proxy.clone();
+    proxy_config.resolved_addresses = proxy.resolved_addresses.clone();
     proxy_config.enable_network_audit = !proxy.audit_disabled;
     synthesize_credential_provider_proxy_config(proxy, &mut proxy_config)?;
     if !proxy_config.oauth_capture.is_empty() {
@@ -4118,6 +4120,7 @@ mod tests {
             upstream_proxy: None,
             no_proxy: Vec::new(),
             upstream_bypass: Vec::new(),
+            resolved_addresses: Default::default(),
             listen_ports: Vec::new(),
             capability_elevation: false,
             #[cfg(target_os = "linux")]
@@ -4199,6 +4202,7 @@ mod tests {
             upstream_proxy: None,
             no_proxy: vec![".internal.corp".to_string()],
             upstream_bypass: Vec::new(),
+            resolved_addresses: Default::default(),
             listen_ports: Vec::new(),
             capability_elevation: false,
             #[cfg(target_os = "linux")]
@@ -4275,6 +4279,7 @@ mod tests {
             upstream_proxy: Some("127.0.0.1:9".to_string()),
             no_proxy: vec!["redis".to_string(), "*.internal.example".to_string()],
             upstream_bypass: Vec::new(),
+            resolved_addresses: Default::default(),
             listen_ports: Vec::new(),
             capability_elevation: false,
             #[cfg(target_os = "linux")]
