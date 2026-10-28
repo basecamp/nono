@@ -173,6 +173,8 @@ pub(crate) struct ProxyLaunchOptions {
     /// buffer. Set from `--no-audit`. Does not change filter, credentials,
     /// or fail-closed auth.
     pub(crate) audit_disabled: bool,
+    /// Profile `network.allowlist_denial_message`, passed to the proxy.
+    pub(crate) allowlist_denial_message: Option<String>,
 }
 
 impl ProxyLaunchOptions {
