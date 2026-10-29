@@ -2,12 +2,16 @@
 //!
 //! Checks the hostname against the allowlist/deny list before resolving DNS,
 //! then resolves and checks the resulting IPs against the link-local range
-//! (cloud metadata SSRF protection).
+//! (cloud metadata SSRF protection) and, under a public-only
+//! [`ResolvedAddressPolicy`], against the other non-public address classes.
 
-use crate::config::{is_proxy_denied_metadata_ip, parse_host_ip_literal};
+use crate::config::{ResolvedAddressPolicy, is_proxy_denied_metadata_ip, parse_host_ip_literal};
 use crate::error::Result;
-use nono::net_filter::{FilterResult, HostFilter};
+use nono::net_filter::{
+    AddressClass, FilterResult, HostFilter, address_class, host_pattern_matches,
+};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::sync::Arc;
 use tracing::debug;
 
 /// Result of a filter check including resolved socket addresses.
@@ -26,6 +30,19 @@ pub struct CheckResult {
 #[derive(Debug, Clone)]
 pub struct ProxyFilter {
     inner: HostFilter,
+    /// IP addresses the allowlist names as exact entries (`10.1.2.3`,
+    /// `[fd00::1]:8443`): an address named outright is permitted by a
+    /// public-only address policy.
+    named_ips: Arc<Vec<IpAddr>>,
+    /// The public-only address gate, when the policy sets `public_only`.
+    address_gate: Option<Arc<AddressGate>>,
+}
+
+/// A public-only [`ResolvedAddressPolicy`], normalized for matching.
+#[derive(Debug)]
+struct AddressGate {
+    /// (normalized host pattern, classes it may resolve to)
+    exceptions: Vec<(String, Vec<AddressClass>)>,
 }
 
 impl ProxyFilter {
@@ -34,6 +51,8 @@ impl ProxyFilter {
     pub fn new(allowed_hosts: &[String]) -> Self {
         Self {
             inner: HostFilter::new(allowed_hosts),
+            named_ips: Arc::new(named_ips(allowed_hosts)),
+            address_gate: None,
         }
     }
 
@@ -42,6 +61,8 @@ impl ProxyFilter {
     pub fn new_strict(allowed_hosts: &[String]) -> Self {
         Self {
             inner: HostFilter::new_strict(allowed_hosts),
+            named_ips: Arc::new(named_ips(allowed_hosts)),
+            address_gate: None,
         }
     }
 
@@ -50,6 +71,34 @@ impl ProxyFilter {
     pub fn allow_all() -> Self {
         Self {
             inner: HostFilter::allow_all(),
+            named_ips: Arc::new(Vec::new()),
+            address_gate: None,
+        }
+    }
+
+    /// Apply a resolved-address policy. Without `public_only` this changes
+    /// nothing; with it, every address a host resolves to must be public, or
+    /// in a class the policy's exceptions permit for that host, or the
+    /// host's own IP literal named by the allowlist. The policy must already
+    /// be valid ([`ResolvedAddressPolicy::validate`]).
+    #[must_use]
+    pub fn with_resolved_address_policy(self, policy: &ResolvedAddressPolicy) -> Self {
+        if !policy.public_only {
+            return self;
+        }
+        let exceptions = policy
+            .exceptions
+            .iter()
+            .map(|(pattern, classes)| {
+                (
+                    HostFilter::normalize_authority_host(pattern),
+                    classes.clone(),
+                )
+            })
+            .collect();
+        Self {
+            address_gate: Some(Arc::new(AddressGate { exceptions })),
+            ..self
         }
     }
 
@@ -63,6 +112,7 @@ impl ProxyFilter {
         }
         Self {
             inner: self.inner.with_denied_hosts(denied),
+            ..self
         }
     }
 
@@ -102,6 +152,7 @@ impl ProxyFilter {
         let resolved_ips: Vec<IpAddr> = resolved.iter().map(|a| a.ip()).collect();
         let result = proxy_metadata_filter_result(host, &resolved_ips)
             .unwrap_or_else(|| self.check_host_result(host, port, &resolved_ips));
+        let result = self.gate_addresses(host, &resolved_ips, result);
 
         // Only return resolved addrs on allow to prevent misuse
         let addrs = if result.is_allowed() {
@@ -119,8 +170,47 @@ impl ProxyFilter {
     /// Check a host with pre-resolved IPs (no DNS lookup).
     #[must_use]
     pub fn check_host_with_ips(&self, host: &str, resolved_ips: &[IpAddr]) -> FilterResult {
-        proxy_metadata_filter_result(host, resolved_ips)
-            .unwrap_or_else(|| self.inner.check_host(host, resolved_ips))
+        let result = proxy_metadata_filter_result(host, resolved_ips)
+            .unwrap_or_else(|| self.inner.check_host(host, resolved_ips));
+        self.gate_addresses(host, resolved_ips, result)
+    }
+
+    /// Under a public-only policy, turn an allow into a deny when any of
+    /// `resolved_ips` is in a non-public class the policy does not permit for
+    /// `host`. Any one such address denies the host, as a link-local one
+    /// does: the caller connects to whichever resolved address answers.
+    fn gate_addresses(
+        &self,
+        host: &str,
+        resolved_ips: &[IpAddr],
+        result: FilterResult,
+    ) -> FilterResult {
+        let Some(gate) = self.address_gate.as_deref() else {
+            return result;
+        };
+        if !result.is_allowed() {
+            return result;
+        }
+        let normalized = HostFilter::normalize_authority_host(host);
+        let literal = parse_host_ip_literal(host);
+        for ip in resolved_ips {
+            let Some(class) = address_class(ip) else {
+                continue;
+            };
+            let named = literal == Some(*ip) && self.named_ips.contains(ip);
+            let excepted = gate.exceptions.iter().any(|(pattern, classes)| {
+                classes.contains(&class) && host_pattern_matches(pattern, &normalized)
+            });
+            let permittable = !matches!(class, AddressClass::LinkLocal | AddressClass::Unspecified);
+            if !(permittable && (named || excepted)) {
+                return FilterResult::DenyAddressClass {
+                    host: host.to_string(),
+                    ip: *ip,
+                    class,
+                };
+            }
+        }
+        result
     }
 
     /// Checks deny (incl. `host:port`) before the allowlist, so a wildcard
@@ -157,6 +247,28 @@ impl ProxyFilter {
     pub fn allowed_count(&self) -> usize {
         self.inner.allowed_count()
     }
+}
+
+/// The IP addresses among `allowed_hosts` written as exact entries: a bare
+/// literal (`10.1.2.3`, `fd00::1`, `[fd00::1]`) or one with a port
+/// (`10.1.2.3:8080`, `[fd00::1]:8443`). Wildcard entries name no address.
+fn named_ips(allowed_hosts: &[String]) -> Vec<IpAddr> {
+    allowed_hosts
+        .iter()
+        .filter(|entry| !entry.contains('*'))
+        .filter_map(|entry| {
+            let entry = entry.trim();
+            parse_host_ip_literal(entry).or_else(|| {
+                let (host, port) = entry.rsplit_once(':')?;
+                port.parse::<u16>().ok()?;
+                if host.contains(':') && !host.starts_with('[') {
+                    // An unbracketed IPv6 literal: its last group is not a port.
+                    return None;
+                }
+                parse_host_ip_literal(host)
+            })
+        })
+        .collect()
 }
 
 fn proxy_metadata_filter_result(host: &str, resolved_ips: &[IpAddr]) -> Option<FilterResult> {
@@ -392,5 +504,229 @@ mod tests {
         ))];
         let result = filter.check_host_with_ips("allowed.example", &resolved);
         assert!(!result.is_allowed());
+    }
+
+    fn public_only(exceptions: &[(&str, &[AddressClass])]) -> ResolvedAddressPolicy {
+        ResolvedAddressPolicy {
+            public_only: true,
+            exceptions: exceptions
+                .iter()
+                .map(|(pattern, classes)| ((*pattern).to_string(), classes.to_vec()))
+                .collect(),
+        }
+    }
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn test_default_policy_keeps_private_answers_allowed() {
+        // Without public_only nothing changes: nono allows RFC 1918 by design.
+        let filter = ProxyFilter::new(&["corp.example".to_string()])
+            .with_resolved_address_policy(&ResolvedAddressPolicy::default());
+        for addr in ["10.0.0.1", "127.0.0.1", "100.64.0.1", "fd00::1"] {
+            assert!(
+                filter
+                    .check_host_with_ips("corp.example", &[ip(addr)])
+                    .is_allowed(),
+                "{addr}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_public_only_refuses_allowlisted_name_at_each_non_public_class() {
+        let filter = ProxyFilter::new(&["api.example.com".to_string()])
+            .with_resolved_address_policy(&public_only(&[]));
+        for (addr, class) in [
+            ("10.0.0.1", AddressClass::Private),
+            ("172.16.0.1", AddressClass::Private),
+            ("192.168.1.1", AddressClass::Private),
+            ("fd7a:115c:a1e0::53", AddressClass::Private),
+            ("127.0.0.1", AddressClass::Loopback),
+            ("::1", AddressClass::Loopback),
+            ("100.100.100.100", AddressClass::Cgnat),
+            ("0.0.0.0", AddressClass::Unspecified),
+            ("::ffff:10.0.0.1", AddressClass::Private),
+        ] {
+            let result = filter.check_host_with_ips("api.example.com", &[ip(addr)]);
+            assert_eq!(
+                result,
+                FilterResult::DenyAddressClass {
+                    host: "api.example.com".to_string(),
+                    ip: ip(addr),
+                    class,
+                },
+                "{addr}"
+            );
+        }
+        // Link-local stays the library's own refusal.
+        let result = filter.check_host_with_ips("api.example.com", &[ip("169.254.1.1")]);
+        assert!(matches!(result, FilterResult::DenyLinkLocal { .. }));
+        // Public answers pass.
+        let result = filter.check_host_with_ips("api.example.com", &[ip("104.18.7.96")]);
+        assert!(result.is_allowed());
+    }
+
+    #[test]
+    fn test_public_only_one_non_public_answer_refuses_the_host() {
+        let filter = ProxyFilter::new(&["api.example.com".to_string()])
+            .with_resolved_address_policy(&public_only(&[]));
+        let result =
+            filter.check_host_with_ips("api.example.com", &[ip("104.18.7.96"), ip("10.0.0.1")]);
+        assert!(matches!(result, FilterResult::DenyAddressClass { .. }));
+    }
+
+    #[test]
+    fn test_public_only_exception_permits_only_its_classes() {
+        let filter = ProxyFilter::new(&[
+            "console.int.example".to_string(),
+            "*.corp.example".to_string(),
+        ])
+        .with_resolved_address_policy(&public_only(&[
+            ("console.int.example", &[AddressClass::Private]),
+            (
+                "*.corp.example",
+                &[AddressClass::Private, AddressClass::Cgnat],
+            ),
+        ]));
+        assert!(
+            filter
+                .check_host_with_ips("console.int.example", &[ip("10.1.2.3")])
+                .is_allowed()
+        );
+        // Case and a trailing dot do not change the match.
+        assert!(
+            filter
+                .check_host_with_ips("Console.Int.Example.", &[ip("10.1.2.3")])
+                .is_allowed()
+        );
+        // The same name at a loopback or CGNAT address is still refused.
+        for addr in ["127.0.0.1", "100.64.0.1", "0.0.0.0"] {
+            assert!(
+                matches!(
+                    filter.check_host_with_ips("console.int.example", &[ip(addr)]),
+                    FilterResult::DenyAddressClass { .. }
+                ),
+                "{addr}"
+            );
+        }
+        // Link-local can never be excepted.
+        assert!(
+            !filter
+                .check_host_with_ips("console.int.example", &[ip("169.254.0.1")])
+                .is_allowed()
+        );
+        assert!(
+            filter
+                .check_host_with_ips("db.corp.example", &[ip("100.80.0.1")])
+                .is_allowed()
+        );
+        // A wildcard exception does not cover the bare suffix, which the
+        // allowlist does not allow either.
+        assert!(
+            !filter
+                .check_host_with_ips("corp.example", &[ip("10.0.0.1")])
+                .is_allowed()
+        );
+    }
+
+    #[test]
+    fn test_public_only_exception_does_not_allow_a_host() {
+        let filter =
+            ProxyFilter::new(&["api.example.com".to_string()]).with_resolved_address_policy(
+                &public_only(&[("console.int.example", &[AddressClass::Private])]),
+            );
+        let result = filter.check_host_with_ips("console.int.example", &[ip("10.1.2.3")]);
+        assert!(matches!(result, FilterResult::DenyNotAllowed { .. }));
+    }
+
+    #[test]
+    fn test_public_only_permits_an_ip_literal_the_allowlist_names() {
+        let filter = ProxyFilter::new(&["10.1.2.3".to_string(), "[fd00::5]:8443".to_string()])
+            .with_resolved_address_policy(&public_only(&[]));
+        assert!(
+            filter
+                .check_host_with_ips("10.1.2.3", &[ip("10.1.2.3")])
+                .is_allowed()
+        );
+        assert_eq!(*filter.named_ips, vec![ip("10.1.2.3"), ip("fd00::5")]);
+
+        // A wildcard names no address: a literal it matches is still gated.
+        let wildcard =
+            ProxyFilter::new(&["*".to_string()]).with_resolved_address_policy(&public_only(&[]));
+        assert!(matches!(
+            wildcard.check_host_with_ips("10.1.2.3", &[ip("10.1.2.3")]),
+            FilterResult::DenyAddressClass { .. }
+        ));
+        // So does allow-all.
+        let all = ProxyFilter::allow_all().with_resolved_address_policy(&public_only(&[]));
+        assert!(matches!(
+            all.check_host_with_ips("127.0.0.1", &[ip("127.0.0.1")]),
+            FilterResult::DenyAddressClass { .. }
+        ));
+    }
+
+    #[test]
+    fn test_named_ips_reads_literals_with_and_without_ports() {
+        let entries: Vec<String> = [
+            "10.1.2.3",
+            "127.0.0.1:8080",
+            "fd00::1",
+            "[fd00::2]",
+            "[fd00::3]:443",
+            "*.example.com",
+            "example.com:443",
+            "10.9.9.9:notaport",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(
+            named_ips(&entries),
+            vec![
+                ip("10.1.2.3"),
+                ip("127.0.0.1"),
+                ip("fd00::1"),
+                ip("fd00::2"),
+                ip("fd00::3")
+            ]
+        );
+    }
+
+    #[test]
+    fn test_denied_hosts_keep_the_address_policy() {
+        let filter = ProxyFilter::new(&["api.example.com".to_string()])
+            .with_resolved_address_policy(&public_only(&[]))
+            .with_denied_hosts(&["evil.example.com".to_string()]);
+        assert!(matches!(
+            filter.check_host_with_ips("api.example.com", &[ip("10.0.0.1")]),
+            FilterResult::DenyAddressClass { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_check_host_resolves_then_gates_the_answer() {
+        // localhost resolves to loopback on every host this runs on.
+        let filter = ProxyFilter::new(&["localhost".to_string()])
+            .with_resolved_address_policy(&public_only(&[]));
+        let check = filter.check_host("localhost", 80).await.unwrap();
+        assert!(matches!(
+            check.result,
+            FilterResult::DenyAddressClass {
+                class: AddressClass::Loopback,
+                ..
+            }
+        ));
+        assert!(check.resolved_addrs.is_empty());
+
+        let excepted = ProxyFilter::new(&["localhost".to_string()]).with_resolved_address_policy(
+            &public_only(&[("localhost", &[AddressClass::Loopback])]),
+        );
+        let check = excepted.check_host("localhost", 80).await.unwrap();
+        assert!(check.result.is_allowed());
+        assert!(!check.resolved_addrs.is_empty());
+        assert!(check.resolved_addrs.iter().all(|a| a.ip().is_loopback()));
     }
 }
