@@ -369,6 +369,7 @@ fn build_launch_options(args: &ProxyArgs) -> Result<ProxyLaunchOptions> {
         credential_capture,
         credential_providers,
         credential_routes,
+        allowlist_denial_message: network.and_then(|n| n.allowlist_denial_message.clone()),
         session_id: crate::session::generate_session_id(),
         enable_h2,
         resolved_addresses: network
@@ -567,6 +568,34 @@ mod tests {
         let args = parse_args(&["--allow-http2"]);
         let opts = build_launch_options(&args).expect("flag-only args are valid");
         assert!(opts.enable_h2);
+    }
+
+    #[test]
+    fn profile_allowlist_denial_message_reaches_the_proxy_config() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _env = cleared_env();
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let profile_path = dir.path().join("denial.json");
+        std::fs::write(
+            &profile_path,
+            r#"{
+                "meta": { "name": "denial-test" },
+                "network": {
+                    "allow_domain": ["allowed.example"],
+                    "allowlist_denial_message": "refused: {host}. Ask your person."
+                }
+            }"#,
+        )
+        .expect("write profile");
+
+        let args = parse_args(&["--profile", profile_path.to_str().expect("valid utf8")]);
+        let opts = build_launch_options(&args).expect("profile with a denial message is valid");
+        let config = crate::proxy_runtime::build_proxy_config_from_flags(&opts)
+            .expect("build_proxy_config_from_flags");
+        assert_eq!(
+            config.allowlist_denial_message.as_deref(),
+            Some("refused: {host}. Ask your person.")
+        );
     }
 
     #[test]
