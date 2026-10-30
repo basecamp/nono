@@ -638,8 +638,10 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
     #[cfg(target_os = "linux")]
     let seccomp_proxy_fallback = {
         let needs_proxy = matches!(caps.network_mode(), nono::NetworkMode::ProxyOnly { .. });
-        // Landlock policy opts out of seccomp-notify entirely (see its docs);
-        // honor that even though it leaves ProxyOnly's destination check unenforced.
+        // Landlock policy opts out of nono's network seccomp, the proxy-mode
+        // notify layer included (see its docs); honor that even though it
+        // leaves ProxyOnly's destination check unenforced. Opt-in mediations
+        // (AF_UNIX, file metadata) still install their listener.
         let no_seccomp_fallback = matches!(
             flags.sandbox_policy,
             crate::profile::LinuxSandboxPolicy::External
@@ -716,6 +718,16 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
     }
 
     #[cfg(target_os = "linux")]
+    if flags.metadata_mediation.is_write_grants() && nono::sandbox::is_wsl2() {
+        return Err(NonoError::SandboxInit(
+            "WSL2: linux.metadata_mediation = \"write_grants\" requires seccomp user \
+             notification, but WSL2 reports EBUSY for seccomp notify listeners. Disable \
+             metadata mediation or run on native Linux."
+                .to_string(),
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
     if flags.proc_comm_notify && nono::sandbox::is_wsl2() {
         return Err(NonoError::SandboxInit(
             "WSL2: NVIDIA GPU thread-name mediation requires seccomp user notification, \
@@ -768,6 +780,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
             proxy_fallback: seccomp_proxy_fallback,
             af_unix_mediation: flags.af_unix_mediation.is_pathname(),
             proc_comm_notify: flags.proc_comm_notify,
+            metadata_mediation: flags.metadata_mediation.is_write_grants(),
         },
         #[cfg(target_os = "linux")]
         sandbox_policy: flags.sandbox_policy,
