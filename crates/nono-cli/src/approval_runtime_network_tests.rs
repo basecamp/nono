@@ -186,6 +186,7 @@ impl Session {
                     ConnectAuthMode::Disabled,
                     None,
                     Some(&approval),
+                    None,
                 )
                 .await;
                 assert!(

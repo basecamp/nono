@@ -2030,6 +2030,7 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
                 state.config.require_auth,
                 ext_config,
                 state.audit_log.as_ref(),
+                state.config.allowlist_denial_message.as_deref(),
             )
             .await
         } else if state.config.external_proxy.is_some() {
@@ -2081,6 +2082,7 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
                 connect_auth_mode,
                 state.audit_log.as_ref(),
                 network_approval.as_ref(),
+                state.config.allowlist_denial_message.as_deref(),
             )
             .await
         } else {
@@ -2093,6 +2095,7 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
                 connect_auth_mode,
                 state.audit_log.as_ref(),
                 network_approval.as_ref(),
+                state.config.allowlist_denial_message.as_deref(),
             )
             .await
         }
@@ -2145,8 +2148,12 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
                 port,
                 &reason,
             );
-            let sanitised = reason.replace(['\r', '\n'], " ");
-            let response = format!("HTTP/1.1 403 Forbidden: {}\r\n\r\n", sanitised);
+            let response = crate::denial::host_denial_response(
+                state.config.allowlist_denial_message.as_deref(),
+                &host,
+                &check.result,
+                crate::denial::is_head(first_line),
+            );
             stream.write_all(response.as_bytes()).await?;
         } else {
             stream
@@ -2281,8 +2288,12 @@ async fn handle_forward_http(
             port,
             &reason,
         );
-        let sanitised = reason.replace(['\r', '\n'], " ");
-        let response = format!("HTTP/1.1 403 Forbidden: {}\r\n\r\n", sanitised);
+        let response = crate::denial::host_denial_response(
+            state.config.allowlist_denial_message.as_deref(),
+            &host,
+            &check.result,
+            crate::denial::is_head(first_line),
+        );
         stream.write_all(response.as_bytes()).await?;
         return Ok(());
     }
@@ -3463,6 +3474,239 @@ mod tests {
             !status.contains("407"),
             "lenient CONNECT auth must not challenge with 407, got: {status:?}"
         );
+        handle.shutdown();
+    }
+
+    const ALLOWLIST_DENIAL_MESSAGE: &str =
+        "refused: {host} is not reachable from the sandbox. Ask your person to allow it.";
+
+    /// Send `request` to the proxy at `port` and read until it closes.
+    async fn request_until_close(port: u16, request: &str) -> String {
+        let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        client.write_all(request.as_bytes()).await.unwrap();
+        let mut resp = Vec::new();
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.read_to_end(&mut resp),
+        )
+        .await;
+        String::from_utf8_lossy(&resp).to_string()
+    }
+
+    fn expected_allowlist_denial(host: &str) -> String {
+        let text = format!(
+            "refused: {host} is not reachable from the sandbox. Ask your person to allow it. \
+             [rule: net.allowlist]"
+        );
+        format!(
+            "HTTP/1.1 403 Forbidden: {text}\r\nX-Nono-Denied-By: net.allowlist\r\n\
+             Content-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{text}\n",
+            text.len() + 1
+        )
+    }
+
+    #[tokio::test]
+    async fn test_allowlist_denial_without_message_is_unchanged() {
+        let config = ProxyConfig {
+            allowed_hosts: vec!["allowed.invalid".to_string()],
+            require_auth: false,
+            ..Default::default()
+        };
+        let handle = start(config).await.unwrap();
+        let response = request_until_close(
+            handle.port,
+            "CONNECT denied.invalid:443 HTTP/1.1\r\nHost: denied.invalid:443\r\n\r\n",
+        )
+        .await;
+        assert_eq!(
+            response,
+            "HTTP/1.1 403 Forbidden: host denied.invalid:443 is not in the allowlist\r\n\r\n"
+        );
+        let response = request_until_close(
+            handle.port,
+            "GET http://denied.invalid/ HTTP/1.1\r\nHost: denied.invalid\r\n\r\n",
+        )
+        .await;
+        assert_eq!(
+            response,
+            "HTTP/1.1 403 Forbidden: host denied.invalid:80 is not in the allowlist\r\n\r\n"
+        );
+        handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_connect_allowlist_denial_uses_configured_message() {
+        let config = ProxyConfig {
+            allowed_hosts: vec!["allowed.invalid".to_string()],
+            require_auth: false,
+            allowlist_denial_message: Some(ALLOWLIST_DENIAL_MESSAGE.to_string()),
+            ..Default::default()
+        };
+        let handle = start(config).await.unwrap();
+        let response = request_until_close(
+            handle.port,
+            "CONNECT denied.invalid:443 HTTP/1.1\r\nHost: denied.invalid:443\r\n\r\n",
+        )
+        .await;
+        assert_eq!(response, expected_allowlist_denial("denied.invalid"));
+        handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_connect_deny_list_ignores_allowlist_denial_message() {
+        let config = ProxyConfig {
+            allowed_hosts: vec!["*.invalid".to_string()],
+            denied_hosts: vec!["blocked.invalid".to_string()],
+            require_auth: false,
+            allowlist_denial_message: Some(ALLOWLIST_DENIAL_MESSAGE.to_string()),
+            ..Default::default()
+        };
+        let handle = start(config).await.unwrap();
+        let response = request_until_close(
+            handle.port,
+            "CONNECT blocked.invalid:443 HTTP/1.1\r\nHost: blocked.invalid:443\r\n\r\n",
+        )
+        .await;
+        assert!(
+            response.starts_with("HTTP/1.1 403 Forbidden: ")
+                && !response.contains("X-Nono-Denied-By"),
+            "a deny-list refusal keeps the default response, got: {response:?}"
+        );
+        handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_forward_http_allowlist_denial_uses_configured_message() {
+        let config = ProxyConfig {
+            allowed_hosts: vec!["allowed.invalid".to_string()],
+            require_auth: false,
+            allowlist_denial_message: Some(ALLOWLIST_DENIAL_MESSAGE.to_string()),
+            ..Default::default()
+        };
+        let handle = start(config).await.unwrap();
+        let response = request_until_close(
+            handle.port,
+            "GET http://denied.invalid/ HTTP/1.1\r\nHost: denied.invalid\r\n\r\n",
+        )
+        .await;
+        assert_eq!(response, expected_allowlist_denial("denied.invalid"));
+        handle.shutdown();
+    }
+
+    /// Denies every network approval prompt.
+    struct DenyAllApprovals;
+
+    impl nono::ApprovalBackend for DenyAllApprovals {
+        fn request_approval(
+            &self,
+            _request: &nono::supervisor::ApprovalRequest,
+        ) -> nono::Result<nono::supervisor::ApprovalDecision> {
+            Ok(nono::supervisor::ApprovalDecision::Denied {
+                reason: "denied by test".to_string(),
+            })
+        }
+
+        fn backend_name(&self) -> &str {
+            "deny-all"
+        }
+    }
+
+    #[tokio::test]
+    async fn test_connect_approval_denial_keeps_default_response() {
+        // With a network approval backend, a CONNECT outside the allowlist
+        // goes to the backend, and the backend's refusal is not the
+        // allowlist's: it keeps the default response. Forward HTTP consults
+        // no backend, so its allowlist refusal still carries the message.
+        let config = ProxyConfig {
+            allowed_hosts: vec!["allowed.invalid".to_string()],
+            require_auth: false,
+            allowlist_denial_message: Some(ALLOWLIST_DENIAL_MESSAGE.to_string()),
+            ..Default::default()
+        };
+        let handle = start_with_network_approval(
+            config,
+            None,
+            None,
+            None,
+            Some(Arc::new(DenyAllApprovals)),
+            "test".to_string(),
+        )
+        .await
+        .unwrap();
+        let response = request_until_close(
+            handle.port,
+            "CONNECT denied.invalid:443 HTTP/1.1\r\nHost: denied.invalid:443\r\n\r\n",
+        )
+        .await;
+        assert_eq!(
+            response,
+            "HTTP/1.1 403 Forbidden: host denied.invalid:443 is not in the allowlist\r\n\r\n"
+        );
+        let response = request_until_close(
+            handle.port,
+            "GET http://denied.invalid/ HTTP/1.1\r\nHost: denied.invalid\r\n\r\n",
+        )
+        .await;
+        assert_eq!(response, expected_allowlist_denial("denied.invalid"));
+        handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_forward_http_head_allowlist_denial_has_no_body() {
+        let config = ProxyConfig {
+            allowed_hosts: vec!["allowed.invalid".to_string()],
+            require_auth: false,
+            allowlist_denial_message: Some(ALLOWLIST_DENIAL_MESSAGE.to_string()),
+            ..Default::default()
+        };
+        let handle = start(config).await.unwrap();
+        let mut client = tokio::net::TcpStream::connect(("127.0.0.1", handle.port))
+            .await
+            .unwrap();
+        client
+            .write_all(b"HEAD http://denied.invalid/ HTTP/1.1\r\nHost: denied.invalid\r\n\r\n")
+            .await
+            .unwrap();
+        let mut bytes = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.read_to_end(&mut bytes),
+        )
+        .await
+        .expect("the proxy closes the connection after the 403")
+        .unwrap();
+        let response = String::from_utf8_lossy(&bytes);
+        let expected = expected_allowlist_denial("denied.invalid");
+        let (headers, _) = expected.split_once("\r\n\r\n").unwrap();
+        // Nothing follows the header terminator, and the proxy closes the
+        // connection, so no stray bytes can be read as a next response.
+        assert_eq!(response, format!("{headers}\r\n\r\n"));
+        handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_external_proxy_allowlist_denial_uses_configured_message() {
+        let config = ProxyConfig {
+            allowed_hosts: vec!["allowed.invalid".to_string()],
+            require_auth: false,
+            external_proxy: Some(crate::config::ExternalProxyConfig {
+                address: "127.0.0.1:9".to_string(),
+                auth: None,
+                bypass_hosts: Vec::new(),
+            }),
+            allowlist_denial_message: Some(ALLOWLIST_DENIAL_MESSAGE.to_string()),
+            ..Default::default()
+        };
+        let handle = start(config).await.unwrap();
+        let response = request_until_close(
+            handle.port,
+            "CONNECT denied.invalid:443 HTTP/1.1\r\nHost: denied.invalid:443\r\n\r\n",
+        )
+        .await;
+        assert_eq!(response, expected_allowlist_denial("denied.invalid"));
         handle.shutdown();
     }
 
