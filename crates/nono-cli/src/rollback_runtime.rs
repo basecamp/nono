@@ -41,6 +41,7 @@ pub(crate) struct RollbackExitContext<'a> {
         Option<&'a Mutex<Vec<nono_proxy::audit::BufferedAuditEvent>>>,
     pub(crate) audit_integrity_enabled: bool,
     pub(crate) proxy_handle: Option<&'a nono_proxy::server::ProxyHandle>,
+    pub(crate) scoped_proxy_handles: &'a [nono_proxy::server::ProxyHandle],
     pub(crate) executable_identity: Option<&'a ExecutableIdentity>,
     pub(crate) audit_signer: Option<&'a AuditSigner>,
     pub(crate) redaction_policy: &'a nono::ScrubPolicy,
@@ -512,6 +513,7 @@ pub(crate) fn finalize_supervised_exit(ctx: RollbackExitContext<'_>) -> Result<F
         supervisor_network_audit_events,
         audit_integrity_enabled,
         proxy_handle,
+        scoped_proxy_handles,
         executable_identity,
         audit_signer,
         redaction_policy,
@@ -535,6 +537,13 @@ pub(crate) fn finalize_supervised_exit(ctx: RollbackExitContext<'_>) -> Result<F
         Vec::new,
         nono_proxy::server::ProxyHandle::drain_buffered_audit_events,
     );
+    // Command-scoped proxies (#1981) keep their own buffers and get the same
+    // live sink. Detach before draining for the same reason: an in-flight
+    // delivery lands in the buffer first, and none arrives after the seal.
+    for handle in scoped_proxy_handles {
+        handle.detach_audit_sink();
+        buffered_events.extend(handle.drain_buffered_audit_events());
+    }
     if let Some(events_mutex) = supervisor_network_audit_events {
         let mut supervisor_events = events_mutex.lock().map_err(|_| {
             nono::NonoError::Snapshot("Network audit event lock poisoned".to_string())
@@ -1031,5 +1040,327 @@ mod tests {
 
         metadata.session_id = "20260421-200001-22222".to_string();
         assert!(!record_session_in_ledger(&metadata));
+    }
+
+    /// Send a CONNECT for `host` that the proxy at `port` denies.
+    async fn send_denied_connect(port: u16, host: &str) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        stream
+            .write_all(
+                format!("CONNECT {host}:443 HTTP/1.1\r\nHost: {host}:443\r\n\r\n").as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        assert!(
+            String::from_utf8_lossy(&response).starts_with("HTTP/1.1 403"),
+            "expected the proxy to deny {host}"
+        );
+    }
+
+    /// Per-command proxies keep their own audit buffer. Finalization has to
+    /// drain those too, or a brokered command's network denials never reach
+    /// the session record.
+    #[test]
+    fn finalize_drains_command_scoped_proxy_audit_events() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state");
+        fs::create_dir_all(&state).unwrap();
+        let home = tmp.path().to_string_lossy().to_string();
+        let state_str = state.to_string_lossy().to_string();
+        let _env = EnvVarGuard::set_all(&[("HOME", &home), ("XDG_STATE_HOME", &state_str)]);
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let strict = || nono_proxy::config::ProxyConfig {
+            strict_filter: true,
+            allowed_hosts: Vec::new(),
+            ..nono_proxy::config::ProxyConfig::default()
+        };
+        let session_proxy = rt.block_on(nono_proxy::server::start(strict())).unwrap();
+        let scoped_proxies = vec![rt.block_on(nono_proxy::server::start(strict())).unwrap()];
+        rt.block_on(send_denied_connect(session_proxy.port, "session.example"));
+        rt.block_on(send_denied_connect(
+            scoped_proxies[0].port,
+            "command.example",
+        ));
+
+        let audit_state = create_audit_state(false, None, Some("scoped-proxy-drain"))
+            .unwrap()
+            .unwrap();
+        let command = vec!["/bin/true".to_string()];
+        let _outcome = finalize_supervised_exit(RollbackExitContext {
+            audit_state: Some(&audit_state),
+            rollback_state: None,
+            audit_snapshot_state: None,
+            audit_tracked_paths: Vec::new(),
+            audit_recorder: None,
+            supervisor_network_audit_events: None,
+            audit_integrity_enabled: false,
+            proxy_handle: Some(&session_proxy),
+            scoped_proxy_handles: &scoped_proxies,
+            executable_identity: None,
+            audit_signer: None,
+            redaction_policy: &nono::ScrubPolicy::secure_default(),
+            started: "2026-10-05T12:00:00Z",
+            ended: "2026-10-05T12:00:01Z",
+            command: &command,
+            exit_code: 0,
+            silent: true,
+            rollback_prompt_disabled: true,
+        })
+        .unwrap();
+
+        let meta =
+            nono::undo::SnapshotManager::load_session_metadata(&audit_state.session_dir).unwrap();
+        let denied: Vec<&str> = meta
+            .network_events
+            .iter()
+            .filter(|e| e.decision == nono::undo::NetworkAuditDecision::Deny)
+            .map(|e| e.target.as_str())
+            .collect();
+        assert!(
+            denied.contains(&"session.example"),
+            "session proxy denial missing: {denied:?}"
+        );
+        assert!(
+            denied.contains(&"command.example"),
+            "command proxy denial missing: {denied:?}"
+        );
+        assert!(
+            scoped_proxies[0].drain_audit_events().is_empty(),
+            "command proxy buffer must be drained"
+        );
+
+        session_proxy.shutdown();
+        scoped_proxies[0].shutdown();
+    }
+
+    fn strict_proxy_config() -> nono_proxy::config::ProxyConfig {
+        nono_proxy::config::ProxyConfig {
+            strict_filter: true,
+            allowed_hosts: Vec::new(),
+            ..nono_proxy::config::ProxyConfig::default()
+        }
+    }
+
+    /// A fresh session recorder that has recorded `session_started`, as
+    /// `execute_supervised_runtime` leaves it before attaching the sinks.
+    fn started_recorder(audit_state: &AuditState) -> std::sync::Arc<Mutex<AuditRecorder>> {
+        let recorder = AuditRecorder::new(audit_state.session_dir.clone()).unwrap();
+        let recorder = std::sync::Arc::new(Mutex::new(recorder));
+        recorder
+            .lock()
+            .unwrap()
+            .record_session_started(
+                "2026-10-30T12:00:00Z".to_string(),
+                vec!["/bin/true".to_string()],
+            )
+            .unwrap();
+        recorder
+    }
+
+    /// Network events for `target` in the session's append-only audit log.
+    fn logged_network_events(session_dir: &Path, target: &str) -> usize {
+        fs::read_to_string(session_dir.join("audit-events.ndjson"))
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|record| {
+                record["event"]["type"] == "network" && record["event"]["event"]["target"] == target
+            })
+            .count()
+    }
+
+    /// Network events for `target` in the session metadata.
+    fn recorded_network_events(session_dir: &Path, target: &str) -> usize {
+        nono::undo::SnapshotManager::load_session_metadata(session_dir)
+            .unwrap()
+            .network_events
+            .iter()
+            .filter(|event| event.target == target)
+            .count()
+    }
+
+    fn scoped_exit_context<'a>(
+        audit_state: &'a AuditState,
+        recorder: &'a Mutex<AuditRecorder>,
+        proxy_handle: Option<&'a nono_proxy::server::ProxyHandle>,
+        scoped_proxy_handles: &'a [nono_proxy::server::ProxyHandle],
+        command: &'a [String],
+        redaction_policy: &'a nono::ScrubPolicy,
+    ) -> RollbackExitContext<'a> {
+        RollbackExitContext {
+            audit_state: Some(audit_state),
+            rollback_state: None,
+            audit_snapshot_state: None,
+            audit_tracked_paths: Vec::new(),
+            audit_recorder: Some(recorder),
+            supervisor_network_audit_events: None,
+            audit_integrity_enabled: true,
+            proxy_handle,
+            scoped_proxy_handles,
+            executable_identity: None,
+            audit_signer: None,
+            redaction_policy,
+            started: "2026-10-30T12:00:00Z",
+            ended: "2026-10-30T12:00:01Z",
+            command,
+            exit_code: 0,
+            silent: true,
+            rollback_prompt_disabled: true,
+        }
+    }
+
+    /// Command-scoped proxies get the live sink the session proxy gets
+    /// (nolabs-ai/nono#2235), so each of their events is in the audit log
+    /// exactly once: a live one as it happens and not again at exit, one
+    /// emitted before the sink was attached replayed from the buffer.
+    #[test]
+    fn command_scoped_proxy_events_are_recorded_live_and_once() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state");
+        fs::create_dir_all(&state).unwrap();
+        let home = tmp.path().to_string_lossy().to_string();
+        let state_str = state.to_string_lossy().to_string();
+        let _env = EnvVarGuard::set_all(&[("HOME", &home), ("XDG_STATE_HOME", &state_str)]);
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let session_proxy = rt
+            .block_on(nono_proxy::server::start(strict_proxy_config()))
+            .unwrap();
+        let scoped_proxies = vec![
+            rt.block_on(nono_proxy::server::start(strict_proxy_config()))
+                .unwrap(),
+        ];
+        let audit_state = create_audit_state(false, None, Some("scoped-proxy-live"))
+            .unwrap()
+            .unwrap();
+        let session_dir = audit_state.session_dir.clone();
+        let recorder = started_recorder(&audit_state);
+
+        rt.block_on(send_denied_connect(scoped_proxies[0].port, "early.example"));
+        crate::supervised_runtime::attach_live_network_audit_sinks(
+            &recorder,
+            Some(&session_proxy),
+            &scoped_proxies,
+        );
+        rt.block_on(send_denied_connect(session_proxy.port, "session.example"));
+        rt.block_on(send_denied_connect(
+            scoped_proxies[0].port,
+            "command.example",
+        ));
+        assert_eq!(
+            logged_network_events(&session_dir, "command.example"),
+            1,
+            "a command proxy's event must be recorded live"
+        );
+        assert_eq!(logged_network_events(&session_dir, "early.example"), 0);
+
+        let command = vec!["/bin/true".to_string()];
+        let redaction_policy = nono::ScrubPolicy::secure_default();
+        let _outcome = finalize_supervised_exit(scoped_exit_context(
+            &audit_state,
+            &recorder,
+            Some(&session_proxy),
+            &scoped_proxies,
+            &command,
+            &redaction_policy,
+        ))
+        .unwrap();
+
+        for target in ["early.example", "session.example", "command.example"] {
+            assert_eq!(
+                logged_network_events(&session_dir, target),
+                1,
+                "{target}: once in the audit log"
+            );
+            assert_eq!(
+                recorded_network_events(&session_dir, target),
+                1,
+                "{target}: once in the session record"
+            );
+        }
+        let summary = nono::undo::SnapshotManager::load_session_metadata(&session_dir)
+            .unwrap()
+            .audit_integrity
+            .expect("integrity summary");
+        let verified = nono::audit::verify_audit_log(&session_dir, Some(&summary)).unwrap();
+        assert!(verified.records_verified);
+
+        session_proxy.shutdown();
+        scoped_proxies[0].shutdown();
+    }
+
+    /// A command proxy's delivery still in flight when the session ends must
+    /// land before the seal. Finalization detaches the scoped sinks before
+    /// draining, which waits for it. Without that, it reaches the recorder
+    /// after `session_ended`, is refused, and is buffered after the drain: in
+    /// neither the log nor the session record.
+    #[test]
+    fn finalize_waits_for_an_in_flight_command_scoped_proxy_event() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state");
+        fs::create_dir_all(&state).unwrap();
+        let home = tmp.path().to_string_lossy().to_string();
+        let state_str = state.to_string_lossy().to_string();
+        let _env = EnvVarGuard::set_all(&[("HOME", &home), ("XDG_STATE_HOME", &state_str)]);
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let scoped_proxies = vec![
+            rt.block_on(nono_proxy::server::start(strict_proxy_config()))
+                .unwrap(),
+        ];
+        let audit_state = create_audit_state(false, None, Some("scoped-proxy-in-flight"))
+            .unwrap()
+            .unwrap();
+        let session_dir = audit_state.session_dir.clone();
+        let recorder = started_recorder(&audit_state);
+
+        // The production sink, held at its start until released.
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = Mutex::new(release_rx);
+        let live = crate::supervised_runtime::live_network_audit_sink(&recorder);
+        scoped_proxies[0].attach_audit_sink(std::sync::Arc::new(move |event| {
+            let _ = entered_tx.send(());
+            let _ = release_rx.lock().unwrap().recv();
+            live(event)
+        }));
+
+        let command = vec!["/bin/true".to_string()];
+        let redaction_policy = nono::ScrubPolicy::secure_default();
+        let port = scoped_proxies[0].port;
+        let runtime = rt.handle().clone();
+        std::thread::scope(|scope| {
+            let connect = scope
+                .spawn(move || runtime.block_on(send_denied_connect(port, "inflight.example")));
+            entered_rx.recv().unwrap();
+            let finalize = scope.spawn(|| {
+                finalize_supervised_exit(scoped_exit_context(
+                    &audit_state,
+                    &recorder,
+                    None,
+                    &scoped_proxies,
+                    &command,
+                    &redaction_policy,
+                ))
+            });
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            release_tx.send(()).unwrap();
+            connect.join().unwrap();
+            let _outcome = finalize.join().unwrap().unwrap();
+        });
+
+        assert_eq!(logged_network_events(&session_dir, "inflight.example"), 1);
+        assert_eq!(recorded_network_events(&session_dir, "inflight.example"), 1);
+
+        scoped_proxies[0].shutdown();
     }
 }
