@@ -138,6 +138,9 @@ const RATE_LIMITED_CAPABILITY_AUDIT_BURST: u32 = crate::profile::NETWORK_DENIAL_
 /// `backend` recorded for requests the approval rate limiter refused.
 const RATE_LIMITED_CAPABILITY_BACKEND: &str = "supervisor-rate-limit";
 
+/// Decision reason recorded for each request the approval rate limiter refused.
+const RATE_LIMITED_CAPABILITY_REASON: &str = "approval rate limit exceeded";
+
 impl RateLimitedCapabilityAudit {
     pub(super) fn new() -> Self {
         Self {
@@ -166,14 +169,13 @@ impl RateLimitedCapabilityAudit {
 fn record_rate_limited_capability(
     config: &SupervisorConfig<'_>,
     request: nono::supervisor::ApprovalRequest,
+    reason: String,
 ) -> Result<()> {
     if let Some(recorder_mutex) = config.audit_recorder.as_ref() {
         let entry = AuditEntry {
             timestamp: std::time::SystemTime::now(),
             request,
-            decision: ApprovalDecision::Denied {
-                reason: "approval rate limit exceeded".to_string(),
-            },
+            decision: ApprovalDecision::Denied { reason },
             backend: RATE_LIMITED_CAPABILITY_BACKEND.to_string(),
             duration_ms: 0,
         };
@@ -187,8 +189,9 @@ fn record_rate_limited_capability(
 
 /// Emit one summary entry for rate-limited capability requests that were
 /// refused but not individually recorded, then reset the counter. The entry
-/// carries the most recent such request; its reason gives the count.
-/// Failures are logged, never fatal.
+/// carries the most recent such request. The count is in its decision reason,
+/// which `nono audit show` prints, and in the request reason. Failures are
+/// logged, never fatal.
 pub(super) fn flush_suppressed_rate_limited_capabilities(
     config: &SupervisorConfig<'_>,
     audit: &mut RateLimitedCapabilityAudit,
@@ -200,13 +203,15 @@ pub(super) fn flush_suppressed_rate_limited_capabilities(
     if count == 0 {
         return;
     }
+    let summary = format!(
+        "{count} capability requests were refused by the approval rate limiter but not \
+         individually recorded (audit rate limit exceeded); this is the most recent"
+    );
     if let nono::supervisor::ApprovalRequest::Capability { reason, .. } = &mut request {
-        *reason = Some(format!(
-            "{count} capability requests were refused by the approval rate limiter but not \
-             individually recorded (audit rate limit exceeded); this is the most recent"
-        ));
+        *reason = Some(summary.clone());
     }
-    if let Err(err) = record_rate_limited_capability(config, request) {
+    let reason = format!("{RATE_LIMITED_CAPABILITY_REASON}: {summary}");
+    if let Err(err) = record_rate_limited_capability(config, request, reason) {
         warn!(
             "Failed to record rate-limited capability request summary: {}",
             err
@@ -719,7 +724,11 @@ fn handle_received_filesystem_notification(
         let deny_result = deny_notif(notify_fd, notif.id);
         let audit_result = if rate_limited_audit.admit(&request) {
             flush_suppressed_rate_limited_capabilities(config, rate_limited_audit);
-            record_rate_limited_capability(config, request)
+            record_rate_limited_capability(
+                config,
+                request,
+                RATE_LIMITED_CAPABILITY_REASON.to_string(),
+            )
         } else {
             Ok(())
         };
@@ -2230,6 +2239,14 @@ mod tests {
             assert_eq!(entry["request"]["path"], "/last");
             let reason = entry["request"]["reason"].as_str().unwrap_or_default();
             assert!(reason.starts_with("3 capability requests"), "{reason}");
+            // `nono audit show` prints the decision reason, not the request's.
+            let decision_reason = entry["decision"]["Denied"]["reason"]
+                .as_str()
+                .unwrap_or_default();
+            assert!(
+                decision_reason.starts_with("approval rate limit exceeded: 3 capability requests"),
+                "{decision_reason}"
+            );
         }
 
         /// The summary is flushed when the supervisor loop exits
@@ -2269,8 +2286,12 @@ mod tests {
             };
             super::super::flush_suppressed_rate_limited_capabilities(&config, &mut audit);
             assert!(
-                super::super::record_rate_limited_capability(&config, capability_request("/late"))
-                    .is_err(),
+                super::super::record_rate_limited_capability(
+                    &config,
+                    capability_request("/late"),
+                    super::super::RATE_LIMITED_CAPABILITY_REASON.to_string(),
+                )
+                .is_err(),
                 "a sealed recorder refuses a late entry"
             );
 
