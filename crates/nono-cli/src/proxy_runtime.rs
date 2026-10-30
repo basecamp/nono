@@ -2001,6 +2001,10 @@ fn load_supervisor_credential_source(
     source: &crate::command_policy::AmbientCredentialSourceConfig,
     outer_caps: &CapabilitySet,
 ) -> Result<String> {
+    // (A dry run reads no source: the route is planned as declared.)
+    if crate::credential_runtime::plan_only() {
+        return Ok(String::new());
+    }
     match source {
         crate::command_policy::AmbientCredentialSourceConfig::Keystore { key } => {
             nono::keystore::load_secret_by_ref(
@@ -3218,6 +3222,51 @@ fn remove_tool_sandbox_routes(
 /// Start a narrow proxy for each effective command sandbox that uses proxy
 /// routes. Each caller and intercept override gets a distinct listener and
 /// credential, so a child cannot reuse broader authority from another scope.
+/// A stand-in loopback proxy address for a scope the dry run does not start a
+/// proxy for. Its port stands for the one a run binds; the report leaves
+/// brokered commands' network out of its contract.
+const DRY_RUN_SCOPED_PROXY_URL: &str = "http://nono:dry-run@127.0.0.1:9";
+
+/// The command-scoped proxy environment a run of `intent` would start, without
+/// starting a proxy: every scope `start_command_scoped_proxies` serves (the
+/// same selection), each with a stand-in loopback address. For
+/// `nono run --dry-run --json`, so each brokered sandbox is built by the
+/// launch code as a run builds it.
+pub(crate) fn dry_run_scoped_proxy_env_vars(
+    intent: &NetworkIntent,
+) -> BTreeMap<String, Vec<(String, String)>> {
+    let mut envs = BTreeMap::new();
+    let NetworkIntent::ProxyFiltered(proxy) = intent else {
+        return envs;
+    };
+    let Some(policies) = proxy
+        .command_policies
+        .as_ref()
+        .filter(|_| proxy.is_active())
+    else {
+        return envs;
+    };
+    for (scope, sandbox) in command_proxy_scopes(policies) {
+        let credential_names = scoped_proxy_credential_names(proxy, sandbox);
+        if requires_command_scoped_proxy(sandbox, &credential_names) {
+            envs.insert(
+                scope,
+                vec![
+                    (
+                        "HTTP_PROXY".to_string(),
+                        DRY_RUN_SCOPED_PROXY_URL.to_string(),
+                    ),
+                    (
+                        "HTTPS_PROXY".to_string(),
+                        DRY_RUN_SCOPED_PROXY_URL.to_string(),
+                    ),
+                ],
+            );
+        }
+    }
+    envs
+}
+
 fn start_command_scoped_proxies(
     proxy: &ProxyLaunchOptions,
     base: &nono_proxy::config::ProxyConfig,
