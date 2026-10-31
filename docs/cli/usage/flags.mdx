@@ -1317,6 +1317,7 @@ nono run --profile my-agent --workdir . --allow-cwd --dry-run --json -- my-agent
   ],
   "unix_sockets": [],
   "metadata_paths": ["/usr/local/bin", "/usr/bin"],
+  "metadata_children": ["/usr/local/bin", "/usr/bin"],
   "seatbelt_grants": [
     {"access": "metadata", "filter": "subpath", "path": "/Users/luke/.ssh"},
     {"access": "read", "filter": "subpath", "path": "/etc"},
@@ -1347,7 +1348,8 @@ nono run --profile my-agent --workdir . --allow-cwd --dry-run --json -- my-agent
 - **Declared paths.** A brokered command resolves its policy again each time it runs, so `declared` lists every path its policy declares, as the launch expands it before checking that it exists: a path that isn't there yet, which a later run would grant once it is, is still reported, and a dynamic `@` token that expands to nothing from the working directory is listed with `"expanded": null`. `cwd_dependent` holds the entries whose grant depends on the command's working directory: an `@` token, and an entry still relative once its variables are filled (`.`, `data`, `$UID/data`).
 - **`/proc`.** On Linux a read grant of `/proc/self` is reported as `/proc`, as the exec widens it for the child. A grant the launch remaps to the child's own process after it forks (`/proc/self/...`, `/proc/thread-self/...`, `/dev/fd`, `/dev/std*`) is reported in that self-relative spelling with `"process_relative": true`.
 - **`metadata_paths`.** On macOS, the paths whose metadata the sandbox can read beyond `filesystem`, metadata only: the `$PATH` directories (each with its children, ancestors and symlink hops) and, with command mediation, the working directory's ancestors. Empty on Linux.
-- **Versioning.** `version` changes when a field changes or is removed, and when a new field holds what a reader must read to keep the contract; other new fields are added without a version change. Version 2 added `seatbelt_grants`, which takes the generated Seatbelt rules it lists out of `incomplete`: a reader of version 1 would pass grants it never read.
+- **`metadata_children`.** On macOS, the directories whose direct children's metadata the sandbox can also read: each `$PATH` directory, so a command lookup of `<dir>/<command>` gets `ENOENT` rather than a deny. It lists no working-directory ancestor, whose grant reaches that path alone. Empty on Linux.
+- **Versioning.** `version` changes when a field changes or is removed, and when a new field holds what a reader must read to keep the contract; other new fields are added without a version change. Version 2 added `seatbelt_grants`, which takes the generated Seatbelt rules it lists out of `incomplete`: a reader of version 1 would pass grants it never read. It also added `metadata_children`, since `metadata_paths` can't say which of its entries reach their direct children.
 
 #### `--verbose`, `-v`
 

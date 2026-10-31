@@ -149,6 +149,7 @@ pub(crate) fn dry_run_report(
         "filesystem": caps.fs_capabilities().iter().map(session_fs_value).collect::<Vec<_>>(),
         "unix_sockets": caps.unix_socket_capabilities().iter().map(socket_value).collect::<Vec<_>>(),
         "metadata_paths": metadata_paths(&caps).into_iter().chain(runtime_metadata).collect::<Vec<_>>(),
+        "metadata_children": metadata_children(&caps),
         "seatbelt_grants": seatbelt_grants,
         // (Each as declared: a dry run reads no credential source.)
         "credentials": {
@@ -235,6 +236,26 @@ fn metadata_paths(caps: &CapabilitySet) -> Vec<Value> {
 
 #[cfg(not(target_os = "macos"))]
 fn metadata_paths(_caps: &CapabilitySet) -> Vec<Value> {
+    Vec::new()
+}
+
+/// The directories whose direct children's metadata the run lets the
+/// sandbox read (macOS: each `$PATH` directory, for `<dir>/<command>`, as
+/// `(regex "^<dir>/[^/]+$")`). Each is in `metadata_paths` too, which names
+/// what reaches that path alone and can't say which of its entries reach
+/// their children. Linux grants none.
+#[cfg(target_os = "macos")]
+fn metadata_children(caps: &CapabilitySet) -> Vec<Value> {
+    let mut seen = std::collections::HashSet::new();
+    caps.path_metadata_dirs()
+        .iter()
+        .filter(|p| seen.insert(p.as_path()))
+        .map(|p| path_value(p))
+        .collect()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn metadata_children(_caps: &CapabilitySet) -> Vec<Value> {
     Vec::new()
 }
 

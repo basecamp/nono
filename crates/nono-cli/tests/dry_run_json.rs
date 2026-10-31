@@ -767,6 +767,11 @@ fn the_report_follows_the_launch_on_this_platform() {
     );
     assert_eq!(report["incomplete"], serde_json::json!([]), "{report}");
     assert_eq!(report["seatbelt_grants"], serde_json::json!([]), "{report}");
+    assert_eq!(
+        report["metadata_children"],
+        serde_json::json!([]),
+        "{report}"
+    );
     assert_eq!(report["workdir"], "/", "{report}");
 }
 
