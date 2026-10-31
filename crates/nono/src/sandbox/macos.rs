@@ -9,7 +9,7 @@ use crate::capability::{
     AccessMode, CapabilitySet, MACOS_PORT_RANGE_LIMIT, NetworkMode, merge_port_ranges,
 };
 use crate::error::{NonoError, Result};
-use crate::path::collect_symlink_hops;
+use crate::path::{PathMetadataRead, collect_symlink_hops};
 use crate::sandbox::SupportInfo;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
@@ -723,89 +723,21 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
     // Lets libc command resolution get ENOENT (not a deny's EPERM, which aborts
     // the PATH walk) on ungranted/missing $PATH entries. Metadata only, emitted
     // last so it overrides read denies without exposing file contents.
-    // Separate sets: a dir may appear both as a $PATH target (needs a direct-
-    // children regex, to cover <dir>/<command>) and as another entry's
-    // ancestor (needs only literal). Tracking them together would let an
-    // ancestor-first literal suppress the later direct-children grant and
-    // re-break nested lookups.
-    let mut seen_dir = std::collections::HashSet::new();
-    let mut seen_ancestor = std::collections::HashSet::new();
-    for dir in caps.path_metadata_dirs() {
-        let dir_str = dir.to_str().ok_or_else(|| {
-            NonoError::SandboxInit(format!(
-                "PATH directory contains non-UTF-8 bytes: {}",
-                dir.display()
-            ))
-        })?;
-        if seen_dir.insert(dir_str.to_string()) {
-            // Command resolution only stats direct children (`<dir>/<command>`),
-            // never descends recursively, so scope the grant to that instead of
-            // a recursive `subpath` — the latter would expose metadata for the
-            // entire subtree nested under a $PATH dir.
-            let literal = escape_path(dir_str)?;
-            profile.push_str(&format!(
-                "(allow file-read-metadata (literal \"{}\"))\n",
-                literal
-            ));
-            let regex = regex_escape_path_for_seatbelt(dir_str)?;
-            profile.push_str(&format!(
-                "(allow file-read-metadata (regex \"^{}/[^/]+$\"))\n",
-                regex
-            ));
-        }
-        // Ancestors (literal): Seatbelt checks metadata on every component
-        // during traversal. A dir's own grant already covers it and its
-        // ancestors-were-walked, so stop at the first already-covered one.
-        let mut current = dir.parent();
-        while let Some(parent) = current {
-            let Some(parent_str) = parent.to_str() else {
-                break;
-            };
-            if parent_str == "/" || parent_str.is_empty() {
-                break;
-            }
-            if seen_dir.contains(parent_str) || !seen_ancestor.insert(parent_str.to_string()) {
-                break;
-            }
-            let escaped = escape_path(parent_str)?;
-            profile.push_str(&format!(
-                "(allow file-read-metadata (literal \"{}\"))\n",
-                escaped
-            ));
-            current = parent.parent();
-        }
-
-        // A $PATH dir reached through a multi-hop symlink needs metadata
-        // grants on the intermediate hops too, or the kernel denies EPERM
-        // (not ENOENT) dereferencing one, aborting the PATH walk.
-        for hop in collect_symlink_hops(dir) {
-            let Some(hop_str) = hop.to_str() else {
-                continue;
-            };
-            if !seen_dir.contains(hop_str) && seen_ancestor.insert(hop_str.to_string()) {
-                let escaped = escape_path(hop_str)?;
+    // The reads, in emission order, come from `path_metadata_reads`, which
+    // the dry-run report lists too.
+    for read in crate::path::path_metadata_reads(caps.path_metadata_dirs())? {
+        match read {
+            PathMetadataRead::Path(path) => {
                 profile.push_str(&format!(
                     "(allow file-read-metadata (literal \"{}\"))\n",
-                    escaped
+                    escape_path(&path)?
                 ));
             }
-            let mut current = hop.parent();
-            while let Some(parent) = current {
-                let Some(parent_str) = parent.to_str() else {
-                    break;
-                };
-                if parent_str == "/" || parent_str.is_empty() {
-                    break;
-                }
-                if seen_dir.contains(parent_str) || !seen_ancestor.insert(parent_str.to_string()) {
-                    break;
-                }
-                let escaped = escape_path(parent_str)?;
+            PathMetadataRead::Children(dir) => {
                 profile.push_str(&format!(
-                    "(allow file-read-metadata (literal \"{}\"))\n",
-                    escaped
+                    "(allow file-read-metadata (regex \"^{}/[^/]+$\"))\n",
+                    regex_escape_path_for_seatbelt(&dir)?
                 ));
-                current = parent.parent();
             }
         }
     }

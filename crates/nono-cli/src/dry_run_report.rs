@@ -134,6 +134,7 @@ pub(crate) fn dry_run_report(
             "{runtime_allows} Seatbelt allow rule(s) command mediation adds to the session at launch"
         ));
     }
+    let (metadata_paths, metadata_children) = path_metadata(&caps)?;
     let limits = caps.resource_limits();
     let commands = mediation
         .children
@@ -148,8 +149,8 @@ pub(crate) fn dry_run_report(
         "out_of_scope": OUT_OF_SCOPE,
         "filesystem": caps.fs_capabilities().iter().map(session_fs_value).collect::<Vec<_>>(),
         "unix_sockets": caps.unix_socket_capabilities().iter().map(socket_value).collect::<Vec<_>>(),
-        "metadata_paths": metadata_paths(&caps).into_iter().chain(runtime_metadata).collect::<Vec<_>>(),
-        "metadata_children": metadata_children(&caps),
+        "metadata_paths": metadata_paths.into_iter().chain(runtime_metadata).collect::<Vec<_>>(),
+        "metadata_children": metadata_children,
         "seatbelt_grants": seatbelt_grants,
         // (Each as declared: a dry run reads no credential source.)
         "credentials": {
@@ -223,40 +224,32 @@ fn session_fs_value(cap: &FsCapability) -> Value {
     value
 }
 
-/// The directories whose metadata the run lets the sandbox read beyond the
-/// list (macOS: each `$PATH` directory, its children, ancestors and symlink
-/// hops, as `file-read-metadata` only). Linux grants none.
+/// The metadata-only reads the run grants beyond the list, as
+/// (`metadata_paths`, `metadata_children`). macOS: for each `$PATH`
+/// directory, `file-read-metadata` on the directory, its ancestors, the
+/// intermediate hops of a symlink chain reaching it and their ancestors (each
+/// that path alone), and on the directory's direct children (as
+/// `(regex "^<dir>/[^/]+$")`, for `<dir>/<command>`). The same function
+/// computes the profile's rules, so the two lists are what the profile
+/// grants. Linux grants none.
 #[cfg(target_os = "macos")]
-fn metadata_paths(caps: &CapabilitySet) -> Vec<Value> {
-    caps.path_metadata_dirs()
-        .iter()
-        .map(|p| path_value(p))
-        .collect()
+fn path_metadata(caps: &CapabilitySet) -> Result<(Vec<Value>, Vec<Value>)> {
+    let mut paths = Vec::new();
+    let mut children = Vec::new();
+    for read in nono::path::path_metadata_reads(caps.path_metadata_dirs())? {
+        match read {
+            nono::path::PathMetadataRead::Path(p) => paths.push(path_value(Path::new(&p))),
+            nono::path::PathMetadataRead::Children(d) => {
+                children.push(path_value(Path::new(&d)));
+            }
+        }
+    }
+    Ok((paths, children))
 }
 
 #[cfg(not(target_os = "macos"))]
-fn metadata_paths(_caps: &CapabilitySet) -> Vec<Value> {
-    Vec::new()
-}
-
-/// The directories whose direct children's metadata the run lets the
-/// sandbox read (macOS: each `$PATH` directory, for `<dir>/<command>`, as
-/// `(regex "^<dir>/[^/]+$")`). Each is in `metadata_paths` too, which names
-/// what reaches that path alone and can't say which of its entries reach
-/// their children. Linux grants none.
-#[cfg(target_os = "macos")]
-fn metadata_children(caps: &CapabilitySet) -> Vec<Value> {
-    let mut seen = std::collections::HashSet::new();
-    caps.path_metadata_dirs()
-        .iter()
-        .filter(|p| seen.insert(p.as_path()))
-        .map(|p| path_value(p))
-        .collect()
-}
-
-#[cfg(not(target_os = "macos"))]
-fn metadata_children(_caps: &CapabilitySet) -> Vec<Value> {
-    Vec::new()
+fn path_metadata(_caps: &CapabilitySet) -> Result<(Vec<Value>, Vec<Value>)> {
+    Ok((Vec::new(), Vec::new()))
 }
 
 /// The plan's network: its mode, and the port exceptions the capability set
