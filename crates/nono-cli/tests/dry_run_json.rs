@@ -56,7 +56,7 @@ fn reports_resolved_session_grants_and_resources() {
     fs::create_dir_all(&flag_dir).expect("create flag dir");
     let report = report(&t, &json, |run| run.read(&flag_dir).memory("64M"));
 
-    assert_eq!(report["version"], 1);
+    assert_eq!(report["version"], 2);
     for dir in ["cache-a", "cache-b"] {
         let entry = fs_entry(&report, &canon(&ws.join(dir)))
             .unwrap_or_else(|| panic!("glob match {dir} listed: {report}"));
@@ -766,6 +766,7 @@ fn the_report_follows_the_launch_on_this_platform() {
         |run| run,
     );
     assert_eq!(report["incomplete"], serde_json::json!([]), "{report}");
+    assert_eq!(report["seatbelt_grants"], serde_json::json!([]), "{report}");
     assert_eq!(report["workdir"], "/", "{report}");
 }
 

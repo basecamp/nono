@@ -14,8 +14,10 @@
 //!
 //! Its contract is that capability set. What else a run does is out of it and
 //! named in `out_of_scope`. What would widen filesystem access beyond the set
-//! (capability elevation, a Seatbelt allow rule) is named in `incomplete`, so a
-//! program that decides on the report fails closed when it is non-empty.
+//! is either listed as a path grant (a generated Seatbelt allow rule of a shape
+//! read back exactly, in `seatbelt_grants`) or named in `incomplete` (capability
+//! elevation, any other Seatbelt allow rule), so a program that decides on the
+//! report fails closed when `incomplete` is non-empty.
 
 use std::path::Path;
 
@@ -28,8 +30,11 @@ use crate::launch_runtime::{LaunchPlan, NetworkIntent};
 use crate::tool_sandbox::DryRunChild;
 
 /// The report's format version: a new field is added without a change; a
-/// field changed or removed gets a new version.
-pub(crate) const DRY_RUN_REPORT_VERSION: u32 = 1;
+/// field changed or removed gets a new version, and so does a new field a
+/// reader must read to keep the contract (2: `seatbelt_grants`, which takes
+/// the generated Seatbelt allow rules it lists out of `incomplete`, so a
+/// reader of 1 would pass what it never read).
+pub(crate) const DRY_RUN_REPORT_VERSION: u32 = 2;
 
 /// What a run does that the report does not cover: out of its contract.
 pub(crate) const OUT_OF_SCOPE: &[&str] = &[
@@ -105,7 +110,8 @@ pub(crate) fn dry_run_report(
                 .to_string(),
         );
     }
-    incomplete.extend(seatbelt_widenings(&caps, raw_rules));
+    let (widenings, seatbelt_grants) = seatbelt_widenings(&caps, raw_rules);
+    incomplete.extend(widenings);
     // (The rules command mediation's runtime adds to the session's set at
     // launch, on macOS: its execute gate's `(allow process-exec*)`, which is
     // the execute allowlist, out of the contract; metadata reads of the
@@ -143,6 +149,7 @@ pub(crate) fn dry_run_report(
         "filesystem": caps.fs_capabilities().iter().map(session_fs_value).collect::<Vec<_>>(),
         "unix_sockets": caps.unix_socket_capabilities().iter().map(socket_value).collect::<Vec<_>>(),
         "metadata_paths": metadata_paths(&caps).into_iter().chain(runtime_metadata).collect::<Vec<_>>(),
+        "seatbelt_grants": seatbelt_grants,
         // (Each as declared: a dry run reads no credential source.)
         "credentials": {
             "env": plan.loaded_secrets.iter().map(|secret| secret.env_var.clone()).collect::<Vec<_>>(),
@@ -274,16 +281,159 @@ fn network_mode(intent: &NetworkIntent, caps: &CapabilitySet) -> &'static str {
 /// The path of a generated `(allow file-read-metadata (literal "PATH"))`
 /// rule, unescaped as `escape_seatbelt_path` escapes it; none for any other.
 fn metadata_literal(rule: &str) -> Option<String> {
-    let inner = rule
-        .trim()
-        .strip_prefix("(allow file-read-metadata (literal \"")?
-        .strip_suffix("\"))")?;
-    let mut out = String::new();
-    let mut chars = inner.chars();
+    seatbelt_grant(rule)
+        .filter(|grant| grant.access == "metadata" && grant.filter == "literal")
+        .map(|grant| grant.path)
+}
+
+/// A generated Seatbelt allow rule read back as a path grant: what it lets the
+/// sandbox do there (`access`) and how its filter reaches from `path`
+/// (`filter`). The record is at least as wide as the rule, never narrower:
+///
+/// - `access`: `metadata` (`file-read-metadata` alone), `read` (`file-read*`,
+///   `file-read-data`), `write` (`file-write*`, `file-write-data`, with
+///   `file-read-metadata` beside them or not) or `readwrite` (a read op and a
+///   write op); `read` and `write` each also stand for the entries' metadata.
+/// - `filter`: `literal` (that path itself), `subpath` (it and everything
+///   beneath it), or `atomic_temp` (the entries beside `path` named
+///   `<path>.tmp.<digits>.<hex>`, the atomic-write siblings of a write grant;
+///   the regex's `$` also matches before one final line terminator).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SeatbeltGrant {
+    access: &'static str,
+    filter: &'static str,
+    path: String,
+}
+
+impl SeatbeltGrant {
+    fn value(&self) -> Value {
+        json!({ "access": self.access, "filter": self.filter, "path": self.path })
+    }
+}
+
+/// The ops a path grant may hold: each `(read, write, metadata)`.
+const SEATBELT_FILE_OPS: &[(&str, (bool, bool, bool))] = &[
+    ("file-read-metadata", (false, false, true)),
+    ("file-read*", (true, false, false)),
+    ("file-read-data", (true, false, false)),
+    ("file-write*", (false, true, false)),
+    ("file-write-data", (false, true, false)),
+];
+
+/// The regex `add_atomic_write_rule` puts after a write grant's escaped path.
+const ATOMIC_TEMP_SUFFIX: &str = r"\.tmp\.[0-9]+\.[0-9a-f]+$";
+
+/// `rule` read back as a path grant, when it is one of the shapes the
+/// preparation generates and nothing else:
+///
+/// - `(allow OP... (literal "PATH"))` or `(allow OP... (subpath "PATH"))`, each
+///   OP one of `SEATBELT_FILE_OPS`, PATH absolute and unescaped as the exact
+///   inverse of `escape_seatbelt_path` (the deny groups' `file-read-metadata`,
+///   the symlink pairs' `file-read*`, keychain database grants);
+/// - `(allow file-write* file-read-metadata (regex #"^PATH\.tmp\.[0-9]+\.[0-9a-f]+$"))`,
+///   PATH unescaped as the exact inverse of `regex_escape_path`
+///   (`add_atomic_write_rule`).
+///
+/// Anything else is none, and stays in `incomplete`: another op, filter or
+/// regex, a second filter or rule, a comment, other spacing, an escape the
+/// escaper never writes. And a rule is read back only when the generator's own
+/// code renders the record it reads to that rule byte for byte, so no rule
+/// stands for a path other than the one it was generated from.
+fn seatbelt_grant(rule: &str) -> Option<SeatbeltGrant> {
+    let body = rule.strip_prefix("(allow ")?.strip_suffix("\"))")?;
+    // (No op holds a space or a parenthesis, so the first " (" ends the ops.)
+    let (ops, filter) = body.split_once(" (")?;
+    if let Some(regex) = filter.strip_prefix("regex #\"") {
+        let path = regex
+            .strip_prefix('^')?
+            .strip_suffix(ATOMIC_TEMP_SUFFIX)
+            .and_then(regex_unescape)?;
+        if ops != "file-write* file-read-metadata"
+            || !path.starts_with('/')
+            || crate::capability_ext::atomic_write_rule(&path) != rule
+        {
+            return None;
+        }
+        return Some(SeatbeltGrant {
+            access: "write",
+            filter: "atomic_temp",
+            path,
+        });
+    }
+    let (filter, quoted) = if let Some(quoted) = filter.strip_prefix("literal \"") {
+        ("literal", quoted)
+    } else {
+        ("subpath", filter.strip_prefix("subpath \"")?)
+    };
+    let path = seatbelt_unescape(quoted).filter(|path| path.starts_with('/'))?;
+    let (mut read, mut write, mut metadata) = (false, false, false);
+    for op in ops.split(' ') {
+        let (_, (r, w, m)) = SEATBELT_FILE_OPS.iter().find(|(name, _)| *name == op)?;
+        read |= r;
+        write |= w;
+        metadata |= m;
+    }
+    let access = match (read, write, metadata) {
+        (true, true, _) => "readwrite",
+        (true, false, _) => "read",
+        (false, true, _) => "write",
+        (false, false, true) => "metadata",
+        (false, false, false) => return None,
+    };
+    let escaped = crate::policy::escape_seatbelt_path(&path).ok()?;
+    if format!("(allow {ops} ({filter} \"{escaped}\"))") != rule {
+        return None;
+    }
+    Some(SeatbeltGrant {
+        access,
+        filter,
+        path,
+    })
+}
+
+/// The exact inverse of `escape_seatbelt_path`: `\\` and `\"` are the only
+/// escapes it writes, a bare `"` would end the string, and it refuses every
+/// control character. Any of those otherwise is none.
+fn seatbelt_unescape(quoted: &str) -> Option<String> {
+    let mut out = String::with_capacity(quoted.len());
+    let mut chars = quoted.chars();
     while let Some(c) = chars.next() {
         match c {
-            '\\' => out.push(chars.next()?),
+            '\\' => match chars.next()? {
+                c @ ('\\' | '"') => out.push(c),
+                _ => return None,
+            },
             '"' => return None,
+            c if c.is_control() => return None,
+            c => out.push(c),
+        }
+    }
+    Some(out)
+}
+
+/// The characters `regex_escape_path` writes with a backslash before them:
+/// every ICU metacharacter outside a set, and the `"` that would end the
+/// Seatbelt string.
+const REGEX_ESCAPED: &[char] = &[
+    '.', '+', '*', '?', '(', ')', '[', ']', '{', '}', '|', '^', '$', '\\', '"',
+];
+
+/// The exact inverse of `regex_escape_path`: each of `REGEX_ESCAPED` only
+/// after a backslash, and a backslash only before one of them, so the regex
+/// matches the path's characters themselves and nothing else. (In a `#"…"`
+/// string the backslashes reach the regex engine as written, which is what
+/// the generated `\.tmp\.` relies on.) A control character, which ICU reads
+/// as itself but the escaper never had to consider, is none.
+fn regex_unescape(escaped: &str) -> Option<String> {
+    let mut out = String::with_capacity(escaped.len());
+    let mut chars = escaped.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => match chars.next()? {
+                c if REGEX_ESCAPED.contains(&c) => out.push(c),
+                _ => return None,
+            },
+            c if REGEX_ESCAPED.contains(&c) || c.is_control() => return None,
             c => out.push(c),
         }
     }
@@ -300,12 +450,14 @@ fn seatbelt_allows(rule: &str) -> bool {
 
 /// The Seatbelt rules that can grant beyond the capability list: the
 /// profile's raw rules the set applies, whatever they say, and every other
-/// `allow` rule the preparation generated (a keychain grant, say). Deny rules
-/// only narrow.
-fn seatbelt_widenings(caps: &CapabilitySet, raw_rules: &[String]) -> Vec<String> {
+/// `allow` rule the preparation generated (a deny group's metadata read, say).
+/// A generated rule `seatbelt_grant` reads back is listed as its path grant;
+/// what stays is named for `incomplete`. Deny rules only narrow.
+fn seatbelt_widenings(caps: &CapabilitySet, raw_rules: &[String]) -> (Vec<String>, Vec<Value>) {
     let mut out = Vec::new();
     // (Only the raw rules the prepared set still applies: none on Linux, and
-    // none a trust policy stripped.)
+    // none a trust policy stripped. A raw rule is never read back as a grant,
+    // even one spelled as a generated rule is: the profile wrote it.)
     let applied_raw = raw_rules
         .iter()
         .filter(|rule| caps.platform_rules().contains(rule))
@@ -315,17 +467,24 @@ fn seatbelt_widenings(caps: &CapabilitySet, raw_rules: &[String]) -> Vec<String>
             "{applied_raw} raw Seatbelt rule(s) (unsafe_macos_seatbelt_rules) the capability list cannot show"
         ));
     }
-    let generated = caps
+    let mut grants = Vec::new();
+    let mut generated = 0;
+    for rule in caps
         .platform_rules()
         .iter()
         .filter(|rule| !raw_rules.contains(rule) && seatbelt_allows(rule))
-        .count();
+    {
+        match seatbelt_grant(rule) {
+            Some(grant) => grants.push(grant.value()),
+            None => generated += 1,
+        }
+    }
     if generated > 0 {
         out.push(format!(
-            "{generated} generated Seatbelt allow rule(s) that grant beyond the capability list"
+            "{generated} generated Seatbelt allow rule(s) that grant beyond the capability list and seatbelt_grants"
         ));
     }
-    out
+    (out, grants)
 }
 
 /// One brokered sandbox: what its launch builds (filesystem, sockets, the
@@ -372,7 +531,7 @@ fn child_value(child: &DryRunChild, workdir: &Path, outer_caps: &CapabilitySet) 
     let launch = match &child.launch {
         Ok(launch) => {
             let raw = &child.sandbox.unsafe_macos_seatbelt_rules;
-            let mut incomplete = seatbelt_widenings(&launch.caps, raw);
+            let (mut incomplete, seatbelt_grants) = seatbelt_widenings(&launch.caps, raw);
             // (A grant the launch spec carries resolved for the supervisor's own
             // process: the child, a different process, can't apply it, and its
             // launch stops. Reported in its self-relative spelling.)
@@ -398,6 +557,7 @@ fn child_value(child: &DryRunChild, workdir: &Path, outer_caps: &CapabilitySet) 
                 "filesystem": filesystem,
                 "unix_sockets": launch.caps.unix_socket_capabilities().iter().map(|c| without_source(socket_value(c))).collect::<Vec<_>>(),
                 "exec_paths": launch.exec_paths.iter().map(|p| path_value(p)).collect::<Vec<_>>(),
+                "seatbelt_grants": seatbelt_grants,
             })
         }
         Err(reason) => json!({
@@ -406,6 +566,7 @@ fn child_value(child: &DryRunChild, workdir: &Path, outer_caps: &CapabilitySet) 
             "filesystem": [],
             "unix_sockets": [],
             "exec_paths": [],
+            "seatbelt_grants": [],
         }),
     };
     if let (Some(object), Some(launch)) = (value.as_object_mut(), launch.as_object()) {
@@ -529,21 +690,20 @@ mod tests {
     fn seatbelt_allows_beyond_the_list_are_named() -> Result<()> {
         let mut caps = CapabilitySet::new();
         caps.add_platform_rule("(deny file-read* (subpath \"/a\"))".to_string())?;
-        assert!(
-            seatbelt_widenings(&caps, &[]).is_empty(),
+        assert_eq!(
+            seatbelt_widenings(&caps, &[]),
+            (vec![], vec![]),
             "a deny only narrows"
         );
         caps.add_platform_rule(
             "(deny file-read* (subpath \"/b\")) (allow file-read* (subpath \"/c\"))".to_string(),
         )?;
-        assert_eq!(
-            seatbelt_widenings(&caps, &[]).len(),
-            1,
-            "an allow anywhere in a rule widens"
-        );
+        let (incomplete, grants) = seatbelt_widenings(&caps, &[]);
+        assert_eq!(incomplete.len(), 1, "an allow anywhere in a rule widens");
+        assert!(grants.is_empty(), "and isn't read back: {grants:?}");
         let unapplied = vec!["(allow file-read* (subpath \"/d\"))".to_string()];
         assert_eq!(
-            seatbelt_widenings(&caps, &unapplied).len(),
+            seatbelt_widenings(&caps, &unapplied).0.len(),
             1,
             "a raw rule the set doesn't apply counts for nothing"
         );
@@ -564,7 +724,219 @@ mod tests {
             metadata_literal(r#"(allow file-read* (literal "/x"))"#),
             None
         );
+        assert_eq!(
+            metadata_literal(r#"(allow file-read-metadata (subpath "/x"))"#),
+            None
+        );
         Ok(())
+    }
+
+    /// Paths that hold every character an escaper treats specially.
+    const AWKWARD_PATHS: &[&str] = &[
+        "/a",
+        "/",
+        "/Users/luke/Library/Application Support/x",
+        r#"/a/b "c""#,
+        r"/a\b",
+        r#"/a\"b"#,
+        r"/a\\",
+        "/x.y+z*w?(v)[u]{t}|s^r$q",
+        "/a/.tmp.1.f",
+        "/a/allow (literal \"/\")",
+        "/a/é/日本",
+    ];
+
+    fn grant(access: &'static str, filter: &'static str, path: &str) -> Option<SeatbeltGrant> {
+        Some(SeatbeltGrant {
+            access,
+            filter,
+            path: path.to_string(),
+        })
+    }
+
+    #[test]
+    fn generated_rules_read_back_as_the_paths_they_were_generated_from() -> Result<()> {
+        for path in AWKWARD_PATHS {
+            let escaped = crate::policy::escape_seatbelt_path(path)?;
+            // (The deny groups' stat-only read, as `emit_macos_deny_rules_for_path`
+            // writes it for a directory or a path that isn't there, and for a file.)
+            let absent = format!("/nonexistent-dry-run-report{path}");
+            let mut caps = CapabilitySet::new();
+            crate::policy::emit_macos_deny_rules_for_path(Path::new(&absent), &mut caps)?;
+            let (incomplete, grants) = seatbelt_widenings(&caps, &[]);
+            // (Its deny rules count as allows when the path says "allow":
+            // `seatbelt_allows` errs toward `incomplete`.)
+            assert_eq!(
+                incomplete.len(),
+                usize::from(path.contains("allow")),
+                "{path}: {incomplete:?}"
+            );
+            assert_eq!(
+                grants,
+                vec![json!({ "access": "metadata", "filter": "subpath", "path": absent })],
+                "{path}"
+            );
+            for (rule, want) in [
+                (
+                    format!("(allow file-read-metadata (literal \"{escaped}\"))"),
+                    grant("metadata", "literal", path),
+                ),
+                // (The symlink pairs.)
+                (
+                    format!("(allow file-read* (subpath \"{escaped}\"))"),
+                    grant("read", "subpath", path),
+                ),
+                // (Keychain database grants: specific and wildcard ops, apart.)
+                (
+                    format!("(allow file-read-data (literal \"{escaped}\"))"),
+                    grant("read", "literal", path),
+                ),
+                (
+                    format!("(allow file-write-data (literal \"{escaped}\"))"),
+                    grant("write", "literal", path),
+                ),
+                (
+                    format!("(allow file-write* (literal \"{escaped}\"))"),
+                    grant("write", "literal", path),
+                ),
+                (
+                    format!("(allow file-read* file-write* (subpath \"{escaped}\"))"),
+                    grant("readwrite", "subpath", path),
+                ),
+                (
+                    format!("(allow file-write* file-read-metadata (literal \"{escaped}\"))"),
+                    grant("write", "literal", path),
+                ),
+                (
+                    crate::capability_ext::atomic_write_rule(path),
+                    grant("write", "atomic_temp", path),
+                ),
+            ] {
+                assert_eq!(seatbelt_grant(&rule), want, "{rule}");
+            }
+        }
+        // (A file the deny group finds: a literal.)
+        let file =
+            std::env::current_exe().map_err(|e| nono::NonoError::SandboxInit(e.to_string()))?;
+        let mut caps = CapabilitySet::new();
+        crate::policy::emit_macos_deny_rules_for_path(&file, &mut caps)?;
+        assert_eq!(
+            seatbelt_widenings(&caps, &[]).1,
+            vec![json!({ "access": "metadata", "filter": "literal", "path": file.to_str() })]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_rule_of_any_other_shape_is_not_read_back() {
+        let atomic = crate::capability_ext::atomic_write_rule("/a");
+        assert_eq!(
+            atomic,
+            r#"(allow file-write* file-read-metadata (regex #"^/a\.tmp\.[0-9]+\.[0-9a-f]+$"))"#,
+            "the shape the cases below vary"
+        );
+        for rule in [
+            // Not a path.
+            r#"(allow file-read* (literal "a"))"#,
+            r#"(allow file-read* (literal ""))"#,
+            r#"(allow file-read* (subpath "~/a"))"#,
+            // Another op, beside one that is read back or alone.
+            r#"(allow file-ioctl (literal "/a"))"#,
+            r#"(allow file-read* file-ioctl (literal "/a"))"#,
+            r#"(allow file-read-xattr (literal "/a"))"#,
+            r#"(allow file* (literal "/a"))"#,
+            r#"(allow process-exec* (literal "/a"))"#,
+            r#"(allow network-outbound (literal "/a"))"#,
+            r#"(allow mach-lookup (global-name "/a"))"#,
+            r#"(allow file-read*)"#,
+            r#"(allow default)"#,
+            // Another filter, or more than one.
+            r#"(allow file-read* (path "/a"))"#,
+            r#"(allow file-read* (prefix "/a"))"#,
+            r#"(allow file-read* (vnode-type REGULAR-FILE))"#,
+            r#"(allow file-read* (literal "/a") (literal "/b"))"#,
+            r#"(allow file-read* (require-any (literal "/a")))"#,
+            r#"(allow file-read* (require-all (literal "/a") (vnode-type REGULAR-FILE)))"#,
+            r#"(allow file-read* (literal "/a"))(allow file-read* (subpath "/"))"#,
+            r#"(allow file-read* (literal "/a")) (allow file-read* (subpath "/b"))"#,
+            // Any regex but the one, on any op but its own.
+            r#"(allow file-read* (regex #"^/a$"))"#,
+            r#"(allow file-read-metadata (regex #"^/a\.tmp\.[0-9]+\.[0-9a-f]+$"))"#,
+            r#"(allow file-write* (regex #"^/a\.tmp\.[0-9]+\.[0-9a-f]+$"))"#,
+            r#"(allow file-read-metadata file-write* (regex #"^/a\.tmp\.[0-9]+\.[0-9a-f]+$"))"#,
+            r#"(allow file-write* file-read-metadata (regex #"/a\.tmp\.[0-9]+\.[0-9a-f]+$"))"#,
+            r#"(allow file-write* file-read-metadata (regex #"^/a\.tmp\.[0-9]+\.[0-9a-f]+"))"#,
+            r#"(allow file-write* file-read-metadata (regex #"^/a\.tmp\.[0-9]*\.[0-9a-f]+$"))"#,
+            r#"(allow file-write* file-read-metadata (regex #"^/a\.tmp\.[0-9]+\.[0-9a-z]+$"))"#,
+            r#"(allow file-write* file-read-metadata (regex #"^/a.b\.tmp\.[0-9]+\.[0-9a-f]+$"))"#,
+            r#"(allow file-write* file-read-metadata (regex #"^/a/.*\.tmp\.[0-9]+\.[0-9a-f]+$"))"#,
+            r#"(allow file-write* file-read-metadata (regex #"^/a/[^/]+\.tmp\.[0-9]+\.[0-9a-f]+$"))"#,
+            r#"(allow file-write* file-read-metadata (regex #"^/a|/b\.tmp\.[0-9]+\.[0-9a-f]+$"))"#,
+            r#"(allow file-write* file-read-metadata (regex #"^/a\\.tmp\.[0-9]+\.[0-9a-f]+$"))"#,
+            r#"(allow file-write* file-read-metadata (regex #"^/a\d\.tmp\.[0-9]+\.[0-9a-f]+$"))"#,
+            r#"(allow file-write* file-read-metadata (regex #"^/a\/b\.tmp\.[0-9]+\.[0-9a-f]+$"))"#,
+            r#"(allow file-write* file-read-metadata (regex #"^\.tmp\.[0-9]+\.[0-9a-f]+$"))"#,
+            r#"(allow file-write* file-read-metadata (regex #"^a\.tmp\.[0-9]+\.[0-9a-f]+$"))"#,
+            r#"(allow file-write* file-read-metadata (regex "^/a\.tmp\.[0-9]+\.[0-9a-f]+$"))"#,
+            r#"(allow file-write* file-read-metadata (regex #"^/a\.tmp\.[0-9]+\.[0-9a-f]+$") (literal "/b"))"#,
+            // An escape the escaper never writes, or a quote it always escapes.
+            r#"(allow file-read* (literal "/a\n"))"#,
+            r#"(allow file-read* (literal "/a\x41;"))"#,
+            r#"(allow file-read* (literal "/a"b"))"#,
+            r#"(allow file-read* (literal "/a\"))"#,
+            "(allow file-read* (literal \"/a\u{7}\"))",
+            "(allow file-read* (literal \"/a\nb\"))",
+            // Other spacing, a comment, a deny.
+            r#"(allow  file-read* (literal "/a"))"#,
+            r#"(allow file-read*  (literal "/a"))"#,
+            r#"(allow file-read* (literal  "/a"))"#,
+            r#"(allow file-read* (literal "/a") )"#,
+            r#"( allow file-read* (literal "/a"))"#,
+            r#" (allow file-read* (literal "/a"))"#,
+            r#"(allow file-read* (literal "/a")) "#,
+            "(allow\tfile-read* (literal \"/a\"))",
+            r#"(allow file-read* #| c |# (literal "/a"))"#,
+            "(allow file-read*; c\n (literal \"/a\"))",
+            r#"(deny file-read* (literal "/a"))"#,
+            r#"(allow (literal "/a"))"#,
+        ] {
+            assert_eq!(seatbelt_grant(rule), None, "{rule}");
+        }
+    }
+
+    #[test]
+    fn a_rule_is_read_back_only_as_the_escaper_writes_it() {
+        // (Each decodes to a path some other spelling of which the escaper
+        // writes, or to none: the record never names a path the rule doesn't.)
+        for rule in [
+            r#"(allow file-read* (literal "/a\\\\"))"#,
+            r#"(allow file-write* file-read-metadata (regex #"^/a\\\.tmp\.[0-9]+\.[0-9a-f]+$"))"#,
+            r#"(allow file-write* file-read-metadata (regex #"^/a\"\.tmp\.[0-9]+\.[0-9a-f]+$"))"#,
+        ] {
+            let read = seatbelt_grant(rule);
+            if let Some(grant) = &read {
+                let again = if grant.filter == "atomic_temp" {
+                    crate::capability_ext::atomic_write_rule(&grant.path)
+                } else {
+                    format!(
+                        "(allow file-read* ({} \"{}\"))",
+                        grant.filter,
+                        crate::policy::escape_seatbelt_path(&grant.path).unwrap_or_default()
+                    )
+                };
+                assert_eq!(again, rule, "{rule} read back as {grant:?}");
+            }
+        }
+        assert_eq!(
+            seatbelt_grant(r#"(allow file-read* (literal "/a\\\\"))"#),
+            grant("read", "literal", r"/a\\")
+        );
+        assert_eq!(
+            seatbelt_grant(
+                r#"(allow file-write* file-read-metadata (regex #"^/a\"\.tmp\.[0-9]+\.[0-9a-f]+$"))"#
+            ),
+            grant("write", "atomic_temp", "/a\"")
+        );
     }
 
     #[test]
