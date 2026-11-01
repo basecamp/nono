@@ -291,12 +291,14 @@ fn path_filters_for_cap(cap: &crate::capability::FsCapability) -> Result<Vec<Str
 ///
 /// One deny per spelling the write rules emit for the grant: the resolved
 /// path, and `original` when it differs (as in `path_filters_for_cap`). A
-/// spelling whose parent lies within a directory write grant (either spelling)
-/// gets none, since Landlock allows that removal too. The parent is compared
-/// as written and canonicalized, as Landlock sees it: `/tmp/r/c` lies within
-/// a grant on `/private/tmp/r`, and so does a spelling that differs only in
-/// case on a case-insensitive volume. A parent that doesn't exist is compared
-/// as written.
+/// spelling whose parent lies within a directory write grant gets none, since
+/// Landlock allows that removal too. Containment is decided as Landlock
+/// decides it, on the parent's identity: the canonical parent against the
+/// grants' resolved roots, so `/tmp/r/c` lies within a grant on
+/// `/private/tmp/r` (as does a spelling that differs only in case on a
+/// case-insensitive volume), and `/r/link/c` does not when `link` leads out of
+/// `/r`. Only a parent that doesn't exist is compared as written, against
+/// either spelling of each grant.
 ///
 /// Single-file grants are left as they are. Landlock refuses to unlink a
 /// granted file whose parent isn't write-granted, too, but on macOS a file
@@ -308,17 +310,14 @@ fn write_root_unlink_denies(caps: &CapabilitySet) -> Result<Vec<String>> {
             !cap.is_file && matches!(cap.access, AccessMode::Write | AccessMode::ReadWrite)
         })
     };
-    let write_roots: Vec<&Path> = dir_writes()
-        .flat_map(|cap| [cap.resolved.as_path(), cap.original.as_path()])
-        .collect();
     let parent_write_granted = |path: &Path| {
-        path.parent().is_some_and(|parent| {
-            let canonical = std::fs::canonicalize(parent).ok();
-            write_roots.iter().any(|root| {
-                parent.starts_with(root)
-                    || canonical.as_deref().is_some_and(|c| c.starts_with(root))
+        path.parent()
+            .is_some_and(|parent| match std::fs::canonicalize(parent) {
+                Ok(canonical) => dir_writes().any(|cap| canonical.starts_with(&cap.resolved)),
+                Err(_) => dir_writes().any(|cap| {
+                    parent.starts_with(&cap.resolved) || parent.starts_with(&cap.original)
+                }),
             })
-        })
     };
 
     let mut rules = Vec::new();
@@ -2755,6 +2754,47 @@ mod tests {
             [
                 format!("(deny file-write-unlink (literal \"{granted_str}\"))"),
                 format!("(deny file-write-unlink (literal \"{}\"))", link.display()),
+            ]
+        );
+    }
+
+    #[test]
+    fn dir_write_grant_root_through_a_link_out_of_a_write_grant_is_kept() {
+        // The original spelling runs through a link inside a write grant that
+        // leads out of it: its parent, as Landlock sees it, is not granted.
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let granted = base.join("granted");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&granted).unwrap();
+        std::fs::create_dir_all(outside.join("child")).unwrap();
+        std::os::unix::fs::symlink(&outside, granted.join("link")).unwrap();
+        let granted_str = granted.to_str().unwrap();
+        let linked_child = granted.join("link").join("child");
+        let outside_child = outside.join("child");
+
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(dir_cap(granted_str, granted_str, AccessMode::ReadWrite));
+        caps.add_fs(dir_cap(
+            linked_child.to_str().unwrap(),
+            outside_child.to_str().unwrap(),
+            AccessMode::ReadWrite,
+        ));
+
+        let profile = generate_profile(&caps).unwrap();
+
+        assert_eq!(
+            unlink_denies(&profile),
+            [
+                format!("(deny file-write-unlink (literal \"{granted_str}\"))"),
+                format!(
+                    "(deny file-write-unlink (literal \"{}\"))",
+                    outside_child.display()
+                ),
+                format!(
+                    "(deny file-write-unlink (literal \"{}\"))",
+                    linked_child.display()
+                ),
             ]
         );
     }
