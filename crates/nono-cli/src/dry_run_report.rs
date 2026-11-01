@@ -1276,6 +1276,301 @@ mod tests {
         Ok(())
     }
 
+    /// The op-catalog guard: the profile with every branch the generator and
+    /// the run's preparation gate turned on, built by the preparation's own
+    /// emitters rather than hand-written rules, has every line read back as a
+    /// grant, bounded, or in `incomplete` **as one of the named classes the
+    /// report fails closed on by design**. A rule of any other kind landing in
+    /// `incomplete` fails the test, so a new op or shape an emitter starts
+    /// writing is a decision (bound it, read it back, or name it here), never a
+    /// silent refuse-all and never waved past.
+    ///
+    /// Branches covered, in `generate_profile` order: `(debug deny)`;
+    /// `ProcessInfoMode`, `IpcMode` and `SignalMode` at every value; parent
+    /// metadata (resolved, original and symlink hops); map-executable and ioctl
+    /// per read grant; the extension rules; read and write grants (dir, file,
+    /// and an original spelling through a symlink); the platform rules (every
+    /// macOS policy group, a literal and a glob deny, a bypass with a socket
+    /// inside it, the keychain DB exception, the unlink overrides,
+    /// `--allow-launch-services`, `--allow-gpu`, the instruction-file write
+    /// denies, the atomic-write rule, a raw rule); `$PATH` metadata; and each
+    /// network mode with DNS, Unix sockets (file, dir, subtree) and localhost
+    /// ports and ranges. Plus a brokered child's shape (`caps_from_spec`:
+    /// ProxyOnly with bind ports and a port range, fs, sockets, the child's
+    /// own platform rules).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn every_gated_feature_reads_back_or_is_a_named_incomplete() -> Result<()> {
+        use nono::{IpcMode, NetworkMode, ProcessInfoMode, SignalMode, UnixSocketMode};
+        use std::os::unix::fs::symlink;
+
+        /// The rules the report names in `incomplete` on purpose: grants
+        /// whose reach no `{access, filter, path}` record states.
+        fn named_incomplete(line: &str) -> Option<&'static str> {
+            if line.contains("(extension \"com.apple.app-sandbox.") {
+                Some("extension")
+            } else if line.contains("(require-all (regex #\"^") && line.contains("\\.sb-") {
+                Some("keychain save temp")
+            } else if line.contains("/\\.fl[0-9A-Fa-f]+$") || line.contains("user\\.kb)$") {
+                Some("keychain runtime files")
+            } else if line.starts_with("(allow file-read-metadata (regex #\"") {
+                Some("glob deny metadata")
+            } else {
+                None
+            }
+        }
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp.path().canonicalize().expect("canon");
+        for dir in [
+            "readdir",
+            "writedir",
+            "real/bin",
+            "R",
+            "denied",
+            "denied/sock",
+            "socks",
+        ] {
+            std::fs::create_dir_all(base.join(dir)).expect("dir");
+        }
+        std::fs::write(base.join("write.json"), b"{}").expect("file");
+        std::fs::write(base.join("CLAUDE.md"), b"x").expect("file");
+        std::fs::write(base.join("denied/f"), b"x").expect("file");
+        symlink(base.join("real/bin"), base.join("R/hop")).expect("hop");
+        symlink(base.join("R/hop"), base.join("pathdir")).expect("pathdir");
+        symlink(base.join("writedir"), base.join("wlink")).expect("wlink");
+        let s = |p: &str| base.join(p).to_str().expect("utf-8").to_string();
+
+        let session = |pi: ProcessInfoMode,
+                       ipc: IpcMode,
+                       sig: SignalMode,
+                       net: NetworkMode|
+         -> Result<(CapabilitySet, Vec<String>)> {
+            let mut caps = CapabilitySet::new();
+            caps.set_seatbelt_debug_deny(true);
+            caps.set_extensions_enabled(true);
+            caps.set_process_info_mode_mut(pi);
+            caps.set_ipc_mode_mut(ipc);
+            caps.set_signal_mode_mut(sig);
+            caps.set_network_mode_mut(net);
+            // Every macOS policy group: deny groups, symlink pairs, unlink
+            // protection, the runtimes' grants.
+            let policy = crate::policy::load_embedded_policy()?;
+            let names: Vec<String> = crate::policy::list_groups(&policy)
+                .into_iter()
+                .map(str::to_string)
+                .collect();
+            let mut resolved = crate::policy::resolve_groups(&policy, &names, &mut caps)?;
+            crate::policy::add_deny_access_rules(
+                &s("denied"),
+                &mut caps,
+                &mut resolved.deny_paths,
+            )?;
+            crate::policy::add_glob_deny_rules(
+                &format!("{}/*.key", s("denied")),
+                &mut caps,
+                &mut resolved.deny_paths,
+            )?;
+            for (path, access) in [
+                ("readdir", AccessMode::Read),
+                ("writedir", AccessMode::ReadWrite),
+                ("denied", AccessMode::ReadWrite),
+            ] {
+                caps.add_fs(FsCapability::new_dir(base.join(path), access)?);
+            }
+            caps.add_fs(FsCapability::new_file(
+                base.join("write.json"),
+                AccessMode::ReadWrite,
+            )?);
+            caps.add_fs(FsCapability::new_dir(
+                base.join("wlink"),
+                AccessMode::Write,
+            )?);
+            // The keychain DB exception: a user grant on a keychain DB that
+            // no deny covers.
+            if let Some(db) = crate::policy::macos_user_keychain_dbs().into_iter().next() {
+                caps.add_fs(FsCapability {
+                    original: db.clone(),
+                    resolved: db,
+                    access: AccessMode::ReadWrite,
+                    is_file: true,
+                    source: CapabilitySource::User,
+                });
+            }
+            caps.add_unix_socket(UnixSocketCapability::new_file(
+                base.join("denied/sock/s"),
+                UnixSocketMode::ConnectBind,
+            )?);
+            caps.add_unix_socket(UnixSocketCapability::new_dir(
+                base.join("socks"),
+                UnixSocketMode::Connect,
+            )?);
+            caps.add_unix_socket(UnixSocketCapability::new_dir_subtree(
+                base.join("socks"),
+                UnixSocketMode::ConnectBind,
+            )?);
+            caps.add_localhost_port(3000);
+            caps.add_localhost_port_range(4000, 4002)?;
+            caps.add_path_metadata_dir(base.join("pathdir"));
+            let bypasses = crate::policy::apply_deny_overrides(
+                &[base.join("denied")],
+                &mut resolved.deny_paths,
+                &mut caps,
+            )?;
+            let deny_policy =
+                crate::policy::EffectiveDenyPolicy::from_applied_bypasses(&[], &bypasses);
+            crate::policy::apply_macos_keychain_db_exception(&mut caps, &deny_policy);
+            crate::instruction_deny::write_protect_verified_files(
+                &mut caps,
+                &[base.join("CLAUDE.md")],
+            )?;
+            caps.add_platform_rule(crate::capability_ext::atomic_write_rule(&s("write.json")))?;
+            crate::policy::apply_unlink_overrides(&mut caps);
+            crate::sandbox_prepare::maybe_enable_macos_launch_services(
+                &mut caps,
+                true,
+                true,
+                &["https://example.com".to_string()],
+                false,
+            )?;
+            crate::sandbox_prepare::maybe_enable_macos_gpu(&mut caps, true, true)?;
+            let raw = r#"(allow file-read* (subpath "/opt/raw"))"#.to_string();
+            caps.add_platform_rule(raw.clone())?;
+            Ok((caps, vec![raw]))
+        };
+
+        let child = || -> Result<(CapabilitySet, Vec<String>)> {
+            let mut caps = CapabilitySet::new();
+            caps.set_network_mode_mut(NetworkMode::ProxyOnly {
+                port: 8080,
+                bind_ports: vec![9000],
+            });
+            caps.add_localhost_port_range(5000, 5001)?;
+            caps.add_fs(FsCapability::new_dir(
+                base.join("readdir"),
+                AccessMode::Read,
+            )?);
+            caps.add_fs(FsCapability::new_file(
+                base.join("write.json"),
+                AccessMode::Write,
+            )?);
+            caps.add_unix_socket(UnixSocketCapability::new_dir(
+                base.join("socks"),
+                UnixSocketMode::Connect,
+            )?);
+            caps.add_platform_rule(r#"(deny file-write-unlink)"#)?;
+            crate::policy::apply_unlink_overrides(&mut caps);
+            Ok((caps, Vec::new()))
+        };
+
+        let mut variants = Vec::new();
+        for (pi, ipc, sig, net) in [
+            (
+                ProcessInfoMode::Isolated,
+                IpcMode::SharedMemoryOnly,
+                SignalMode::Isolated,
+                NetworkMode::Blocked,
+            ),
+            (
+                ProcessInfoMode::AllowSameSandbox,
+                IpcMode::Full,
+                SignalMode::AllowSameSandbox,
+                NetworkMode::ProxyOnly {
+                    port: 8080,
+                    bind_ports: vec![9000],
+                },
+            ),
+            (
+                ProcessInfoMode::AllowAll,
+                IpcMode::Full,
+                SignalMode::AllowAll,
+                NetworkMode::AllowAll,
+            ),
+        ] {
+            variants.push((format!("session {net:?}"), session(pi, ipc, sig, net)?));
+        }
+        variants.push(("brokered child".to_string(), child()?));
+
+        let mut seen_classes = std::collections::BTreeSet::new();
+        let mut seen_access = std::collections::BTreeSet::new();
+        for (label, (caps, raw)) in &variants {
+            let (grants, incomplete) = profile_grants(caps, raw)?;
+            for grant in &grants {
+                seen_access.insert(format!("{}/{}", grant["access"], grant["filter"]));
+            }
+            let profile = nono::sandbox::seatbelt_profile(caps)?;
+            let raw_lines: std::collections::HashSet<&str> =
+                raw.iter().flat_map(|r| r.lines()).collect();
+            // The direct-children rules, as profile_grants renders them.
+            let mut children = std::collections::HashSet::new();
+            for read in nono::path::path_metadata_reads(caps.path_metadata_dirs())? {
+                if let nono::path::PathMetadataRead::Children(dir) = read {
+                    children.insert(format!(
+                        "(allow file-read-metadata (regex \"^{}/[^/]+$\"))",
+                        nono::sandbox::seatbelt_path_regex(&dir)?
+                    ));
+                }
+            }
+            for line in profile.lines().filter(|l| !l.is_empty()) {
+                let in_incomplete = incomplete.iter().any(|m| m.ends_with(line));
+                if raw_lines.contains(line) {
+                    continue;
+                }
+                if in_incomplete {
+                    let class = named_incomplete(line).unwrap_or_else(|| {
+                        panic!("{label}: a rule of no named class went to incomplete: {line}")
+                    });
+                    seen_classes.insert(class);
+                } else {
+                    assert!(
+                        children.contains(line)
+                            || seatbelt_grant(line).is_some()
+                            || rule_is_bounded(line),
+                        "{label}: unaccounted rule: {line}"
+                    );
+                }
+            }
+            // A raw rule is always named, and only as a raw rule.
+            for rule in raw {
+                assert!(
+                    incomplete
+                        .iter()
+                        .any(|m| m.starts_with("a raw Seatbelt rule") && m.ends_with(rule)),
+                    "{label}: raw rule not named: {incomplete:?}"
+                );
+            }
+        }
+        // The variants reached what they claim to: every named class, and the
+        // grant kinds the preparation's emitters write.
+        for class in [
+            "extension",
+            "keychain save temp",
+            "keychain runtime files",
+            "glob deny metadata",
+        ] {
+            assert!(
+                seen_classes.contains(class),
+                "no {class} rule reached: {seen_classes:?}"
+            );
+        }
+        for kind in [
+            "\"metadata\"/\"literal\"",
+            "\"metadata\"/\"subpath\"",
+            "\"metadata\"/\"children\"",
+            "\"read\"/\"literal\"",
+            "\"read\"/\"subpath\"",
+            "\"write\"/\"subpath\"",
+            "\"write\"/\"literal\"",
+            "\"write\"/\"atomic_temp\"",
+        ] {
+            assert!(
+                seen_access.contains(kind),
+                "no {kind} grant read back: {seen_access:?}"
+            );
+        }
+        Ok(())
+    }
+
     #[test]
     fn access_and_source_names() {
         assert_eq!(access_name(AccessMode::Read), "read");
