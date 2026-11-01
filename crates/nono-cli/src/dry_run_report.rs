@@ -474,15 +474,21 @@ const DEVICE_IOCTL_RULES: &[&str] = &[
 /// a grant, a construct that is not an allow/deny s-expression — is not
 /// bounded and must go to `incomplete`.
 ///
-/// An `allow` is bounded only when its **first** op is a known non-file op and
-/// **no** op in the rule is a `file-*` op, so a rule that pairs a non-file op
-/// with a file op — `(allow process-exec* file-read* (subpath "/R"))`, which no
-/// current generator emits — fails closed rather than being waved past on its
-/// first op.
+/// A line is bounded only when it is a **single** top-level S-expression form
+/// (nothing but whitespace after its first balanced close) that is a `deny`, a
+/// `(version …)`/`(debug …)` header, or an `allow` whose ops are **all**
+/// non-file. So a line that carries a second form or a file op anywhere —
+/// `(deny X) (allow file-read* (subpath "/R"))`, `(allow process-fork
+/// file-read* (subpath "/opt/private"))`, neither of which a current generator
+/// emits — is not bounded and falls to `incomplete`, never waved past on its
+/// first form or op.
 #[cfg(any(target_os = "macos", test))]
 fn rule_is_bounded(line: &str) -> bool {
     if DEVICE_IOCTL_RULES.contains(&line) {
         return true;
+    }
+    if !is_single_form(line) {
+        return false;
     }
     let Some(body) = line.strip_prefix('(') else {
         return false;
@@ -500,6 +506,49 @@ fn rule_is_bounded(line: &str) -> bool {
                 && !ops.split([' ', ')']).any(|op| op.starts_with("file-"))
         }
         _ => false,
+    }
+}
+
+/// Whether `line` is one balanced parenthesised form with nothing but
+/// whitespace after it: the generator writes one form per line, so a line
+/// holding a second form is not generator output and is not bounded. (A quote
+/// or escape inside a string can't open or close a group here; a `"` toggles
+/// a string span so parens inside it don't count.)
+#[cfg(any(target_os = "macos", test))]
+fn is_single_form(line: &str) -> bool {
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut escaped = false;
+    let mut closed_at = None;
+    for (i, c) in line.char_indices() {
+        if in_str {
+            match c {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '"' => in_str = false,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            '"' => in_str = true,
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    closed_at = Some(i);
+                    break;
+                }
+                if depth < 0 {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    match closed_at {
+        Some(i) => line[i + 1..].trim().is_empty(),
+        None => false,
     }
 }
 
@@ -815,9 +864,16 @@ mod tests {
             // would wave the file grant past, so it must not be bounded.
             r#"(allow process-exec* file-read* (subpath "/R"))"#,
             r#"(allow signal file-write* (literal "/R"))"#,
+            // A second form on the line, after a bounded first form: a deny or
+            // a bounded allow must not shield a trailing file allow.
+            r#"(deny default) (allow file-read* (subpath "/R"))"#,
+            r#"(allow process-fork) (allow file-read* (subpath "/opt/private"))"#,
+            r#"(allow process-fork)(allow file-write* (literal "/R"))"#,
         ] {
             assert!(!rule_is_bounded(line), "{line}");
         }
+        // A lone deny that mentions a file op is still just a deny: bounded.
+        assert!(rule_is_bounded(r#"(deny file-read-data (subpath "/a"))"#));
     }
 
     #[test]
@@ -1124,7 +1180,7 @@ mod tests {
                 .filter(|r| r.contains("/opt/x"))
                 .cloned()
                 .collect();
-            let (grants, incomplete) = profile_grants(&caps, &raw)?;
+            let (_grants, incomplete) = profile_grants(&caps, &raw)?;
             // The direct-children rules, as profile_grants renders them.
             let mut children = std::collections::HashSet::new();
             for read in nono::path::path_metadata_reads(caps.path_metadata_dirs())? {

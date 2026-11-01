@@ -312,11 +312,14 @@ pub(crate) fn dry_run_children(plan: &LaunchPlan) -> Result<DryRunMediation> {
         // and sockets and the platform rules). The report generates the
         // profile from this same set, so it reads back what the launch applies.
         let mut granted = caps.clone();
-        let granted = runtime.grant_outer_caps(&mut granted).map(|()| granted)?;
+        let granted = runtime.grant_outer_caps(&mut granted).map(|()| granted);
+        // Clean up the runtime directory before propagating a grant error, as
+        // the macOS runtime disarms its preparation cleanup and has no
+        // drop-time cleanup: a failed dry run must not leave it behind.
         runtime.cleanup_runtime_dir();
         Ok(DryRunMediation {
             children,
-            session_caps: Some(granted),
+            session_caps: Some(granted?),
             credentials,
             unresolved,
         })
