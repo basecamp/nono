@@ -297,8 +297,9 @@ fn path_filters_for_cap(cap: &crate::capability::FsCapability) -> Result<Vec<Str
 /// grants' resolved roots, so `/tmp/r/c` lies within a grant on
 /// `/private/tmp/r` (as does a spelling that differs only in case on a
 /// case-insensitive volume), and `/r/link/c` does not when `link` leads out of
-/// `/r`. Only a parent that doesn't exist is compared as written, against
-/// either spelling of each grant.
+/// `/r`. A parent that can't be canonicalized (missing, or unreadable) counts
+/// as not granted, and the root keeps its deny: failing to see a grant only
+/// narrows.
 ///
 /// Single-file grants are left as they are. Landlock refuses to unlink a
 /// granted file whose parent isn't write-granted, too, but on macOS a file
@@ -312,12 +313,8 @@ fn write_root_unlink_denies(caps: &CapabilitySet) -> Result<Vec<String>> {
     };
     let parent_write_granted = |path: &Path| {
         path.parent()
-            .is_some_and(|parent| match std::fs::canonicalize(parent) {
-                Ok(canonical) => dir_writes().any(|cap| canonical.starts_with(&cap.resolved)),
-                Err(_) => dir_writes().any(|cap| {
-                    parent.starts_with(&cap.resolved) || parent.starts_with(&cap.original)
-                }),
-            })
+            .and_then(|parent| std::fs::canonicalize(parent).ok())
+            .is_some_and(|parent| dir_writes().any(|cap| parent.starts_with(&cap.resolved)))
     };
 
     let mut rules = Vec::new();
@@ -2656,22 +2653,71 @@ mod tests {
 
     #[test]
     fn dir_write_grant_root_under_write_grant_is_not_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let path = |rel: &str| base.join(rel).to_str().unwrap().to_string();
+        for rel in ["test/child", "test/a/b", "testx/c"] {
+            std::fs::create_dir_all(base.join(rel)).unwrap();
+        }
+
         let mut caps = CapabilitySet::new();
-        caps.add_fs(dir_cap("/test", "/test", AccessMode::ReadWrite));
+        caps.add_fs(dir_cap(&path("test"), &path("test"), AccessMode::ReadWrite));
         // Child of the grant, and deeper within it: Landlock allows removing both.
-        caps.add_fs(dir_cap("/test/child", "/test/child", AccessMode::ReadWrite));
-        caps.add_fs(dir_cap("/test/a/b", "/test/a/b", AccessMode::Write));
+        caps.add_fs(dir_cap(
+            &path("test/child"),
+            &path("test/child"),
+            AccessMode::ReadWrite,
+        ));
+        caps.add_fs(dir_cap(
+            &path("test/a/b"),
+            &path("test/a/b"),
+            AccessMode::Write,
+        ));
         // A sibling whose name extends the grant's is not within it.
-        caps.add_fs(dir_cap("/testx/c", "/testx/c", AccessMode::ReadWrite));
+        caps.add_fs(dir_cap(
+            &path("testx/c"),
+            &path("testx/c"),
+            AccessMode::ReadWrite,
+        ));
 
         let profile = generate_profile(&caps).unwrap();
 
-        assert!(profile.contains("(allow file-write* (subpath \"/test/child\"))"));
+        assert!(profile.contains(&format!(
+            "(allow file-write* (subpath \"{}\"))",
+            path("test/child")
+        )));
         assert_eq!(
             unlink_denies(&profile),
             [
-                "(deny file-write-unlink (literal \"/test\"))",
-                "(deny file-write-unlink (literal \"/testx/c\"))",
+                format!("(deny file-write-unlink (literal \"{}\"))", path("test")),
+                format!("(deny file-write-unlink (literal \"{}\"))", path("testx/c")),
+            ]
+        );
+    }
+
+    #[test]
+    fn dir_write_grant_root_whose_parent_is_missing_is_kept() {
+        // A parent that can't be canonicalized has no identity to check, so
+        // the root keeps its deny even under a grant as written.
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(dir_cap(
+            "/nono-missing/p",
+            "/nono-missing/p",
+            AccessMode::ReadWrite,
+        ));
+        caps.add_fs(dir_cap(
+            "/nono-missing/p/c",
+            "/nono-missing/p/c",
+            AccessMode::ReadWrite,
+        ));
+
+        let profile = generate_profile(&caps).unwrap();
+
+        assert_eq!(
+            unlink_denies(&profile),
+            [
+                "(deny file-write-unlink (literal \"/nono-missing/p\"))",
+                "(deny file-write-unlink (literal \"/nono-missing/p/c\"))",
             ]
         );
     }
@@ -2801,15 +2847,21 @@ mod tests {
 
     #[test]
     fn dir_write_grant_root_under_read_grant_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::create_dir_all(base.join("test/child")).unwrap();
+        let parent = base.join("test").to_str().unwrap().to_string();
+        let child = base.join("test/child").to_str().unwrap().to_string();
+
         let mut caps = CapabilitySet::new();
-        caps.add_fs(dir_cap("/test", "/test", AccessMode::Read));
-        caps.add_fs(dir_cap("/test/child", "/test/child", AccessMode::ReadWrite));
+        caps.add_fs(dir_cap(&parent, &parent, AccessMode::Read));
+        caps.add_fs(dir_cap(&child, &child, AccessMode::ReadWrite));
 
         let profile = generate_profile(&caps).unwrap();
 
         assert_eq!(
             unlink_denies(&profile),
-            ["(deny file-write-unlink (literal \"/test/child\"))"]
+            [format!("(deny file-write-unlink (literal \"{child}\"))")]
         );
     }
 
