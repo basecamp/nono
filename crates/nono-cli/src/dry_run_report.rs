@@ -299,6 +299,7 @@ const SEATBELT_FILE_OPS: &[(&str, (bool, bool, bool))] = &[
     ("file-ioctl", (true, false, false)),
     ("file-write*", (false, true, false)),
     ("file-write-data", (false, true, false)),
+    ("file-write-unlink", (false, true, false)),
 ];
 
 /// The regex `add_atomic_write_rule` puts after a write grant's escaped path.
@@ -311,10 +312,12 @@ const ATOMIC_TEMP_SUFFIX: &str = r"\.tmp\.[0-9]+\.[0-9a-f]+$";
 /// - `(allow OP... (literal "PATH"))` or `(allow OP... (subpath "PATH"))`, each
 ///   OP one of `SEATBELT_FILE_OPS`, PATH absolute and unescaped as the exact
 ///   inverse of `escape_seatbelt_path` (the deny groups' `file-read-metadata`,
-///   the symlink pairs' `file-read*`, keychain database grants);
-/// - `(allow file-write* file-read-metadata (regex #"^PATH\.tmp\.[0-9]+\.[0-9a-f]+$"))`,
-///   PATH unescaped as the exact inverse of `regex_escape_path`
-///   (`add_atomic_write_rule`).
+///   the symlink pairs' `file-read*`, keychain database grants, the unlink
+///   overrides' `file-write-unlink`);
+/// - the atomic-temp regex `(... (regex #"^PATH\.tmp\.[0-9]+\.[0-9a-f]+$"))`,
+///   with ops `file-write* file-read-metadata` (`add_atomic_write_rule`) or
+///   `file-write-unlink` (the unlink override), PATH unescaped as the exact
+///   inverse of `regex_escape_path`.
 ///
 /// Anything else is none, and stays in `incomplete`: another op, filter or
 /// regex, a second filter or rule, a comment, other spacing, an escape the
@@ -331,10 +334,16 @@ fn seatbelt_grant(rule: &str) -> Option<SeatbeltGrant> {
             .strip_prefix('^')?
             .strip_suffix(ATOMIC_TEMP_SUFFIX)
             .and_then(regex_unescape)?;
-        if ops != "file-write* file-read-metadata"
-            || !path.starts_with('/')
-            || crate::capability_ext::atomic_write_rule(&path) != rule
-        {
+        // The two atomic-temp regex shapes the generator writes for a file's
+        // temp siblings: the write grant's, and the unlink override's. Each is
+        // read back only when its own renderer reproduces the rule byte for
+        // byte, so the path is the one it was generated from.
+        let rendered = match ops {
+            "file-write* file-read-metadata" => crate::capability_ext::atomic_write_rule(&path),
+            "file-write-unlink" => crate::capability_ext::unlink_atomic_rule(&path),
+            _ => return None,
+        };
+        if !path.starts_with('/') || rendered != rule {
             return None;
         }
         return Some(SeatbeltGrant {
@@ -874,6 +883,34 @@ mod tests {
         }
         // A lone deny that mentions a file op is still just a deny: bounded.
         assert!(rule_is_bounded(r#"(deny file-read-data (subpath "/a"))"#));
+    }
+
+    #[test]
+    fn unlink_overrides_read_back_as_write_grants() {
+        // `apply_unlink_overrides` emits `file-write-unlink` for a writable
+        // path (literal or subpath) and an atomic-temp regex for a file. All
+        // read back as `write`, on paths already write-granted.
+        for (rule, want) in [
+            (
+                r#"(allow file-write-unlink (literal "/a/b"))"#.to_string(),
+                grant("write", "literal", "/a/b"),
+            ),
+            (
+                r#"(allow file-write-unlink (subpath "/a/b"))"#.to_string(),
+                grant("write", "subpath", "/a/b"),
+            ),
+            (
+                crate::capability_ext::unlink_atomic_rule("/a/b"),
+                grant("write", "atomic_temp", "/a/b"),
+            ),
+        ] {
+            assert_eq!(seatbelt_grant(&rule), want, "{rule}");
+        }
+        // The unlink atomic regex and the write-atomic regex are distinct ops.
+        assert_ne!(
+            crate::capability_ext::unlink_atomic_rule("/a"),
+            crate::capability_ext::atomic_write_rule("/a")
+        );
     }
 
     #[test]

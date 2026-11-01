@@ -477,6 +477,21 @@ pub(crate) fn atomic_write_rule(path: &str) -> String {
     )
 }
 
+/// The Seatbelt rule `apply_unlink_overrides` emits so the sandbox can unlink a
+/// writable file's atomic-write temp sibling (`policy::apply_unlink_overrides`,
+/// the `file-write-unlink` regex for a file cap). The dry-run report reads an
+/// unlink regex back as an `atomic_temp` write grant only when it is this one.
+/// `regex_escape_path` matches `policy::escape_seatbelt_regex_path` for every
+/// path without a control character, which the generator refuses earlier.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn unlink_atomic_rule(path: &str) -> String {
+    let escaped = regex_escape_path(path);
+    format!(
+        "(allow file-write-unlink (regex #\"^{}\\.tmp\\.[0-9]+\\.[0-9a-f]+$\"))",
+        escaped
+    )
+}
+
 /// Escape a filesystem path for use in a Seatbelt regex.
 ///
 /// Escapes both regex metacharacters and the `"` that terminates the
