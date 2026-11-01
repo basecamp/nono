@@ -435,6 +435,8 @@ fn regex_unescape(escaped: &str) -> Option<String> {
 const NON_FILE_ALLOW_OPS: &[&str] = &[
     "iokit-get-properties",
     "iokit-open",
+    "lsopen",
+    "user-preference-read",
     "ipc-posix-sem*",
     "ipc-posix-shm-read-data",
     "ipc-posix-shm-write-create",
@@ -471,6 +473,12 @@ const DEVICE_IOCTL_RULES: &[&str] = &[
 /// rule. Anything else — an unknown or wildcard op, a file op not read back as
 /// a grant, a construct that is not an allow/deny s-expression — is not
 /// bounded and must go to `incomplete`.
+///
+/// An `allow` is bounded only when its **first** op is a known non-file op and
+/// **no** op in the rule is a `file-*` op, so a rule that pairs a non-file op
+/// with a file op — `(allow process-exec* file-read* (subpath "/R"))`, which no
+/// current generator emits — fails closed rather than being waved past on its
+/// first op.
 #[cfg(any(target_os = "macos", test))]
 fn rule_is_bounded(line: &str) -> bool {
     if DEVICE_IOCTL_RULES.contains(&line) {
@@ -485,8 +493,11 @@ fn rule_is_bounded(line: &str) -> bool {
     match kind {
         "deny" | "version" | "debug" => true,
         "allow" => {
-            let op = rest.split([' ', ')']).next().unwrap_or("");
-            NON_FILE_ALLOW_OPS.contains(&op)
+            // The ops are everything up to the first filter `(`.
+            let ops = rest.split_once(" (").map_or(rest, |(ops, _)| ops);
+            let first = ops.split([' ', ')']).next().unwrap_or("");
+            NON_FILE_ALLOW_OPS.contains(&first)
+                && !ops.split([' ', ')']).any(|op| op.starts_with("file-"))
         }
         _ => false,
     }
@@ -782,6 +793,8 @@ mod tests {
             "(allow network-outbound (remote tcp \"*:443\"))",
             "(allow network-outbound (path \"/var/run/mDNSResponder\"))",
             "(allow iokit-open (iokit-user-client-class \"x\"))",
+            "(allow lsopen)",
+            "(allow user-preference-read)",
             r#"(allow file-ioctl (regex #"^/dev/ttys[0-9]+$"))"#,
             r#"(allow file-ioctl (regex #"^/dev/pty[a-z][0-9a-f]+$"))"#,
         ] {
@@ -794,10 +807,14 @@ mod tests {
             r#"(allow file-read-metadata (literal "/a"))"#,
             r#"(allow file-read-xattr (literal "/a"))"#,
             "(allow file*)",
-            "(allow lsopen)",
+            "(allow some-new-op)",
             "(allow default)",
             "(allow)",
             "not a rule",
+            // A non-file op paired with a file op: bounded on the first op
+            // would wave the file grant past, so it must not be bounded.
+            r#"(allow process-exec* file-read* (subpath "/R"))"#,
+            r#"(allow signal file-write* (literal "/R"))"#,
         ] {
             assert!(!rule_is_bounded(line), "{line}");
         }
@@ -1038,21 +1055,22 @@ mod tests {
         );
     }
 
-    /// Coverage (a): over profiles from the real generator, every `file-*`
-    /// allow rule is accounted for — read back as a grant, matched as a
-    /// direct-children rule, a bounded static device rule, or named in
-    /// `incomplete`. No file rule is silently dropped, so a new emitter can't
-    /// widen filesystem access unseen.
+    /// Coverage (a): over profiles from the real generator, across capability
+    /// shapes (a read grant, a write grant with its atomic-temp rule, a `$PATH`
+    /// symlink chain, extensions, a raw rule), **every** line of the profile is
+    /// accounted for — a raw rule named for `incomplete`, a direct-children
+    /// rule, a grant `seatbelt_grant` reads back, a bounded rule, or a line
+    /// named in `incomplete`. No rule is silently dropped, so a new emitter
+    /// can't widen access unseen. It also checks the full `{access, filter,
+    /// path}` of the grants a known fixture must produce, not only their paths.
     #[cfg(target_os = "macos")]
     #[test]
-    fn every_file_rule_the_generator_emits_is_a_grant_or_incomplete() -> Result<()> {
+    fn every_rule_the_generator_emits_is_accounted_for() -> Result<()> {
         use std::os::unix::fs::symlink;
         let tmp = tempfile::tempdir().expect("tempdir");
         let base = tmp.path().canonicalize().expect("canon");
-        let readdir = base.join("readdir");
-        std::fs::create_dir(&readdir).expect("readdir");
-        let writefile = base.join("write.json");
-        std::fs::write(&writefile, b"{}").expect("writefile");
+        std::fs::create_dir(base.join("readdir")).expect("readdir");
+        std::fs::write(base.join("write.json"), b"{}").expect("writefile");
         // A $PATH directory reached through a symlink chain (hops + ancestors).
         std::fs::create_dir_all(base.join("real/bin")).expect("real/bin");
         std::fs::create_dir(base.join("R")).expect("R");
@@ -1066,12 +1084,20 @@ mod tests {
                         nono::FsCapability::new_dir(base.join("readdir"), AccessMode::Read)
                             .expect("read cap"),
                     );
-                    let w = nono::FsCapability::new_file(
-                        base.join("write.json"),
-                        AccessMode::ReadWrite,
-                    )
-                    .expect("write cap");
-                    c.add_fs(w);
+                    c.add_fs(
+                        nono::FsCapability::new_file(
+                            base.join("write.json"),
+                            AccessMode::ReadWrite,
+                        )
+                        .expect("write cap"),
+                    );
+                    // `add_fs` records the capability but doesn't emit the
+                    // atomic-temp platform rule a run's preparation would, so
+                    // add it as the generator does, to exercise that filter.
+                    c.add_platform_rule(crate::capability_ext::atomic_write_rule(
+                        base.join("write.json").to_str().expect("utf-8"),
+                    ))
+                    .expect("atomic rule");
                 }
                 b as fn(&mut CapabilitySet, &Path)
             }),
@@ -1099,10 +1125,6 @@ mod tests {
                 .cloned()
                 .collect();
             let (grants, incomplete) = profile_grants(&caps, &raw)?;
-            let granted: std::collections::HashSet<&str> = grants
-                .iter()
-                .map(|g| g["path"].as_str().expect("path"))
-                .collect();
             // The direct-children rules, as profile_grants renders them.
             let mut children = std::collections::HashSet::new();
             for read in nono::path::path_metadata_reads(caps.path_metadata_dirs())? {
@@ -1113,18 +1135,51 @@ mod tests {
                     ));
                 }
             }
+            let raw_lines: std::collections::HashSet<&str> =
+                raw.iter().flat_map(|r| r.lines()).collect();
+            // Every line is accounted for, not only `(allow file-…)` lines:
+            // each hits exactly the branch profile_grants takes for it.
             let profile = nono::sandbox::seatbelt_profile(&caps)?;
             for line in profile.lines() {
-                if !line.starts_with("(allow file-") {
+                if line.is_empty() {
                     continue;
                 }
-                let accounted = children.contains(line)
-                    || DEVICE_IOCTL_RULES.contains(&line)
-                    || seatbelt_grant(line).is_some_and(|g| granted.contains(g.path.as_str()))
+                let accounted = raw_lines.contains(line)
+                    || children.contains(line)
+                    || seatbelt_grant(line).is_some()
+                    || rule_is_bounded(line)
                     || incomplete.iter().any(|m| m.ends_with(line));
-                assert!(accounted, "{label}: unaccounted file rule: {line}");
+                assert!(accounted, "{label}: unaccounted rule: {line}");
             }
         }
+
+        // The full records a known fixture must produce (not only paths): a
+        // read dir grant (both ops' shapes collapse to one), its atomic-temp.
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(
+            nono::FsCapability::new_dir(base.join("readdir"), AccessMode::Read).expect("read cap"),
+        );
+        caps.add_platform_rule(crate::capability_ext::atomic_write_rule(
+            base.join("write.json").to_str().expect("utf-8"),
+        ))
+        .expect("atomic");
+        let (grants, _) = profile_grants(&caps, &[])?;
+        let readdir = base.join("readdir").to_str().expect("utf-8").to_string();
+        let writefile = base.join("write.json").to_str().expect("utf-8").to_string();
+        assert!(
+            grants.contains(&json!({ "access": "read", "filter": "subpath", "path": readdir })),
+            "read subpath grant for the read dir: {grants:?}"
+        );
+        assert!(
+            grants.contains(
+                &json!({ "access": "write", "filter": "atomic_temp", "path": writefile })
+            ),
+            "atomic_temp grant for the writable file: {grants:?}"
+        );
+        assert!(
+            grants.contains(&json!({ "access": "read", "filter": "literal", "path": "/" })),
+            "the static root read is reported: {grants:?}"
+        );
         Ok(())
     }
 
