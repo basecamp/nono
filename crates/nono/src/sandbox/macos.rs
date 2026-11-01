@@ -793,14 +793,6 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
         profile.push('\n');
     }
 
-    // Keep each directory write grant's root in place, as Landlock does.
-    // After the platform rules: a client's `(allow file-write-unlink (subpath
-    // R))` override would otherwise re-allow it under last-matching-rule.
-    for rule in write_root_unlink_denies(caps)? {
-        profile.push_str(&rule);
-        profile.push('\n');
-    }
-
     // Lets libc command resolution get ENOENT (not a deny's EPERM, which aborts
     // the PATH walk) on ungranted/missing $PATH entries. Metadata only, emitted
     // last so it overrides read denies without exposing file contents.
@@ -1002,6 +994,15 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
                      filtering (routed through the proxy) or ProxyOnly mode instead."
                 .to_string(),
         });
+    }
+
+    // Keep each directory write grant's root in place, as Landlock does.
+    // Last in the profile: under last-matching-rule, any later allow (a
+    // client's `(allow file-write-unlink (subpath "R"))` override, in either
+    // platform-rule loop) would let R go again.
+    for rule in write_root_unlink_denies(caps)? {
+        profile.push_str(&rule);
+        profile.push('\n');
     }
 
     Ok(profile)
@@ -2791,5 +2792,25 @@ mod tests {
             .find("(deny file-write-unlink (literal \"/test\"))")
             .expect("root deny not found");
         assert!(override_pos < deny_pos, "{profile}");
+    }
+
+    #[test]
+    fn dir_write_grant_root_deny_is_last() {
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(dir_cap("/test", "/test", AccessMode::ReadWrite));
+        // Read as a network rule (it starts with one), so it is emitted with
+        // the network rules, after the filesystem ones.
+        caps.add_platform_rule(
+            "(allow network-outbound) (allow file-write-unlink (subpath \"/test\"))",
+        )
+        .unwrap();
+
+        let profile = generate_profile(&caps).unwrap();
+
+        assert_eq!(
+            profile.lines().last(),
+            Some("(deny file-write-unlink (literal \"/test\"))"),
+            "{profile}"
+        );
     }
 }
