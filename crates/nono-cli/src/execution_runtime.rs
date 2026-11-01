@@ -205,9 +205,14 @@ fn recommended_pack_profile(program: &Path) -> Option<(&'static str, &'static [&
 pub(crate) struct DryRunMediation {
     /// Each sandbox a brokered command can run under, as the launch builds it.
     pub(crate) children: Vec<crate::tool_sandbox::DryRunChild>,
-    /// The platform rules the runtime adds to the session's own set
-    /// (`grant_outer_caps`; on macOS, Seatbelt rules).
-    pub(crate) session_rules: Vec<String>,
+    /// The session's capability set after runtime augmentation
+    /// (`grant_outer_caps`: command-mediation shims and sockets, and the
+    /// platform rules), i.e. the set the launch generates its profile from.
+    /// `None` when no command mediation runs, so the report uses the plan's
+    /// own set, exactly as the launch does. Read only where a profile is
+    /// generated (macOS); the Linux dry run keeps it for the same shape.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) session_caps: Option<CapabilitySet>,
     /// Each command-policy credential, as declared and as it resolves.
     pub(crate) credentials: Vec<crate::tool_sandbox::DryRunCredential>,
     /// The credentials that don't resolve as declared, and why: left out of
@@ -302,20 +307,16 @@ pub(crate) fn dry_run_children(plan: &LaunchPlan) -> Result<DryRunMediation> {
             },
         )?;
         let children = runtime.dry_run_children(&requested_workdir);
-        // (What the runtime adds to the session's own set, as the launch adds
-        // it: only its platform rules are kept, which the report weighs.)
+        // The session's augmented set, exactly as the launch builds it before
+        // generating its profile (grant_outer_caps adds the mediation shims
+        // and sockets and the platform rules). The report generates the
+        // profile from this same set, so it reads back what the launch applies.
         let mut granted = caps.clone();
-        let granted = runtime.grant_outer_caps(&mut granted).map(|()| granted);
+        let granted = runtime.grant_outer_caps(&mut granted).map(|()| granted)?;
         runtime.cleanup_runtime_dir();
-        let session_rules = granted?
-            .platform_rules()
-            .iter()
-            .filter(|rule| !caps.platform_rules().contains(rule))
-            .cloned()
-            .collect();
         Ok(DryRunMediation {
             children,
-            session_rules,
+            session_caps: Some(granted),
             credentials,
             unresolved,
         })

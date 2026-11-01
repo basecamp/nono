@@ -330,7 +330,7 @@ fn escape_path(path: &str) -> Result<String> {
 ///
 /// Control characters are rejected outright, matching `escape_path`'s
 /// policy.
-fn regex_escape_path_for_seatbelt(path: &str) -> Result<String> {
+pub(crate) fn regex_escape_path_for_seatbelt(path: &str) -> Result<String> {
     for c in path.chars() {
         if c.is_control() {
             return Err(NonoError::SandboxInit(format!(
@@ -500,7 +500,11 @@ fn push_localhost_tcp_outbound_seatbelt_rules(
 ///
 /// Returns an error if any path contains non-UTF-8 bytes (which would produce
 /// incorrect Seatbelt rules via lossy conversion).
-fn generate_profile(caps: &CapabilitySet) -> Result<String> {
+///
+/// `pub(crate)` so the dry run can read back the very profile enforcement
+/// applies (via `sandbox::seatbelt_profile`), rather than rebuild its grants
+/// from the inputs and risk missing an emitter.
+pub(crate) fn generate_profile(caps: &CapabilitySet) -> Result<String> {
     let merged_ranges = merge_port_ranges(caps.localhost_port_ranges());
     let total_range_ports: u32 = merged_ranges
         .iter()

@@ -467,6 +467,7 @@ fn add_atomic_write_rule(_caps: &mut CapabilitySet, _cap: &FsCapability) -> Resu
 /// temp files of `path` (`add_atomic_write_rule`). Built on every platform: the
 /// dry-run report reads a rule back as a grant only when it is this one
 /// (`dry_run_report::seatbelt_grant`).
+#[cfg(any(target_os = "macos", test))]
 pub(crate) fn atomic_write_rule(path: &str) -> String {
     let escaped = regex_escape_path(path);
     let regex = format!("^{}\\.tmp\\.[0-9]+\\.[0-9a-f]+$", escaped);
@@ -483,6 +484,7 @@ pub(crate) fn atomic_write_rule(path: &str) -> String {
 /// in a path would otherwise close that string literal early, letting the
 /// remainder of the path be parsed as new S-expression tokens and injected
 /// into the generated sandbox profile.
+#[cfg(any(target_os = "macos", test))]
 fn regex_escape_path(path: &str) -> String {
     let mut out = String::with_capacity(path.len() + 8);
     for c in path.chars() {

@@ -31,10 +31,18 @@ use crate::tool_sandbox::DryRunChild;
 
 /// The report's format version: a new field is added without a change; a
 /// field changed or removed gets a new version, and so does a new field a
-/// reader must read to keep the contract (2: `seatbelt_grants`, which takes
-/// the generated Seatbelt allow rules it lists out of `incomplete`, so a
-/// reader of 1 would pass what it never read).
-pub(crate) const DRY_RUN_REPORT_VERSION: u32 = 2;
+/// reader must read to keep the contract.
+///
+/// - 2: `seatbelt_grants`, which took the generated Seatbelt allow rules it
+///   lists out of `incomplete`, so a reader of 1 would pass what it never read.
+/// - 3: `seatbelt_grants` now reads back **every** file rule of the Seatbelt
+///   profile the launch applies (parsed from the profile itself, not rebuilt
+///   from the capability list), each with its real scope — `literal` (that
+///   path), `subpath` (its subtree), `children` (its direct children) or
+///   `atomic_temp`. A rule not shown bounded goes to `incomplete`. The
+///   `metadata_paths` and `metadata_children` fields are gone: their reads are
+///   `metadata` grants here now, with the scope each rule actually has.
+pub(crate) const DRY_RUN_REPORT_VERSION: u32 = 3;
 
 /// What a run does that the report does not cover: out of its contract.
 pub(crate) const OUT_OF_SCOPE: &[&str] = &[
@@ -110,31 +118,17 @@ pub(crate) fn dry_run_report(
                 .to_string(),
         );
     }
-    let (widenings, seatbelt_grants) = seatbelt_widenings(&caps, raw_rules);
-    incomplete.extend(widenings);
-    // (The rules command mediation's runtime adds to the session's set at
-    // launch, on macOS: its execute gate's `(allow process-exec*)`, which is
-    // the execute allowlist, out of the contract; metadata reads of the
-    // working directory's ancestors, listed in `metadata_paths`; any other
-    // allow widens the set.)
-    let mut runtime_metadata: Vec<Value> = Vec::new();
-    let mut runtime_allows = 0;
-    for rule in &mediation.session_rules {
-        if rule.trim() == "(allow process-exec*)" {
-            continue;
-        }
-        if let Some(path) = metadata_literal(rule) {
-            runtime_metadata.push(json!(path));
-        } else if seatbelt_allows(rule) {
-            runtime_allows += 1;
-        }
-    }
-    if runtime_allows > 0 {
-        incomplete.push(format!(
-            "{runtime_allows} Seatbelt allow rule(s) command mediation adds to the session at launch"
-        ));
-    }
-    let (metadata_paths, metadata_children) = path_metadata(&caps)?;
+    // Every file grant read back from the profile the launch applies, from
+    // the session's augmented set (`grant_outer_caps`), or the plan's own set
+    // when no mediation runs — the same choice the launch makes. On Linux
+    // there is no Seatbelt profile, so this is empty and Landlock grants no
+    // metadata-only reads.
+    #[cfg(target_os = "macos")]
+    let profile_caps = mediation.session_caps.as_ref().unwrap_or(&caps);
+    #[cfg(not(target_os = "macos"))]
+    let profile_caps = &caps;
+    let (seatbelt_grants, grant_incomplete) = profile_grants(profile_caps, raw_rules)?;
+    incomplete.extend(grant_incomplete);
     let limits = caps.resource_limits();
     let commands = mediation
         .children
@@ -149,8 +143,6 @@ pub(crate) fn dry_run_report(
         "out_of_scope": OUT_OF_SCOPE,
         "filesystem": caps.fs_capabilities().iter().map(session_fs_value).collect::<Vec<_>>(),
         "unix_sockets": caps.unix_socket_capabilities().iter().map(socket_value).collect::<Vec<_>>(),
-        "metadata_paths": metadata_paths.into_iter().chain(runtime_metadata).collect::<Vec<_>>(),
-        "metadata_children": metadata_children,
         "seatbelt_grants": seatbelt_grants,
         // (Each as declared: a dry run reads no credential source.)
         "credentials": {
@@ -224,34 +216,6 @@ fn session_fs_value(cap: &FsCapability) -> Value {
     value
 }
 
-/// The metadata-only reads the run grants beyond the list, as
-/// (`metadata_paths`, `metadata_children`). macOS: for each `$PATH`
-/// directory, `file-read-metadata` on the directory, its ancestors, the
-/// intermediate hops of a symlink chain reaching it and their ancestors (each
-/// that path alone), and on the directory's direct children (as
-/// `(regex "^<dir>/[^/]+$")`, for `<dir>/<command>`). The same function
-/// computes the profile's rules, so the two lists are what the profile
-/// grants. Linux grants none.
-#[cfg(target_os = "macos")]
-fn path_metadata(caps: &CapabilitySet) -> Result<(Vec<Value>, Vec<Value>)> {
-    let mut paths = Vec::new();
-    let mut children = Vec::new();
-    for read in nono::path::path_metadata_reads(caps.path_metadata_dirs())? {
-        match read {
-            nono::path::PathMetadataRead::Path(p) => paths.push(path_value(Path::new(&p))),
-            nono::path::PathMetadataRead::Children(d) => {
-                children.push(path_value(Path::new(&d)));
-            }
-        }
-    }
-    Ok((paths, children))
-}
-
-#[cfg(not(target_os = "macos"))]
-fn path_metadata(_caps: &CapabilitySet) -> Result<(Vec<Value>, Vec<Value>)> {
-    Ok((Vec::new(), Vec::new()))
-}
-
 /// The plan's network: its mode, and the port exceptions the capability set
 /// carries beside it (a connect or bind port, a localhost port or range, the
 /// ports the proxy lets the run bind), which a restricted mode still allows.
@@ -292,14 +256,6 @@ fn network_mode(intent: &NetworkIntent, caps: &CapabilitySet) -> &'static str {
     }
 }
 
-/// The path of a generated `(allow file-read-metadata (literal "PATH"))`
-/// rule, unescaped as `escape_seatbelt_path` escapes it; none for any other.
-fn metadata_literal(rule: &str) -> Option<String> {
-    seatbelt_grant(rule)
-        .filter(|grant| grant.access == "metadata" && grant.filter == "literal")
-        .map(|grant| grant.path)
-}
-
 /// A generated Seatbelt allow rule read back as a path grant: what it lets the
 /// sandbox do there (`access`) and how its filter reaches from `path`
 /// (`filter`). The record is at least as wide as the rule, never narrower:
@@ -313,12 +269,14 @@ fn metadata_literal(rule: &str) -> Option<String> {
 ///   `<path>.tmp.<digits>.<hex>`, the atomic-write siblings of a write grant;
 ///   the regex's `$` also matches before one final line terminator).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(any(target_os = "macos", test))]
 struct SeatbeltGrant {
     access: &'static str,
     filter: &'static str,
     path: String,
 }
 
+#[cfg(any(target_os = "macos", test))]
 impl SeatbeltGrant {
     fn value(&self) -> Value {
         json!({ "access": self.access, "filter": self.filter, "path": self.path })
@@ -326,15 +284,25 @@ impl SeatbeltGrant {
 }
 
 /// The ops a path grant may hold: each `(read, write, metadata)`.
+///
+/// `file-map-executable` (mapping a file as executable memory) and
+/// `file-ioctl` count as `read`: both reach the file, conservatively more than
+/// metadata, and the generator only ever emits them on a path a read grant
+/// already covers or on a device node, so this never narrows and never widens
+/// past a read grant.
+#[cfg(any(target_os = "macos", test))]
 const SEATBELT_FILE_OPS: &[(&str, (bool, bool, bool))] = &[
     ("file-read-metadata", (false, false, true)),
     ("file-read*", (true, false, false)),
     ("file-read-data", (true, false, false)),
+    ("file-map-executable", (true, false, false)),
+    ("file-ioctl", (true, false, false)),
     ("file-write*", (false, true, false)),
     ("file-write-data", (false, true, false)),
 ];
 
 /// The regex `add_atomic_write_rule` puts after a write grant's escaped path.
+#[cfg(any(target_os = "macos", test))]
 const ATOMIC_TEMP_SUFFIX: &str = r"\.tmp\.[0-9]+\.[0-9a-f]+$";
 
 /// `rule` read back as a path grant, when it is one of the shapes the
@@ -353,6 +321,7 @@ const ATOMIC_TEMP_SUFFIX: &str = r"\.tmp\.[0-9]+\.[0-9a-f]+$";
 /// escaper never writes. And a rule is read back only when the generator's own
 /// code renders the record it reads to that rule byte for byte, so no rule
 /// stands for a path other than the one it was generated from.
+#[cfg(any(target_os = "macos", test))]
 fn seatbelt_grant(rule: &str) -> Option<SeatbeltGrant> {
     let body = rule.strip_prefix("(allow ")?.strip_suffix("\"))")?;
     // (No op holds a space or a parenthesis, so the first " (" ends the ops.)
@@ -408,6 +377,7 @@ fn seatbelt_grant(rule: &str) -> Option<SeatbeltGrant> {
 /// The exact inverse of `escape_seatbelt_path`: `\\` and `\"` are the only
 /// escapes it writes, a bare `"` would end the string, and it refuses every
 /// control character. Any of those otherwise is none.
+#[cfg(any(target_os = "macos", test))]
 fn seatbelt_unescape(quoted: &str) -> Option<String> {
     let mut out = String::with_capacity(quoted.len());
     let mut chars = quoted.chars();
@@ -428,6 +398,7 @@ fn seatbelt_unescape(quoted: &str) -> Option<String> {
 /// The characters `regex_escape_path` writes with a backslash before them:
 /// every ICU metacharacter outside a set, and the `"` that would end the
 /// Seatbelt string.
+#[cfg(any(target_os = "macos", test))]
 const REGEX_ESCAPED: &[char] = &[
     '.', '+', '*', '?', '(', ')', '[', ']', '{', '}', '|', '^', '$', '\\', '"',
 ];
@@ -438,6 +409,7 @@ const REGEX_ESCAPED: &[char] = &[
 /// string the backslashes reach the regex engine as written, which is what
 /// the generated `\.tmp\.` relies on.) A control character, which ICU reads
 /// as itself but the escaper never had to consider, is none.
+#[cfg(any(target_os = "macos", test))]
 fn regex_unescape(escaped: &str) -> Option<String> {
     let mut out = String::with_capacity(escaped.len());
     let mut chars = escaped.chars();
@@ -454,51 +426,144 @@ fn regex_unescape(escaped: &str) -> Option<String> {
     Some(out)
 }
 
-/// Whether a Seatbelt rule may hold an `allow` form: any `allow` in it at all,
-/// however it is spaced or commented (`( allow`, `(; note` then `allow` on
-/// the next line). A deny whose path says "allow" counts too, which only
-/// errs toward `incomplete`.
-fn seatbelt_allows(rule: &str) -> bool {
-    rule.contains("allow")
+/// The allow ops the profile emits that grant no filesystem path: a rule with
+/// one of these can be consumed without a file grant. Matched exactly, so a
+/// new op the generator adds falls through to `incomplete` rather than being
+/// waved past. (File ops are in `SEATBELT_FILE_OPS`; `deny`, `version` and
+/// `debug` forms are handled by shape.)
+#[cfg(any(target_os = "macos", test))]
+const NON_FILE_ALLOW_OPS: &[&str] = &[
+    "iokit-get-properties",
+    "iokit-open",
+    "ipc-posix-sem*",
+    "ipc-posix-shm-read-data",
+    "ipc-posix-shm-write-create",
+    "ipc-posix-shm-write-data",
+    "mach-lookup",
+    "mach-per-user-lookup",
+    "mach-task-name",
+    "network-bind",
+    "network-inbound",
+    "network-outbound",
+    "process-exec*",
+    "process-fork",
+    "process-info*",
+    "pseudo-tty",
+    "signal",
+    "sysctl-read",
+    "system-fsctl",
+    "system-info",
+    "system-socket",
+];
+
+/// The two static `file-ioctl` device regexes the profile always emits
+/// (byte for byte). They match terminal device nodes, which no tier root can
+/// be, so they grant nothing a path check must see.
+#[cfg(any(target_os = "macos", test))]
+const DEVICE_IOCTL_RULES: &[&str] = &[
+    r#"(allow file-ioctl (regex #"^/dev/ttys[0-9]+$"))"#,
+    r#"(allow file-ioctl (regex #"^/dev/pty[a-z][0-9a-f]+$"))"#,
+];
+
+/// Whether a profile line grants no filesystem path and so can be consumed
+/// without a grant record: a `deny` (which only narrows), the `(version …)`
+/// and `(debug …)` headers, a non-file allow op, or a static device-ioctl
+/// rule. Anything else — an unknown or wildcard op, a file op not read back as
+/// a grant, a construct that is not an allow/deny s-expression — is not
+/// bounded and must go to `incomplete`.
+#[cfg(any(target_os = "macos", test))]
+fn rule_is_bounded(line: &str) -> bool {
+    if DEVICE_IOCTL_RULES.contains(&line) {
+        return true;
+    }
+    let Some(body) = line.strip_prefix('(') else {
+        return false;
+    };
+    let (kind, rest) = body
+        .split_once(' ')
+        .unwrap_or((body.trim_end_matches(')'), ""));
+    match kind {
+        "deny" | "version" | "debug" => true,
+        "allow" => {
+            let op = rest.split([' ', ')']).next().unwrap_or("");
+            NON_FILE_ALLOW_OPS.contains(&op)
+        }
+        _ => false,
+    }
 }
 
-/// The Seatbelt rules that can grant beyond the capability list: the
-/// profile's raw rules the set applies, whatever they say, and every other
-/// `allow` rule the preparation generated (a deny group's metadata read, say).
-/// A generated rule `seatbelt_grant` reads back is listed as its path grant;
-/// what stays is named for `incomplete`. Deny rules only narrow.
-fn seatbelt_widenings(caps: &CapabilitySet, raw_rules: &[String]) -> (Vec<String>, Vec<Value>) {
-    let mut out = Vec::new();
-    // (Only the raw rules the prepared set still applies: none on Linux, and
-    // none a trust policy stripped. A raw rule is never read back as a grant,
-    // even one spelled as a generated rule is: the profile wrote it.)
-    let applied_raw = raw_rules
-        .iter()
-        .filter(|rule| caps.platform_rules().contains(rule))
-        .count();
-    if applied_raw > 0 {
-        out.push(format!(
-            "{applied_raw} raw Seatbelt rule(s) (unsafe_macos_seatbelt_rules) the capability list cannot show"
-        ));
-    }
-    let mut grants = Vec::new();
-    let mut generated = 0;
-    for rule in caps
-        .platform_rules()
-        .iter()
-        .filter(|rule| !raw_rules.contains(rule) && seatbelt_allows(rule))
-    {
-        match seatbelt_grant(rule) {
-            Some(grant) => grants.push(grant.value()),
-            None => generated += 1,
+/// Every file grant the Seatbelt profile for `caps` gives, read back from the
+/// profile the launch applies (not rebuilt from the capability list), and an
+/// `incomplete` note for each rule not shown bounded.
+///
+/// Each line of the profile is one of: a raw rule
+/// (`unsafe_macos_seatbelt_rules`, named for `incomplete` — the profile wrote
+/// it and it is never read back as a grant); a direct-children metadata rule,
+/// rendered from the generator's own producer so a line is matched to its
+/// directory and no other line is mistaken for it; a rule `seatbelt_grant`
+/// reads back (`literal`, `subpath` or `atomic_temp`); a bounded non-file or
+/// device rule; or anything else, which goes to `incomplete` so a reader fails
+/// closed. macOS only; Linux generates no profile and grants no path here.
+#[cfg(target_os = "macos")]
+fn profile_grants(caps: &CapabilitySet, raw_rules: &[String]) -> Result<(Vec<Value>, Vec<String>)> {
+    let profile = nono::sandbox::seatbelt_profile(caps)?;
+    // The direct-children rules, rendered from the generator's own producer
+    // and escaper: a line equal to one is that directory's children grant.
+    let mut children: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for read in nono::path::path_metadata_reads(caps.path_metadata_dirs())? {
+        if let nono::path::PathMetadataRead::Children(dir) = read {
+            let rule = format!(
+                "(allow file-read-metadata (regex \"^{}/[^/]+$\"))",
+                nono::sandbox::seatbelt_path_regex(&dir)?
+            );
+            children.insert(rule, dir);
         }
     }
-    if generated > 0 {
-        out.push(format!(
-            "{generated} generated Seatbelt allow rule(s) that grant beyond the capability list and seatbelt_grants"
+    // The lines of each raw rule: skip them while parsing (they are named for
+    // `incomplete` below), so a raw rule's line is never read back as a grant.
+    let raw_applied: Vec<&String> = raw_rules
+        .iter()
+        .filter(|rule| caps.platform_rules().contains(rule))
+        .collect();
+    let raw_lines: std::collections::HashSet<&str> =
+        raw_applied.iter().flat_map(|rule| rule.lines()).collect();
+    let mut grants = Vec::new();
+    let mut incomplete = Vec::new();
+    for rule in &raw_applied {
+        incomplete.push(format!(
+            "a raw Seatbelt rule (unsafe_macos_seatbelt_rules) the capability list cannot show: {rule}"
         ));
     }
-    (out, grants)
+    for line in profile.lines() {
+        if line.is_empty() || raw_lines.contains(line) {
+            continue;
+        }
+        if let Some(dir) = children.get(line) {
+            grants.push(
+                SeatbeltGrant {
+                    access: "metadata",
+                    filter: "children",
+                    path: dir.clone(),
+                }
+                .value(),
+            );
+        } else if let Some(grant) = seatbelt_grant(line) {
+            grants.push(grant.value());
+        } else if !rule_is_bounded(line) {
+            incomplete.push(format!(
+                "a generated Seatbelt rule not read back as a path grant: {line}"
+            ));
+        }
+    }
+    Ok((grants, incomplete))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn profile_grants(
+    _caps: &CapabilitySet,
+    _raw_rules: &[String],
+) -> Result<(Vec<Value>, Vec<String>)> {
+    Ok((Vec::new(), Vec::new()))
 }
 
 /// One brokered sandbox: what its launch builds (filesystem, sockets, the
@@ -545,7 +610,7 @@ fn child_value(child: &DryRunChild, workdir: &Path, outer_caps: &CapabilitySet) 
     let launch = match &child.launch {
         Ok(launch) => {
             let raw = &child.sandbox.unsafe_macos_seatbelt_rules;
-            let (mut incomplete, seatbelt_grants) = seatbelt_widenings(&launch.caps, raw);
+            let (seatbelt_grants, mut incomplete) = profile_grants(&launch.caps, raw)?;
             // (A grant the launch spec carries resolved for the supervisor's own
             // process: the child, a different process, can't apply it, and its
             // launch stops. Reported in its self-relative spelling.)
@@ -701,48 +766,63 @@ mod tests {
     }
 
     #[test]
-    fn seatbelt_allows_beyond_the_list_are_named() -> Result<()> {
-        let mut caps = CapabilitySet::new();
-        caps.add_platform_rule("(deny file-read* (subpath \"/a\"))".to_string())?;
-        assert_eq!(
-            seatbelt_widenings(&caps, &[]),
-            (vec![], vec![]),
-            "a deny only narrows"
-        );
-        caps.add_platform_rule(
-            "(deny file-read* (subpath \"/b\")) (allow file-read* (subpath \"/c\"))".to_string(),
-        )?;
-        let (incomplete, grants) = seatbelt_widenings(&caps, &[]);
-        assert_eq!(incomplete.len(), 1, "an allow anywhere in a rule widens");
-        assert!(grants.is_empty(), "and isn't read back: {grants:?}");
-        let unapplied = vec!["(allow file-read* (subpath \"/d\"))".to_string()];
-        assert_eq!(
-            seatbelt_widenings(&caps, &unapplied).0.len(),
-            1,
-            "a raw rule the set doesn't apply counts for nothing"
-        );
-        assert!(
-            seatbelt_allows("( allow file-read* (subpath \"/e\"))"),
-            "however spaced"
-        );
-        assert!(
-            seatbelt_allows("(; note\n allow file-read* (subpath \"/f\"))"),
-            "however commented"
-        );
-        assert_eq!(
-            metadata_literal(r#"(allow file-read-metadata (literal "/a/b \"c\""))"#).as_deref(),
-            Some(r#"/a/b "c""#),
-            "a generated metadata rule's path, unescaped"
-        );
-        assert_eq!(
-            metadata_literal(r#"(allow file-read* (literal "/x"))"#),
-            None
-        );
-        assert_eq!(
-            metadata_literal(r#"(allow file-read-metadata (subpath "/x"))"#),
-            None
-        );
-        Ok(())
+    fn a_non_file_or_device_rule_is_bounded_and_a_file_rule_is_not() {
+        // Bounded: a deny (narrows only), the headers, the fixed non-file
+        // allow ops, and the two static device-ioctl rules.
+        for line in [
+            r#"(deny file-read* (subpath "/a"))"#,
+            r#"(deny default)"#,
+            "(version 1)",
+            "(debug deny)",
+            "(allow process-exec*)",
+            "(allow process-info* (target self))",
+            "(allow mach-lookup)",
+            "(allow signal (target same-sandbox))",
+            "(allow system-socket (socket-domain AF_UNIX) (socket-type SOCK_STREAM))",
+            "(allow network-outbound (remote tcp \"*:443\"))",
+            "(allow network-outbound (path \"/var/run/mDNSResponder\"))",
+            "(allow iokit-open (iokit-user-client-class \"x\"))",
+            r#"(allow file-ioctl (regex #"^/dev/ttys[0-9]+$"))"#,
+            r#"(allow file-ioctl (regex #"^/dev/pty[a-z][0-9a-f]+$"))"#,
+        ] {
+            assert!(rule_is_bounded(line), "{line}");
+        }
+        // Not bounded: a file rule (read back as a grant instead, or named for
+        // `incomplete`), an unknown or wildcard op, and a non-s-expression.
+        for line in [
+            r#"(allow file-read* (literal "/"))"#,
+            r#"(allow file-read-metadata (literal "/a"))"#,
+            r#"(allow file-read-xattr (literal "/a"))"#,
+            "(allow file*)",
+            "(allow lsopen)",
+            "(allow default)",
+            "(allow)",
+            "not a rule",
+        ] {
+            assert!(!rule_is_bounded(line), "{line}");
+        }
+    }
+
+    #[test]
+    fn map_executable_and_ioctl_read_back_as_read_grants() {
+        // Both reach the file, so they read back as `read` (never narrower
+        // than metadata); their paths are a subset of the read grants.
+        for (rule, want) in [
+            (
+                r#"(allow file-map-executable (subpath "/a"))"#,
+                grant("read", "subpath", "/a"),
+            ),
+            (
+                r#"(allow file-ioctl (literal "/dev/tty"))"#,
+                grant("read", "literal", "/dev/tty"),
+            ),
+            (
+                r#"(allow file-read* file-ioctl (literal "/a"))"#,
+                grant("read", "literal", "/a"),
+            ),
+        ] {
+            assert_eq!(seatbelt_grant(rule), want, "{rule}");
+        }
     }
 
     /// Paths that hold every character an escaper treats specially.
@@ -777,14 +857,16 @@ mod tests {
             let absent = format!("/nonexistent-dry-run-report{path}");
             let mut caps = CapabilitySet::new();
             crate::policy::emit_macos_deny_rules_for_path(Path::new(&absent), &mut caps)?;
-            let (incomplete, grants) = seatbelt_widenings(&caps, &[]);
-            // (Its deny rules count as allows when the path says "allow":
-            // `seatbelt_allows` errs toward `incomplete`.)
-            assert_eq!(
-                incomplete.len(),
-                usize::from(path.contains("allow")),
-                "{path}: {incomplete:?}"
-            );
+            let mut grants = Vec::new();
+            for rule in caps.platform_rules() {
+                match seatbelt_grant(rule) {
+                    Some(g) => grants.push(g.value()),
+                    // Everything else the deny group emits is a deny, bounded
+                    // whatever its path says (keyed on the `deny` form, not a
+                    // substring), so none of it reaches `incomplete`.
+                    None => assert!(rule_is_bounded(rule), "{path}: {rule}"),
+                }
+            }
             assert_eq!(
                 grants,
                 vec![json!({ "access": "metadata", "filter": "subpath", "path": absent })],
@@ -834,8 +916,13 @@ mod tests {
             std::env::current_exe().map_err(|e| nono::NonoError::SandboxInit(e.to_string()))?;
         let mut caps = CapabilitySet::new();
         crate::policy::emit_macos_deny_rules_for_path(&file, &mut caps)?;
+        let grants: Vec<Value> = caps
+            .platform_rules()
+            .iter()
+            .filter_map(|rule| seatbelt_grant(rule).map(|g| g.value()))
+            .collect();
         assert_eq!(
-            seatbelt_widenings(&caps, &[]).1,
+            grants,
             vec![json!({ "access": "metadata", "filter": "literal", "path": file.to_str() })]
         );
         Ok(())
@@ -855,8 +942,6 @@ mod tests {
             r#"(allow file-read* (literal ""))"#,
             r#"(allow file-read* (subpath "~/a"))"#,
             // Another op, beside one that is read back or alone.
-            r#"(allow file-ioctl (literal "/a"))"#,
-            r#"(allow file-read* file-ioctl (literal "/a"))"#,
             r#"(allow file-read-xattr (literal "/a"))"#,
             r#"(allow file* (literal "/a"))"#,
             r#"(allow process-exec* (literal "/a"))"#,
@@ -951,6 +1036,96 @@ mod tests {
             ),
             grant("write", "atomic_temp", "/a\"")
         );
+    }
+
+    /// Coverage (a): over profiles from the real generator, every `file-*`
+    /// allow rule is accounted for — read back as a grant, matched as a
+    /// direct-children rule, a bounded static device rule, or named in
+    /// `incomplete`. No file rule is silently dropped, so a new emitter can't
+    /// widen filesystem access unseen.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn every_file_rule_the_generator_emits_is_a_grant_or_incomplete() -> Result<()> {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp.path().canonicalize().expect("canon");
+        let readdir = base.join("readdir");
+        std::fs::create_dir(&readdir).expect("readdir");
+        let writefile = base.join("write.json");
+        std::fs::write(&writefile, b"{}").expect("writefile");
+        // A $PATH directory reached through a symlink chain (hops + ancestors).
+        std::fs::create_dir_all(base.join("real/bin")).expect("real/bin");
+        std::fs::create_dir(base.join("R")).expect("R");
+        symlink(base.join("real/bin"), base.join("R/hop")).expect("hop");
+        symlink(base.join("R/hop"), base.join("pathdir")).expect("pathdir");
+
+        for (label, build) in [
+            ("read + write + atomic", {
+                fn b(c: &mut CapabilitySet, base: &Path) {
+                    c.add_fs(
+                        nono::FsCapability::new_dir(base.join("readdir"), AccessMode::Read)
+                            .expect("read cap"),
+                    );
+                    let w = nono::FsCapability::new_file(
+                        base.join("write.json"),
+                        AccessMode::ReadWrite,
+                    )
+                    .expect("write cap");
+                    c.add_fs(w);
+                }
+                b as fn(&mut CapabilitySet, &Path)
+            }),
+            ("path metadata via a symlink chain", {
+                fn b(c: &mut CapabilitySet, base: &Path) {
+                    c.add_path_metadata_dir(base.join("pathdir"));
+                }
+                b
+            }),
+            ("extensions + a raw rule", {
+                fn b(c: &mut CapabilitySet, _base: &Path) {
+                    c.set_extensions_enabled(true);
+                    c.add_platform_rule(r#"(allow file-read* (subpath "/opt/x"))"#.to_string())
+                        .expect("raw rule");
+                }
+                b
+            }),
+        ] {
+            let mut caps = CapabilitySet::new();
+            build(&mut caps, &base);
+            let raw: Vec<String> = caps
+                .platform_rules()
+                .iter()
+                .filter(|r| r.contains("/opt/x"))
+                .cloned()
+                .collect();
+            let (grants, incomplete) = profile_grants(&caps, &raw)?;
+            let granted: std::collections::HashSet<&str> = grants
+                .iter()
+                .map(|g| g["path"].as_str().expect("path"))
+                .collect();
+            // The direct-children rules, as profile_grants renders them.
+            let mut children = std::collections::HashSet::new();
+            for read in nono::path::path_metadata_reads(caps.path_metadata_dirs())? {
+                if let nono::path::PathMetadataRead::Children(dir) = read {
+                    children.insert(format!(
+                        "(allow file-read-metadata (regex \"^{}/[^/]+$\"))",
+                        nono::sandbox::seatbelt_path_regex(&dir)?
+                    ));
+                }
+            }
+            let profile = nono::sandbox::seatbelt_profile(&caps)?;
+            for line in profile.lines() {
+                if !line.starts_with("(allow file-") {
+                    continue;
+                }
+                let accounted = children.contains(line)
+                    || DEVICE_IOCTL_RULES.contains(&line)
+                    || seatbelt_grant(line).is_some_and(|g| granted.contains(g.path.as_str()))
+                    || incomplete.iter().any(|m| m.ends_with(line));
+                assert!(accounted, "{label}: unaccounted file rule: {line}");
+            }
+        }
+        Ok(())
     }
 
     #[test]
