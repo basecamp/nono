@@ -1002,3 +1002,47 @@ fn runtime_dirs(text: &str) -> Vec<String> {
     }
     out
 }
+
+/// A command whose sandbox could replace a `unix://` approval helper's socket
+/// is refused at its launch, as the run refuses it: the report names the
+/// refusal in that command's `incomplete`, and builds the others.
+#[test]
+fn a_command_that_could_replace_an_approval_socket_is_refused() {
+    let t = nono_test!("dry-run-json-approval-socket");
+    // Below sockaddr_un::sun_path limits on both platforms.
+    let dir = tempfile::Builder::new()
+        .prefix("nono-dry-sock-")
+        .tempdir_in("/tmp")
+        .expect("tempdir");
+    let helper = dir.path().join("helper");
+    fs::create_dir_all(&helper).expect("create helper dir");
+    let json = format!(
+        r#"{{"meta":{{"name":"t"}},"command_policies":{{"approval_backends":{{"dialog":{{"type":"webhook","url":"unix://{socket}"}}}},"commands":{{"impostor":{{"executable":"/bin/true","sandbox":{{"fs_write":["{helper}"]}}}},"plain":{{"executable":"/bin/echo","sandbox":{{}}}}}}}}}}"#,
+        socket = helper.join("approval.sock").display(),
+        helper = helper.display(),
+    );
+    let report = report(&t, &json, |run| run.allow_cwd());
+    let commands = report["commands"].as_array().expect("commands");
+    let impostor = commands
+        .iter()
+        .find(|c| c["command"] == "impostor")
+        .unwrap_or_else(|| panic!("impostor is listed: {report}"));
+    assert!(impostor["executable"].is_null(), "{impostor}");
+    assert!(
+        impostor["incomplete"]
+            .as_array()
+            .expect("incomplete")
+            .iter()
+            .any(|i| i
+                .as_str()
+                .is_some_and(|i| i.contains("approval backend 'dialog' uses unix socket")
+                    && i.contains("could replace it"))),
+        "{impostor}"
+    );
+    assert!(
+        commands
+            .iter()
+            .any(|c| c["command"] == "plain" && c["incomplete"] == serde_json::json!([])),
+        "the rest is built: {report}"
+    );
+}

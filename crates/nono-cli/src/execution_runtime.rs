@@ -298,6 +298,7 @@ pub(crate) fn dry_run_children(plan: &LaunchPlan) -> Result<DryRunMediation> {
                 deny_paths: &plan.deny_paths,
                 #[cfg(target_os = "macos")]
                 bypass_protection_paths: &flags.bypass_protection_paths,
+                approval_sockets: &approval_sockets(flags),
                 policy_root: &requested_workdir,
                 proxy_credentials: &proxy_credentials,
                 reserved_proxy_ports: &std::collections::BTreeSet::new(),
@@ -329,6 +330,27 @@ pub(crate) fn dry_run_children(plan: &LaunchPlan) -> Result<DryRunMediation> {
         let _ = command_policies;
         Ok(DryRunMediation::default())
     }
+}
+
+/// The `unix://` approval helpers on every surface of a launch. Neither the
+/// agent nor a mediated command may be able to replace one of these sockets.
+fn approval_sockets(flags: &ExecutionFlags) -> Vec<(String, std::path::PathBuf)> {
+    crate::approval_runtime::approval_socket_paths(
+        [&flags.approval_backends]
+            .into_iter()
+            .chain(
+                flags
+                    .command_policies
+                    .as_ref()
+                    .map(|config| &config.approval_backends),
+            )
+            .chain(
+                flags
+                    .network
+                    .proxy_options()
+                    .map(|proxy| &proxy.network_approval_backends),
+            ),
+    )
 }
 
 pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
@@ -523,23 +545,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         output::print_supervised_info(flags.silent, rollback.requested, network.is_proxy_active());
     }
 
-    // `unix://` approval helpers on every surface. Neither the agent nor a
-    // mediated command may be able to replace one of these sockets.
-    let approval_sockets = crate::approval_runtime::approval_socket_paths(
-        [&flags.approval_backends]
-            .into_iter()
-            .chain(
-                flags
-                    .command_policies
-                    .as_ref()
-                    .map(|config| &config.approval_backends),
-            )
-            .chain(
-                network
-                    .proxy_options()
-                    .map(|proxy| &proxy.network_approval_backends),
-            ),
-    );
+    let approval_sockets = approval_sockets(&flags);
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     let shared_broker = crate::tool_sandbox::token_broker::new_shared_broker();
