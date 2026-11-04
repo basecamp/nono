@@ -35,6 +35,9 @@ pub(crate) struct SupervisedRuntimeContext<'a> {
     pub(crate) trust: &'a TrustLaunchOptions,
     pub(crate) proxy: Option<&'a ProxyLaunchOptions>,
     pub(crate) proxy_handle: Option<&'a nono_proxy::server::ProxyHandle>,
+    /// Per-command (scoped) proxies. Their audit buffers are drained into the
+    /// session record alongside the session proxy's.
+    pub(crate) scoped_proxy_handles: &'a [nono_proxy::server::ProxyHandle],
     pub(crate) executable_identity: Option<&'a ExecutableIdentity>,
     pub(crate) audit_signer: Option<&'a AuditSigner>,
     pub(crate) redaction_policy: &'a nono::ScrubPolicy,
@@ -212,6 +215,34 @@ fn should_open_supervised_pty(
     detached_start || (stdin_is_terminal && stdout_is_terminal && stderr_is_terminal)
 }
 
+/// Live sink that appends each proxy network audit event to the session log.
+/// Once the recorder is sealed at session end it refuses events, which stay
+/// buffered as unrecorded.
+pub(crate) fn live_network_audit_sink(
+    recorder_mutex: &Arc<Mutex<AuditRecorder>>,
+) -> nono_proxy::audit::AuditSink {
+    let recorder_mutex = Arc::clone(recorder_mutex);
+    Arc::new(move |event| {
+        recorder_mutex
+            .lock()
+            .map_err(|_| nono::NonoError::Snapshot("Audit recorder lock poisoned".to_string()))?
+            .record_network_event(event.clone())
+    })
+}
+
+/// Record the session proxy's network audit events live, and the
+/// command-scoped proxies' too, so a brokered command's events reach the log
+/// as the session proxy's do. `finalize_supervised_exit` detaches them all.
+pub(crate) fn attach_live_network_audit_sinks(
+    recorder_mutex: &Arc<Mutex<AuditRecorder>>,
+    proxy_handle: Option<&nono_proxy::server::ProxyHandle>,
+    scoped_proxy_handles: &[nono_proxy::server::ProxyHandle],
+) {
+    for handle in proxy_handle.into_iter().chain(scoped_proxy_handles) {
+        handle.attach_audit_sink(live_network_audit_sink(recorder_mutex));
+    }
+}
+
 pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> Result<i32> {
     let SupervisedRuntimeContext {
         config,
@@ -223,6 +254,7 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
         trust,
         proxy,
         proxy_handle,
+        scoped_proxy_handles,
         executable_identity,
         audit_signer,
         redaction_policy,
@@ -323,14 +355,8 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
     // event emitted before this point remains in the proxy buffer and is
     // replayed during finalization, while every live event is guaranteed to
     // follow `session_started` in the append-only log.
-    if let (Some(proxy_handle), Some(recorder_mutex)) = (proxy_handle, audit_recorder.as_ref()) {
-        let recorder_mutex = Arc::clone(recorder_mutex);
-        proxy_handle.attach_audit_sink(Arc::new(move |event| {
-            recorder_mutex
-                .lock()
-                .map_err(|_| nono::NonoError::Snapshot("Audit recorder lock poisoned".to_string()))?
-                .record_network_event(event.clone())
-        }));
+    if let Some(recorder_mutex) = audit_recorder.as_ref() {
+        attach_live_network_audit_sinks(recorder_mutex, proxy_handle, scoped_proxy_handles);
     }
 
     let protected_roots = protected_paths::ProtectedRoots::from_defaults()?;
@@ -500,6 +526,7 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
         supervisor_network_audit_events: supervisor_network_audit_events.as_ref(),
         audit_integrity_enabled: !rollback.no_audit_integrity,
         proxy_handle,
+        scoped_proxy_handles,
         executable_identity,
         audit_signer,
         redaction_policy,
