@@ -337,7 +337,8 @@ pub struct ResolvedAddressPolicy {
     /// Refuse a host when any address it resolves to is loopback, private,
     /// shared (CGNAT) or unspecified, unless `exceptions` permits that class
     /// for the host. An IP-literal allowlist entry (`10.1.2.3`,
-    /// `[fd00::1]:8443`) permits its own address: the address is named.
+    /// `[fd00::1]:8443`) permits its own address: the address is named, on
+    /// the port the entry names if it names one.
     #[serde(default)]
     pub public_only: bool,
 

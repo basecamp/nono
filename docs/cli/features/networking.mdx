@@ -595,7 +595,7 @@ A profile can refuse every allowed name that resolves to the local host, the LAN
 }
 ```
 
-With `public_only`, a host is refused when any address it resolves to is loopback (`127.0.0.0/8`, `::1`), private (RFC 1918, `fc00::/7`), shared/CGNAT (`100.64.0.0/10`, which tailnets use) or unspecified (`0.0.0.0/8`, `::`). IPv4-mapped, IPv4-compatible and NAT64 (`64:ff9b::/96`) IPv6 answers are classified by the IPv4 address they carry. `exceptions` names the classes (`loopback`, `private`, `cgnat`) a host pattern may resolve to; it allows no host by itself. An IP-literal `allow_domain` entry permits its own address. Route upstreams are checked the same way, a host approved at runtime (`network.approval_backends`) is checked as an allowed one is (an approval is not an `allow_domain` entry, so an approved IP literal needs an exception), and command-scoped proxies inherit the policy.
+With `public_only`, a host is refused when any address it resolves to is loopback (`127.0.0.0/8`, `::1`), private (RFC 1918, `fc00::/7`), shared/CGNAT (`100.64.0.0/10`, which tailnets use) or unspecified (`0.0.0.0/8`, `::`). IPv4-mapped, IPv4-compatible and NAT64 (`64:ff9b::/96`) IPv6 answers are classified by the IPv4 address they carry. `exceptions` names the classes (`loopback`, `private`, `cgnat`) a host pattern may resolve to; it allows no host by itself. An IP-literal `allow_domain` entry permits its own address, on the port it names if it names one. Route upstreams are checked the same way, a host approved at runtime (`network.approval_backends`) is checked as an allowed one is (an approval is not an `allow_domain` entry, so an approved IP literal needs an exception), and command-scoped proxies inherit the policy.
 
 ## Platform Behavior
 
