@@ -12,8 +12,8 @@
 # topic branch merges onto it in order, it force-pushes integration-upstream-bump, one commit on
 # integration that changes only the pin, and opens or updates one pull request from it, labelled
 # integration-upstream; merging that rebuilds on the new pin. When one does not merge, one issue
-# labelled integration-upstream names the topic branch and its files, and the pin stays; an open
-# bump is closed then only if integration has moved since it was tried. The pull request is opened
+# labelled integration-upstream names the topic branch and its files, the pin stays, and an open
+# bump pull request is closed: one is open only while the latest trial vouches for it. It is opened
 # with GITHUB_TOKEN, so it needs "Allow GitHub Actions to create and approve pull requests"
 # (Settings > Actions > General); without it the issue says so.
 #
@@ -262,7 +262,7 @@ jobs:
 
           body="$(printf '%s\n\n%s\n\n%s\n' \
             "Moves the pin in \`$pin_file\` from \`${PIN:0:12}\` to upstream main's tip \`${BASE:0:12}\` ([what changed upstream]($compare)). Every topic branch in \`.github/integration/topics\` merges onto it in order." \
-            "Merging it rebuilds \`integration\` on the new pin. Each run of rebuild-integration.yml refreshes this branch onto \`integration\` and the then-current tip, closes this when there is nothing to move, and closes it when a later trial fails on an \`integration\` this was not tried on." \
+            "Merging it rebuilds \`integration\` on the new pin. Each run of rebuild-integration.yml refreshes this branch onto \`integration\` and the then-current tip, and closes this when there is nothing to move or a later trial does not vouch for it." \
             "Opened by rebuild-integration.yml.")"
           if [ -z "$open" ]; then
             out="$(gh api "repos/$GH_REPO/pulls" -f title="$title" -f head="$bump" -f base=integration -f body="$body" --jq .number 2>&1)" || {
@@ -280,30 +280,28 @@ jobs:
             --description "Opened and closed by the integration workflows" >/dev/null
           gh api "repos/$GH_REPO/issues/$open/labels" -f 'labels[]=integration-upstream' >/dev/null
 
-      # A bump stands while integration is the commit it was tried on. A failed trial on a moved
-      # integration (a carry PR, or topic branches rebuilt in) says nothing for it, and its pin may
-      # not merge with what integration now carries.
-      - name: Close a bump this trial cannot vouch for
-        if: needs.try-upstream.result == 'failure'
+      # An open bump is only ever what this run's trial proposed on the integration it read: a run
+      # that does not propose closes it, so no bump stays mergeable once a trial stops vouching for it
+      # (a topic moved, a carry PR merged, upstream's tip stopped merging). The next trial that
+      # succeeds opens a new one.
+      - name: Close a bump this run does not propose
+        if: always() && (needs.try-upstream.result == 'failure' || steps.propose.outcome == 'failure' || steps.propose.outputs.deferred == 'true')
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          TRIED: ${{ needs.try-upstream.result }}
+          PROPOSED: ${{ steps.propose.outcome }}
         run: |
           set -euo pipefail
           bump=integration-upstream-bump
           open="$(gh api "repos/$GH_REPO/pulls?state=open&base=integration&head=${GH_REPO%%/*}:$bump" --jq '.[0].number // empty')"
           [ -n "$open" ] || exit 0
-          head="$(gh api "repos/$GH_REPO/pulls/$open" --jq .head.sha)"
-          parent="$(gh api "repos/$GH_REPO/commits/$head" --jq '.parents[0].sha')"
-          tip="$(gh api "repos/$GH_REPO/branches/integration" --jq .commit.sha)"
-          if [ "$parent" = "$tip" ]; then
-            echo "#$open was tried on integration ${tip:0:12}: it stands"
-          else
-            gh api "repos/$GH_REPO/issues/$open/comments" \
-              -f body="integration has moved to ${tip:0:12} since this was tried on ${parent:0:12}, and upstream main's tip no longer merges: see the integration-upstream issue. The next trial that succeeds opens a new one." >/dev/null
-            gh api -X PATCH "repos/$GH_REPO/pulls/$open" -f state=closed >/dev/null
-            echo "closed #$open"
-          fi
+          why="integration moved during this run's trial, so this was not tried on what it now carries"
+          [ "$PROPOSED" != failure ] || why="proposing the pin failed partway (see the integration-upstream issue), so this may not be what the trial vouched for"
+          [ "$TRIED" = success ] || why="upstream main's tip no longer merges (see the integration-upstream issue), so this was not tried on what integration now carries"
+          gh api "repos/$GH_REPO/issues/$open/comments" -f body="Closing: $why. The next trial that succeeds opens a new one." >/dev/null
+          gh api -X PATCH "repos/$GH_REPO/pulls/$open" -f state=closed >/dev/null
+          echo "closed #$open"
 
       - name: Open, update or close the issue
         if: always()
