@@ -12,9 +12,10 @@
 # topic branch merges onto it in order, it force-pushes integration-upstream-bump, one commit on
 # integration that changes only the pin, and opens or updates one pull request from it, labelled
 # integration-upstream; merging that rebuilds on the new pin. When one does not merge, one issue
-# labelled integration-upstream names the topic branch and its files, and nothing changes. The
-# pull request is opened with GITHUB_TOKEN, so it needs "Allow GitHub Actions to create and
-# approve pull requests" (Settings > Actions > General); without it the issue says so.
+# labelled integration-upstream names the topic branch and its files, and the pin stays; an open
+# bump is closed then only if integration has moved since it was tried. The pull request is opened
+# with GITHUB_TOKEN, so it needs "Allow GitHub Actions to create and approve pull requests"
+# (Settings > Actions > General); without it the issue says so.
 #
 # The push: GITHUB_TOKEN unless the INTEGRATION_PUSH_TOKEN secret is set (a fine-grained token or
 # GitHub App token for basecamp/nono only, Contents and Workflows read/write). GitHub refuses a
@@ -209,7 +210,6 @@ jobs:
           PIN: ${{ needs.try-upstream.outputs.pin }}
           LAYER: ${{ needs.try-upstream.outputs.layer }}
           REASON_FILE: ${{ runner.temp }}/reason
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           GIT_AUTHOR_NAME: github-actions[bot]
           GIT_AUTHOR_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
           GIT_COMMITTER_NAME: github-actions[bot]
@@ -249,31 +249,60 @@ jobs:
           title="Pin upstream main at ${BASE:0:12}"
           git commit -q -a -m "$title" -m "Every topic branch in .github/integration/topics merges onto nolabs-ai/nono main $BASE in order. Was $PIN: $compare"
           new="$(git rev-parse HEAD)"
+          # Push only a changed proposal; the title, body and label are reconciled every run, so one
+          # that failed partway is finished by the next.
           if [ -n "$open" ] && [ "$(gh api "repos/$GH_REPO/pulls/$open" --jq .head.sha)" = "$new" ]; then
             echo "#$open already proposes ${BASE:0:12} on integration ${tip:0:12}"
-            exit 0
+          else
+            # gh's credential helper reads GH_TOKEN when git asks, so the push carries it, not setup-git.
+            gh auth setup-git
+            err="$(GH_TOKEN="$PUSH_TOKEN" git push -q --force "https://github.com/$GH_REPO.git" "HEAD:refs/heads/$bump" 2>&1)" \
+              || fail "pushing $bump was refused: $(printf '%s' "$err" | tr '\n' ' ' | cut -c1-300)"
           fi
-          # gh's credential helper reads GH_TOKEN when git asks, so the push carries it, not setup-git.
-          gh auth setup-git
-          err="$(GH_TOKEN="$PUSH_TOKEN" git push -q --force "https://github.com/$GH_REPO.git" "HEAD:refs/heads/$bump" 2>&1)" \
-            || fail "pushing $bump was refused: $(printf '%s' "$err" | tr '\n' ' ' | cut -c1-300)"
 
           body="$(printf '%s\n\n%s\n\n%s\n' \
             "Moves the pin in \`$pin_file\` from \`${PIN:0:12}\` to upstream main's tip \`${BASE:0:12}\` ([what changed upstream]($compare)). Every topic branch in \`.github/integration/topics\` merges onto it in order." \
-            "Merging it rebuilds \`integration\` on the new pin. Each daily run refreshes this branch onto \`integration\` and the then-current tip, or closes this when there is nothing to move." \
-            "Opened by rebuild-integration.yml ([run]($RUN_URL)).")"
-          if [ -n "$open" ]; then
+            "Merging it rebuilds \`integration\` on the new pin. Each run of rebuild-integration.yml refreshes this branch onto \`integration\` and the then-current tip, closes this when there is nothing to move, and closes it when a later trial fails on an \`integration\` this was not tried on." \
+            "Opened by rebuild-integration.yml.")"
+          if [ -z "$open" ]; then
+            out="$(gh api "repos/$GH_REPO/pulls" -f title="$title" -f head="$bump" -f base=integration -f body="$body" --jq .number 2>&1)" || {
+              hint=""
+              case "$out" in *"not permitted to create"*) hint=" (turn on Settings > Actions > General > Allow GitHub Actions to create and approve pull requests)" ;; esac
+              fail "opening the pull request from $bump was refused: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-300)$hint"
+            }
+            open="$out"
+            echo "opened #$open"
+          elif [ "$(gh api "repos/$GH_REPO/pulls/$open" --jq '.title + "\n" + .body')" != "$title"$'\n'"$body" ]; then
             gh api -X PATCH "repos/$GH_REPO/pulls/$open" -f title="$title" -f body="$body" >/dev/null
             echo "updated #$open"
-          elif ! out="$(gh api "repos/$GH_REPO/pulls" -f title="$title" -f head="$bump" -f base=integration -f body="$body" --jq .number 2>&1)"; then
-            hint=""
-            case "$out" in *"not permitted to create"*) hint=" (turn on Settings > Actions > General > Allow GitHub Actions to create and approve pull requests)" ;; esac
-            fail "opening the pull request from $bump was refused: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-300)$hint"
+          fi
+          gh label create integration-upstream -R "$GH_REPO" --color 0e8a16 --force \
+            --description "Opened and closed by the integration workflows" >/dev/null
+          gh api "repos/$GH_REPO/issues/$open/labels" -f 'labels[]=integration-upstream' >/dev/null
+
+      # A bump stands while integration is the commit it was tried on. A failed trial on a moved
+      # integration (a carry PR, or topic branches rebuilt in) says nothing for it, and its pin may
+      # not merge with what integration now carries.
+      - name: Close a bump this trial cannot vouch for
+        if: needs.try-upstream.result == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          bump=integration-upstream-bump
+          open="$(gh api "repos/$GH_REPO/pulls?state=open&base=integration&head=${GH_REPO%%/*}:$bump" --jq '.[0].number // empty')"
+          [ -n "$open" ] || exit 0
+          head="$(gh api "repos/$GH_REPO/pulls/$open" --jq .head.sha)"
+          parent="$(gh api "repos/$GH_REPO/commits/$head" --jq '.parents[0].sha')"
+          tip="$(gh api "repos/$GH_REPO/branches/integration" --jq .commit.sha)"
+          if [ "$parent" = "$tip" ]; then
+            echo "#$open was tried on integration ${tip:0:12}: it stands"
           else
-            gh label create integration-upstream -R "$GH_REPO" --color 0e8a16 --force \
-              --description "Opened and closed by the integration workflows" >/dev/null
-            gh api "repos/$GH_REPO/issues/$out/labels" -f 'labels[]=integration-upstream' >/dev/null
-            echo "opened #$out"
+            gh api "repos/$GH_REPO/issues/$open/comments" \
+              -f body="integration has moved to ${tip:0:12} since this was tried on ${parent:0:12}, and upstream main's tip no longer merges: see the integration-upstream issue. The next trial that succeeds opens a new one." >/dev/null
+            gh api -X PATCH "repos/$GH_REPO/pulls/$open" -f state=closed >/dev/null
+            echo "closed #$open"
           fi
 
       - name: Open, update or close the issue
