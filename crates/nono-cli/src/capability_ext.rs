@@ -448,12 +448,7 @@ fn add_atomic_write_rule(caps: &mut CapabilitySet, cap: &FsCapability) -> Result
                 path.display()
             ))
         })?;
-        let escaped = regex_escape_path(path_str);
-        let regex = format!("^{}\\.tmp\\.[0-9]+\\.[0-9a-f]+$", escaped);
-        caps.add_platform_rule(format!(
-            "(allow file-write* file-read-metadata (regex #\"{}\"))",
-            regex
-        ))
+        caps.add_platform_rule(atomic_write_rule(path_str))
     }
 
     add_rule_for_path(caps, &cap.resolved)?;
@@ -468,6 +463,35 @@ fn add_atomic_write_rule(_caps: &mut CapabilitySet, _cap: &FsCapability) -> Resu
     Ok(())
 }
 
+/// The Seatbelt rule that lets the sandbox create and write the atomic-write
+/// temp files of `path` (`add_atomic_write_rule`). Built on every platform: the
+/// dry-run report reads a rule back as a grant only when it is this one
+/// (`dry_run_report::seatbelt_grant`).
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn atomic_write_rule(path: &str) -> String {
+    let escaped = regex_escape_path(path);
+    let regex = format!("^{}\\.tmp\\.[0-9]+\\.[0-9a-f]+$", escaped);
+    format!(
+        "(allow file-write* file-read-metadata (regex #\"{}\"))",
+        regex
+    )
+}
+
+/// The Seatbelt rule `apply_unlink_overrides` emits so the sandbox can unlink a
+/// writable file's atomic-write temp sibling (`policy::apply_unlink_overrides`,
+/// the `file-write-unlink` regex for a file cap). The dry-run report reads an
+/// unlink regex back as an `atomic_temp` write grant only when it is this one.
+/// `regex_escape_path` matches `policy::escape_seatbelt_regex_path` for every
+/// path without a control character, which the generator refuses earlier.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn unlink_atomic_rule(path: &str) -> String {
+    let escaped = regex_escape_path(path);
+    format!(
+        "(allow file-write-unlink (regex #\"^{}\\.tmp\\.[0-9]+\\.[0-9a-f]+$\"))",
+        escaped
+    )
+}
+
 /// Escape a filesystem path for use in a Seatbelt regex.
 ///
 /// Escapes both regex metacharacters and the `"` that terminates the
@@ -475,7 +499,7 @@ fn add_atomic_write_rule(_caps: &mut CapabilitySet, _cap: &FsCapability) -> Resu
 /// in a path would otherwise close that string literal early, letting the
 /// remainder of the path be parsed as new S-expression tokens and injected
 /// into the generated sandbox profile.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 fn regex_escape_path(path: &str) -> String {
     let mut out = String::with_capacity(path.len() + 8);
     for c in path.chars() {
