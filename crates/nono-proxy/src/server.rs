@@ -9,7 +9,7 @@
 
 use crate::audit;
 use crate::capture::CredentialCaptureBackend;
-use crate::config::ProxyConfig;
+use crate::config::{EndpointPolicyOutcome, ProxyConfig};
 use crate::connect;
 use crate::credential::CredentialStore;
 use crate::error::{ProxyError, Result};
@@ -386,6 +386,35 @@ impl ProxyHandle {
         match self.audit_log.as_ref() {
             Some(audit_log) => audit::drain_audit_events(audit_log),
             None => Vec::new(),
+        }
+    }
+
+    /// Drain collected network audit events with their live-delivery status.
+    ///
+    /// Returns an empty vec when network audit was disabled at start.
+    #[must_use]
+    pub fn drain_buffered_audit_events(&self) -> Vec<audit::BufferedAuditEvent> {
+        match self.audit_log.as_ref() {
+            Some(audit_log) => audit::drain_buffered_audit_events(audit_log),
+            None => Vec::new(),
+        }
+    }
+
+    /// Deliver network audit events to `sink` as they happen.
+    ///
+    /// Events emitted before the sink is attached, or that the sink rejects,
+    /// stay buffered with `live_recorded == false`. No-op when network audit
+    /// was disabled at start.
+    pub fn attach_audit_sink(&self, sink: audit::AuditSink) {
+        if let Some(audit_log) = self.audit_log.as_ref() {
+            audit_log.attach_sink(sink);
+        }
+    }
+
+    /// Stop live delivery of network audit events.
+    pub fn detach_audit_sink(&self) {
+        if let Some(audit_log) = self.audit_log.as_ref() {
+            audit_log.detach_sink();
         }
     }
 
@@ -983,6 +1012,25 @@ struct ProxyState {
     audit_log: Option<audit::SharedAuditLog>,
     /// Optional approval backend registry for L7 endpoint-policy approve routes.
     approval_backends: Option<crate::approval::ApprovalBackendRegistry>,
+    /// Optional backend that answers interactive approval prompts for CONNECT
+    /// hosts not on the allowlist (profile `network.approval_backends`). `None`
+    /// keeps the historical behavior: a not-allowed host gets an immediate 403.
+    network_approval_backend: Option<Arc<dyn nono::ApprovalBackend>>,
+    /// Session-scoped network approval decisions keyed by `(host, port)`
+    /// (`true` = allow, `false` = deny). Populated by "Always allow"/"Always
+    /// deny" choices so repeated connections to the same host within a session
+    /// are not re-prompted. Lives for the proxy's lifetime (one session).
+    network_session_decisions:
+        Arc<std::sync::Mutex<std::collections::HashMap<(String, u16), bool>>>,
+    /// Coordinates concurrent first-touch network-approval prompts (keyed by
+    /// `(host, port)`) so a burst of connections to the same not-yet-decided
+    /// host shares one prompt instead of stacking duplicate prompts. Lives for
+    /// the proxy's lifetime (one session).
+    network_inflight: Arc<connect::InFlightMap>,
+    /// Session identifier recorded in network approval requests, so a backend
+    /// (terminal/webhook) and the audit trail can attribute a prompt to the
+    /// originating sandbox session.
+    network_session_id: String,
     /// Optional supervisor-backed capture backend for command-backed credentials.
     credential_capture_backend: Option<Arc<dyn CredentialCaptureBackend>>,
     /// Optional resolver for command-mediation broker nonces found in request headers.
@@ -1106,6 +1154,37 @@ pub async fn start_with_nonce_resolver(
     approval_backends: Option<crate::approval::ApprovalBackendRegistry>,
     credential_capture_backend: Option<Arc<dyn CredentialCaptureBackend>>,
     nonce_resolver: Option<Arc<dyn crate::token::NonceResolver>>,
+) -> Result<ProxyHandle> {
+    start_with_network_approval(
+        config,
+        approval_backends,
+        credential_capture_backend,
+        nonce_resolver,
+        None,
+        String::new(),
+    )
+    .await
+}
+
+/// Start the proxy server with all optional backends, including an interactive
+/// approval backend for CONNECT hosts that are not on the allowlist.
+///
+/// `network_approval_backend` is distinct from `approval_backends` (which
+/// answers L7 endpoint-policy `approve` decisions): it gates the transparent
+/// CONNECT tunnel itself. When `None`, a not-allowed host is denied with an
+/// immediate 403, exactly as before.
+///
+/// `network_session_id` is recorded in each network approval request so the
+/// backend and audit trail can attribute a prompt to the originating sandbox
+/// session; pass an empty string when there is no session context.
+#[allow(clippy::too_many_arguments)]
+pub async fn start_with_network_approval(
+    config: ProxyConfig,
+    approval_backends: Option<crate::approval::ApprovalBackendRegistry>,
+    credential_capture_backend: Option<Arc<dyn CredentialCaptureBackend>>,
+    nonce_resolver: Option<Arc<dyn crate::token::NonceResolver>>,
+    network_approval_backend: Option<Arc<dyn nono::ApprovalBackend>>,
+    network_session_id: String,
 ) -> Result<ProxyHandle> {
     validate_no_proxy_config(&config)?;
 
@@ -1405,6 +1484,12 @@ pub async fn start_with_nonce_resolver(
         active_connections: AtomicUsize::new(0),
         audit_log: audit_log.clone(),
         approval_backends,
+        network_approval_backend,
+        network_session_decisions: Arc::new(
+            std::sync::Mutex::new(std::collections::HashMap::new()),
+        ),
+        network_inflight: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        network_session_id,
         credential_capture_backend,
         nonce_resolver: effective_nonce_resolver,
         bypass_matcher,
@@ -1912,6 +1997,21 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
             None
         };
 
+        // Interactive approval for CONNECT hosts not on the allowlist, when a
+        // `network.approval_backends` backend is configured. Shared session
+        // cache lets "Always allow"/"Always deny" suppress re-prompts. Not
+        // applied to the chained external-proxy path (that upstream enforces).
+        let network_approval =
+            state
+                .network_approval_backend
+                .as_ref()
+                .map(|backend| connect::NetworkApproval {
+                    backend,
+                    session_decisions: state.network_session_decisions.as_ref(),
+                    in_flight: state.network_inflight.as_ref(),
+                    session_id: &state.network_session_id,
+                });
+
         if let Some(ext_config) = use_external {
             external::handle_external_proxy(
                 first_line,
@@ -1929,11 +2029,41 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
             // routing direct. Without this, bypassed hosts would inherit
             // connect::handle_connect()'s lenient auth (which tolerates
             // missing Proxy-Authorization for Node.js undici compat).
-            token::enforce_proxy_auth(
+            // A failed check answers with a 407 challenge (RFC 9110 section
+            // 15.5.8) so reactive clients can retry with credentials.
+            if let Err(e) = token::enforce_proxy_auth(
                 state.config.require_auth,
                 &header_bytes,
                 &state.session_token,
-            )?;
+            ) {
+                let authority = first_line.split_whitespace().nth(1).unwrap_or("");
+                let host_port = normalize_authority(authority);
+                let (host, port) = connect_target_from_normalized_authority(&host_port)
+                    .unwrap_or_else(|| (host_port.clone(), 443));
+                debug!(
+                    "Bypass CONNECT to {}:{} failed proxy auth: {}",
+                    host, port, e
+                );
+                audit::log_denied(
+                    state.audit_log.as_ref(),
+                    audit::ProxyMode::Connect,
+                    &audit::EventContext {
+                        auth_mechanism: Some(
+                            nono::undo::NetworkAuditAuthMechanism::ProxyAuthorization,
+                        ),
+                        auth_outcome: Some(nono::undo::NetworkAuditAuthOutcome::Failed),
+                        denial_category: Some(
+                            nono::undo::NetworkAuditDenialCategory::AuthenticationFailed,
+                        ),
+                        ..audit::EventContext::default()
+                    },
+                    &host,
+                    port,
+                    "proxy auth missing or invalid",
+                );
+                connect::write_proxy_auth_challenge(&mut stream).await?;
+                return Ok(());
+            }
             connect::handle_connect(
                 first_line,
                 &mut stream,
@@ -1942,6 +2072,7 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
                 &header_bytes,
                 connect_auth_mode,
                 state.audit_log.as_ref(),
+                network_approval.as_ref(),
             )
             .await
         } else {
@@ -1953,6 +2084,7 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
                 &header_bytes,
                 connect_auth_mode,
                 state.audit_log.as_ref(),
+                network_approval.as_ref(),
             )
             .await
         }
@@ -2147,16 +2279,8 @@ async fn handle_forward_http(
         return Ok(());
     }
 
-    // 3. Read the request body before building upstream headers so chunked
-    //    framing can be decoded and re-written with Content-Length.
-    let body = match reverse::read_request_body(stream, header_bytes, buffered).await? {
-        Some(body) => body,
-        None => return Ok(()), // send_error already written (e.g. 413 / 400)
-    };
-
-    // Build the origin-form request bytes: rewritten request line +
-    // proxy-header-stripped header block + optional Content-Length +
-    // terminating CRLF.
+    // Build the origin-form request line and extract method + path so the
+    // endpoint-policy gate below can evaluate the L7 rules.
     let origin_line = rewrite_absolute_to_origin_form(first_line)?;
     let inbound_path = origin_line
         .split_whitespace()
@@ -2168,6 +2292,24 @@ async fn handle_forward_http(
         .next()
         .unwrap_or("GET")
         .to_string();
+
+    // 2b. Endpoint-policy gate. The host filter authorizes the HOST; endpoint
+    //     rules configured on routes for that host restrict which method+path
+    //     combinations may pass. The CONNECT-intercept path enforces them via
+    //     `select_intercept_route`; without the same gate here every
+    //     plain-HTTP request to an allowed host would bypass the rules
+    //     entirely (issue #2174).
+    if enforce_forward_http_endpoint_rules(state, &host, port, &method, &inbound_path).await {
+        reverse::send_error_generic(stream, 403, "Forbidden").await?;
+        return Ok(());
+    }
+
+    // 3. Read the request body before building upstream headers so chunked
+    //    framing can be decoded and re-written with Content-Length.
+    let body = match reverse::read_request_body(stream, header_bytes, buffered).await? {
+        Some(body) => body,
+        None => return Ok(()), // send_error already written (e.g. 413 / 400)
+    };
 
     // Target matches a route's upstream (not nono's own port, handled above) —
     // redeem any phantom nonce before forwarding, as CONNECT already does.
@@ -2299,6 +2441,112 @@ async fn handle_forward_http(
             Ok(())
         }
     }
+}
+
+/// Audit an endpoint-policy denial on the plain-HTTP forward path.
+async fn log_forward_endpoint_denial(
+    state: &ProxyState,
+    host: &str,
+    port: u16,
+    route_id: Option<&str>,
+    reason: &str,
+) {
+    warn!("forward-http: {}", reason);
+    audit::log_denied(
+        state.audit_log.as_ref(),
+        audit::ProxyMode::Reverse,
+        &audit::EventContext {
+            route_id,
+            denial_category: Some(nono::undo::NetworkAuditDenialCategory::EndpointPolicy),
+            ..audit::EventContext::default()
+        },
+        host,
+        port,
+        reason,
+    );
+}
+
+/// Evaluate the endpoint rules configured on routes matching an absolute-form
+/// forward target, mirroring `select_intercept_route`'s authorization
+/// semantics (without credential selection, approval workflows, or rate
+/// limiting — the forward path is a transparent proxy that never injects a
+/// managed credential).
+///
+/// Returns `true` when the request must be denied (the caller responds 403);
+/// `false` when it may proceed.
+async fn enforce_forward_http_endpoint_rules(
+    state: &ProxyState,
+    host: &str,
+    port: u16,
+    method: &str,
+    path: &str,
+) -> bool {
+    let candidates = state
+        .route_store
+        .lookup_forward_endpoint_candidates(host, port);
+    if candidates.is_empty() {
+        return false;
+    }
+
+    let mut has_endpoint_only_route = false;
+    let mut endpoint_authorized = false;
+    for (prefix, route) in &candidates {
+        if route.endpoint_policy.allows_all_without_l7() {
+            // Catch-all route for this host: no L7 constraint.
+            continue;
+        }
+        match route.endpoint_policy.evaluate(method, path) {
+            EndpointPolicyOutcome::Allow { .. } => {
+                endpoint_authorized = true;
+            }
+            EndpointPolicyOutcome::Approve { rule_label, .. } => {
+                // Approval workflows have no client surface on the
+                // plain-HTTP forward path; fail closed.
+                let reason = format!(
+                    "endpoint rule {} requires approval, which is not supported \
+                     on the plain-HTTP forward path: {} {} on {}:{}",
+                    rule_label, method, path, host, port
+                );
+                log_forward_endpoint_denial(state, host, port, Some(prefix), &reason).await;
+                return true;
+            }
+            EndpointPolicyOutcome::Deny { reason, rule_label } => {
+                // Legacy `endpoint_rules` allow-lists compile to a
+                // non-explicit default-deny policy: a non-matching route
+                // simply does not authorize the request. It must not
+                // hard-deny on its own — mirror `select_intercept_route` by
+                // letting credential-less (`_ep_`) routes gate the request
+                // via the post-loop check, and dropping managed-credential
+                // routes (another candidate may still authorize).
+                if !route.endpoint_policy.is_explicit() {
+                    if !route.requires_managed_credential {
+                        has_endpoint_only_route = true;
+                    }
+                    continue;
+                }
+                let reason = reason.map_or_else(
+                    || format!("endpoint denied by policy ({})", rule_label),
+                    std::string::ToString::to_string,
+                );
+                log_forward_endpoint_denial(state, host, port, Some(prefix), &reason).await;
+                return true;
+            }
+        }
+    }
+
+    // A credential catch-all must not be shadowed by an endpoint-only route
+    // that gates this host but did not authorize the request (mirrors
+    // `select_intercept_route`).
+    if has_endpoint_only_route && !endpoint_authorized {
+        let reason = format!(
+            "endpoint rules denied {} {}: no rule matched on {}:{}",
+            method, path, host, port
+        );
+        log_forward_endpoint_denial(state, host, port, None, &reason).await;
+        return true;
+    }
+
+    false
 }
 
 #[cfg(test)]
@@ -2667,6 +2915,50 @@ mod tests {
                 let _ = sock
                     .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
                     .await;
+            }
+        });
+        format!("127.0.0.1:{}", addr.port())
+    }
+
+    /// A mock upstream (enterprise) proxy: answers any CONNECT with
+    /// `200 Connection Established`, then echoes tunnelled bytes back so a
+    /// chained CONNECT can be verified end-to-end.
+    async fn spawn_mock_external_proxy() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            // Consume the CONNECT head up to the blank line.
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            loop {
+                match sock.read(&mut byte).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => head.push(byte[0]),
+                }
+                if head.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            if sock
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .await
+                .is_err()
+            {
+                return;
+            }
+            let mut buf = [0u8; 1024];
+            loop {
+                match sock.read(&mut buf).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => {
+                        if sock.write_all(&buf[..n]).await.is_err() {
+                            return;
+                        }
+                    }
+                }
             }
         });
         format!("127.0.0.1:{}", addr.port())
@@ -3475,6 +3767,7 @@ mod tests {
                         },
                     ],
                     request_body: crate::config::OAuthTokenRequestBodyFormat::Auto,
+                    response_body: crate::config::OAuthTokenRequestBodyFormat::Auto,
                     request_nonce_fields: vec!["refresh_token".to_string()],
                 }],
                 admitted_consumers: vec!["proxy.openai_oauth".to_string()],
@@ -5247,6 +5540,345 @@ mod tests {
         handle.shutdown();
     }
 
+    /// Read one HTTP response head from `sock` (up to the blank line),
+    /// returning whatever arrived if the peer closes the connection first.
+    /// Bounded by a timeout so a hung proxy fails the test instead of
+    /// hanging it.
+    async fn read_response_head(sock: &mut tokio::net::TcpStream) -> String {
+        let read = async {
+            let mut response = Vec::new();
+            let mut byte = [0u8; 1];
+            loop {
+                match sock.read(&mut byte).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => response.push(byte[0]),
+                }
+                if response.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            response
+        };
+        let response = tokio::time::timeout(std::time::Duration::from_secs(5), read)
+            .await
+            .unwrap_or_default();
+        String::from_utf8_lossy(&response).to_string()
+    }
+
+    /// Issue #2079: with an upstream proxy configured, a CONNECT without
+    /// Proxy-Authorization must be answered with a 407 challenge instead of
+    /// a dropped connection, so reactive proxy-auth clients (RFC 9110
+    /// section 15.5.8) can retry with credentials.
+    #[tokio::test]
+    async fn upstream_proxy_connect_missing_auth_answers_407() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpStream;
+
+        let config = ProxyConfig {
+            allowed_hosts: vec!["127.0.0.1".to_string()],
+            require_auth: true,
+            external_proxy: Some(crate::config::ExternalProxyConfig {
+                address: spawn_mock_external_proxy().await,
+                auth: None,
+                bypass_hosts: Vec::new(),
+            }),
+            ..Default::default()
+        };
+        let handle = start(config).await.unwrap();
+
+        let mut sock = TcpStream::connect(("127.0.0.1", handle.port))
+            .await
+            .unwrap();
+        sock.write_all(b"CONNECT 127.0.0.1:443 HTTP/1.1\r\nHost: 127.0.0.1:443\r\n\r\n")
+            .await
+            .unwrap();
+
+        let response = read_response_head(&mut sock).await;
+        assert!(
+            response.starts_with("HTTP/1.1 407 "),
+            "expected a 407 challenge, got: {response:?}"
+        );
+        assert!(
+            response.contains("Proxy-Authenticate: Basic realm=\"nono\""),
+            "the 407 must carry a Proxy-Authenticate challenge, got: {response:?}"
+        );
+
+        let events = handle.drain_audit_events();
+        assert!(
+            events
+                .iter()
+                .any(|e| e.decision == nono::undo::NetworkAuditDecision::Deny
+                    && e.target == "127.0.0.1"
+                    && e.auth_outcome == Some(nono::undo::NetworkAuditAuthOutcome::Failed)
+                    && e.denial_category
+                        == Some(nono::undo::NetworkAuditDenialCategory::AuthenticationFailed)),
+            "expected an AuthenticationFailed deny audit event, got: {events:?}"
+        );
+
+        handle.shutdown();
+    }
+
+    /// Issue #2079, bypass variant: a CONNECT to an `upstream_bypass` host
+    /// without Proxy-Authorization must also be answered with a 407 instead
+    /// of a dropped connection.
+    #[tokio::test]
+    async fn upstream_bypass_connect_missing_auth_answers_407() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpStream;
+
+        let direct = spawn_mock_upstream().await;
+        let config = ProxyConfig {
+            allowed_hosts: vec!["127.0.0.1".to_string()],
+            require_auth: true,
+            external_proxy: Some(crate::config::ExternalProxyConfig {
+                address: "127.0.0.1:1".to_string(),
+                auth: None,
+                bypass_hosts: vec!["127.0.0.1".to_string()],
+            }),
+            ..Default::default()
+        };
+        let handle = start(config).await.unwrap();
+
+        let mut sock = TcpStream::connect(("127.0.0.1", handle.port))
+            .await
+            .unwrap();
+        sock.write_all(format!("CONNECT {direct} HTTP/1.1\r\nHost: {direct}\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+
+        let response = read_response_head(&mut sock).await;
+        assert!(
+            response.starts_with("HTTP/1.1 407 "),
+            "expected a 407 challenge, got: {response:?}"
+        );
+        assert!(
+            response.contains("Proxy-Authenticate: Basic realm=\"nono\""),
+            "the 407 must carry a Proxy-Authenticate challenge, got: {response:?}"
+        );
+
+        let events = handle.drain_audit_events();
+        assert!(
+            events
+                .iter()
+                .any(|e| e.decision == nono::undo::NetworkAuditDecision::Deny
+                    && e.target == "127.0.0.1"
+                    && e.auth_outcome == Some(nono::undo::NetworkAuditAuthOutcome::Failed)
+                    && e.denial_category
+                        == Some(nono::undo::NetworkAuditDenialCategory::AuthenticationFailed)),
+            "expected an AuthenticationFailed deny audit event, got: {events:?}"
+        );
+
+        handle.shutdown();
+    }
+
+    /// A credentialed CONNECT must still chain through the upstream proxy:
+    /// 200 Connection Established, with tunnelled bytes relayed both ways.
+    #[tokio::test]
+    async fn upstream_proxy_connect_with_auth_tunnels_through() {
+        use base64::Engine;
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+
+        let config = ProxyConfig {
+            allowed_hosts: vec!["127.0.0.1".to_string()],
+            require_auth: true,
+            external_proxy: Some(crate::config::ExternalProxyConfig {
+                address: spawn_mock_external_proxy().await,
+                auth: None,
+                bypass_hosts: Vec::new(),
+            }),
+            ..Default::default()
+        };
+        let handle = start(config).await.unwrap();
+        let creds = base64::engine::general_purpose::STANDARD
+            .encode(format!("nono:{}", handle.token.as_str()));
+
+        let mut sock = TcpStream::connect(("127.0.0.1", handle.port))
+            .await
+            .unwrap();
+        sock.write_all(
+            format!(
+                "CONNECT 127.0.0.1:443 HTTP/1.1\r\nHost: 127.0.0.1:443\r\nProxy-Authorization: Basic {creds}\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+
+        let response = read_response_head(&mut sock).await;
+        assert!(
+            response.starts_with("HTTP/1.1 200 "),
+            "expected the chained CONNECT to be tunnelled, got: {response:?}"
+        );
+
+        sock.write_all(b"ping").await.unwrap();
+        let mut buf = [0u8; 4];
+        match tokio::time::timeout(Duration::from_secs(5), sock.read_exact(&mut buf)).await {
+            Ok(Ok(_)) => assert_eq!(buf, *b"ping"),
+            _ => panic!("tunnelled write was not echoed back through the upstream proxy"),
+        }
+
+        handle.shutdown();
+    }
+
+    /// A credentialed CONNECT to an `upstream_bypass` host must still tunnel
+    /// directly to the target, not through the upstream proxy.
+    #[tokio::test]
+    async fn upstream_bypass_connect_with_auth_tunnels_direct() {
+        use base64::Engine;
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+
+        let direct = spawn_mock_upstream().await;
+        let config = ProxyConfig {
+            allowed_hosts: vec!["127.0.0.1".to_string()],
+            require_auth: true,
+            external_proxy: Some(crate::config::ExternalProxyConfig {
+                address: "127.0.0.1:1".to_string(),
+                auth: None,
+                bypass_hosts: vec!["127.0.0.1".to_string()],
+            }),
+            ..Default::default()
+        };
+        let handle = start(config).await.unwrap();
+        let creds = base64::engine::general_purpose::STANDARD
+            .encode(format!("nono:{}", handle.token.as_str()));
+
+        let mut sock = TcpStream::connect(("127.0.0.1", handle.port))
+            .await
+            .unwrap();
+        sock.write_all(
+            format!(
+                "CONNECT {direct} HTTP/1.1\r\nHost: {direct}\r\nProxy-Authorization: Basic {creds}\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+
+        let response = read_response_head(&mut sock).await;
+        assert!(
+            response.starts_with("HTTP/1.1 200 "),
+            "expected the bypassed CONNECT to be tunnelled, got: {response:?}"
+        );
+
+        sock.write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = [0u8; 1024];
+        match tokio::time::timeout(Duration::from_secs(5), sock.read(&mut buf)).await {
+            Ok(Ok(n)) => assert!(
+                String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 200 OK"),
+                "the direct tunnel must reach the bypassed target"
+            ),
+            _ => panic!("the direct tunnel did not relay the request"),
+        }
+
+        handle.shutdown();
+    }
+
+    /// With auth disabled, an unauthenticated CONNECT must still chain through
+    /// the upstream proxy without being challenged.
+    #[tokio::test]
+    async fn upstream_proxy_no_auth_connect_tunnels_without_challenge() {
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+
+        let config = ProxyConfig {
+            allowed_hosts: vec!["127.0.0.1".to_string()],
+            require_auth: false,
+            external_proxy: Some(crate::config::ExternalProxyConfig {
+                address: spawn_mock_external_proxy().await,
+                auth: None,
+                bypass_hosts: Vec::new(),
+            }),
+            ..Default::default()
+        };
+        let handle = start(config).await.unwrap();
+
+        let mut sock = TcpStream::connect(("127.0.0.1", handle.port))
+            .await
+            .unwrap();
+        sock.write_all(b"CONNECT 127.0.0.1:443 HTTP/1.1\r\nHost: 127.0.0.1:443\r\n\r\n")
+            .await
+            .unwrap();
+
+        let response = read_response_head(&mut sock).await;
+        assert!(
+            response.starts_with("HTTP/1.1 200 "),
+            "with --no-auth the CONNECT must tunnel without a challenge, got: {response:?}"
+        );
+        assert!(
+            !response.contains("407"),
+            "auth must not be enforced on the chained path when disabled, got: {response:?}"
+        );
+
+        sock.write_all(b"ping").await.unwrap();
+        let mut buf = [0u8; 4];
+        match tokio::time::timeout(Duration::from_secs(5), sock.read_exact(&mut buf)).await {
+            Ok(Ok(_)) => assert_eq!(buf, *b"ping"),
+            _ => panic!("tunnelled write was not echoed back through the upstream proxy"),
+        }
+
+        handle.shutdown();
+    }
+
+    /// With auth disabled, an unauthenticated CONNECT to an `upstream_bypass`
+    /// host must still tunnel directly without being challenged.
+    #[tokio::test]
+    async fn upstream_bypass_no_auth_connect_tunnels_without_challenge() {
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+
+        let direct = spawn_mock_upstream().await;
+        let config = ProxyConfig {
+            allowed_hosts: vec!["127.0.0.1".to_string()],
+            require_auth: false,
+            external_proxy: Some(crate::config::ExternalProxyConfig {
+                address: "127.0.0.1:1".to_string(),
+                auth: None,
+                bypass_hosts: vec!["127.0.0.1".to_string()],
+            }),
+            ..Default::default()
+        };
+        let handle = start(config).await.unwrap();
+
+        let mut sock = TcpStream::connect(("127.0.0.1", handle.port))
+            .await
+            .unwrap();
+        sock.write_all(format!("CONNECT {direct} HTTP/1.1\r\nHost: {direct}\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+
+        let response = read_response_head(&mut sock).await;
+        assert!(
+            response.starts_with("HTTP/1.1 200 "),
+            "with --no-auth the CONNECT must tunnel without a challenge, got: {response:?}"
+        );
+        assert!(
+            !response.contains("407"),
+            "auth must not be enforced on the bypass path when disabled, got: {response:?}"
+        );
+
+        sock.write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = [0u8; 1024];
+        match tokio::time::timeout(Duration::from_secs(5), sock.read(&mut buf)).await {
+            Ok(Ok(n)) => assert!(
+                String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 200 OK"),
+                "the direct tunnel must reach the bypassed target"
+            ),
+            _ => panic!("the direct tunnel did not relay the request"),
+        }
+
+        handle.shutdown();
+    }
+
     #[test]
     fn test_parse_non_connect_target_default_port_80() {
         let (host, port) = parse_non_connect_target("GET http://google.com/ HTTP/1.1").unwrap();
@@ -6060,6 +6692,246 @@ mod tests {
                     && e.denial_category
                         == Some(nono::undo::NetworkAuditDenialCategory::HostDenied)),
             "expected a HostDenied audit event, got: {events:?}"
+        );
+
+        handle.shutdown();
+    }
+
+    // ========================================================================
+    // Forward-proxy endpoint-rule enforcement — issue #2174
+    // ========================================================================
+
+    /// A route whose legacy `endpoint_rules` allow only `GET /get`, as
+    /// produced by `allow_domain` entries with `endpoints` (or URL-form
+    /// `--allow-domain 'https://host/get'`).
+    fn get_only_route_config(upstream: String) -> crate::config::RouteConfig {
+        crate::config::RouteConfig {
+            redeem_phantoms: Vec::new(),
+            prefix: "get-only".to_string(),
+            upstream,
+            credential_key: None,
+            inject_mode: Default::default(),
+            inject_header: "Authorization".to_string(),
+            credential_format: None,
+            path_pattern: None,
+            path_replacement: None,
+            query_param_name: None,
+            proxy: None,
+            env_var: None,
+            endpoint_rules: vec![crate::config::EndpointRule {
+                method: "GET".to_string(),
+                path: "/get".to_string(),
+            }],
+            endpoint_policy: None,
+            tls_ca: None,
+            tls_client_cert: None,
+            tls_client_key: None,
+            oauth2: None,
+            aws_auth: None,
+            spiffe: None,
+            upgrades: vec![],
+            rate_limit: None,
+        }
+    }
+
+    /// Wrong METHOD on an allowed host must be denied by the route's
+    /// endpoint rules: plain-HTTP forward requests are the cleartext twin of
+    /// intercepted CONNECT traffic and must obey the same L7 policy.
+    #[tokio::test]
+    async fn forward_http_wrong_method_denied_by_endpoint_rules() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+
+        let (origin_addr, _origin_rx) = spawn_echo_origin().await;
+
+        let config = ProxyConfig {
+            allowed_hosts: vec!["127.0.0.1".to_string()],
+            routes: vec![get_only_route_config(format!(
+                "http://127.0.0.1:{}",
+                origin_addr.port()
+            ))],
+            ..ProxyConfig::default()
+        };
+        let handle = start(config).await.unwrap();
+        let token = handle.token.to_string();
+
+        let mut stream = TcpStream::connect(("127.0.0.1", handle.port))
+            .await
+            .unwrap();
+        let creds = {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode(format!("nono:{}", token))
+        };
+        let request = format!(
+            "DELETE http://127.0.0.1:{}/get HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nProxy-Authorization: Basic {}\r\n\r\n",
+            origin_addr.port(),
+            origin_addr.port(),
+            creds
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        let response_str = String::from_utf8_lossy(&response);
+        assert!(
+            response_str.starts_with("HTTP/1.1 403"),
+            "expected 403 for DELETE against a GET-only endpoint rule, got: {}",
+            response_str
+        );
+
+        let events = handle.drain_audit_events();
+        assert!(
+            events
+                .iter()
+                .any(|e| e.decision == nono::undo::NetworkAuditDecision::Deny
+                    && e.target == "127.0.0.1"
+                    && e.denial_category
+                        == Some(nono::undo::NetworkAuditDenialCategory::EndpointPolicy)),
+            "expected an EndpointPolicy deny audit event, got: {events:?}"
+        );
+
+        handle.shutdown();
+    }
+
+    /// Wrong PATH on an allowed host must be denied by the route's endpoint
+    /// rules.
+    #[tokio::test]
+    async fn forward_http_wrong_path_denied_by_endpoint_rules() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+
+        let (origin_addr, _origin_rx) = spawn_echo_origin().await;
+
+        let config = ProxyConfig {
+            allowed_hosts: vec!["127.0.0.1".to_string()],
+            routes: vec![get_only_route_config(format!(
+                "http://127.0.0.1:{}",
+                origin_addr.port()
+            ))],
+            ..ProxyConfig::default()
+        };
+        let handle = start(config).await.unwrap();
+        let token = handle.token.to_string();
+
+        let mut stream = TcpStream::connect(("127.0.0.1", handle.port))
+            .await
+            .unwrap();
+        let creds = {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode(format!("nono:{}", token))
+        };
+        let request = format!(
+            "GET http://127.0.0.1:{}/headers HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nProxy-Authorization: Basic {}\r\n\r\n",
+            origin_addr.port(),
+            origin_addr.port(),
+            creds
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        let response_str = String::from_utf8_lossy(&response);
+        assert!(
+            response_str.starts_with("HTTP/1.1 403"),
+            "expected 403 for /headers against a GET-only /get rule, got: {}",
+            response_str
+        );
+
+        handle.shutdown();
+    }
+
+    /// A request matching the endpoint rules is still forwarded: the gate
+    /// must not over-block.
+    #[tokio::test]
+    async fn forward_http_matching_endpoint_rule_is_forwarded() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+
+        let (origin_addr, origin_rx) = spawn_echo_origin().await;
+
+        let config = ProxyConfig {
+            allowed_hosts: vec!["127.0.0.1".to_string()],
+            routes: vec![get_only_route_config(format!(
+                "http://127.0.0.1:{}",
+                origin_addr.port()
+            ))],
+            ..ProxyConfig::default()
+        };
+        let handle = start(config).await.unwrap();
+        let token = handle.token.to_string();
+
+        let mut stream = TcpStream::connect(("127.0.0.1", handle.port))
+            .await
+            .unwrap();
+        let creds = {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode(format!("nono:{}", token))
+        };
+        let request = format!(
+            "GET http://127.0.0.1:{}/get HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nProxy-Authorization: Basic {}\r\n\r\n",
+            origin_addr.port(),
+            origin_addr.port(),
+            creds
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        let response_str = String::from_utf8_lossy(&response);
+        assert!(
+            response_str.starts_with("HTTP/1.1 200"),
+            "expected upstream 200 for GET /get matching the rule, got: {}",
+            response_str
+        );
+
+        let received = origin_rx.await.unwrap();
+        assert!(
+            received.starts_with("GET /get HTTP/1.1"),
+            "upstream should see origin-form request line, got: {received:?}"
+        );
+
+        handle.shutdown();
+    }
+
+    /// The exact issue #2174 scenario: `allow_domain` endpoint rules compile
+    /// to `https://` upstreams (port 443) while HTTP_PROXY sends plain
+    /// `http://` requests to the default port 80. The rules must still gate
+    /// the plain-HTTP request.
+    #[tokio::test]
+    async fn forward_http_enforces_https_route_rules_on_default_port() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+
+        let config = ProxyConfig {
+            allowed_hosts: vec!["127.0.0.1".to_string()],
+            routes: vec![get_only_route_config("https://127.0.0.1".to_string())],
+            ..ProxyConfig::default()
+        };
+        let handle = start(config).await.unwrap();
+        let token = handle.token.to_string();
+
+        let mut stream = TcpStream::connect(("127.0.0.1", handle.port))
+            .await
+            .unwrap();
+        let creds = {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode(format!("nono:{}", token))
+        };
+        // Port 80 (plain-HTTP default) against a route registered at port
+        // 443 — previously bypassed the rules entirely.
+        let request = format!(
+            "DELETE http://127.0.0.1:80/get HTTP/1.1\r\nHost: 127.0.0.1\r\nProxy-Authorization: Basic {}\r\n\r\n",
+            creds
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        let response_str = String::from_utf8_lossy(&response);
+        assert!(
+            response_str.starts_with("HTTP/1.1 403"),
+            "expected 403 for DELETE http://host:80/get against a GET-only https route, got: {}",
+            response_str
         );
 
         handle.shutdown();

@@ -49,7 +49,8 @@ pub fn seatbelt_path_regex(path: &str) -> crate::error::Result<String> {
 // Re-export Linux Landlock ABI detection and scope policy reporting
 #[cfg(target_os = "linux")]
 pub use linux::{
-    DetectedAbi, LandlockScopePolicy, detect_abi, landlock_scope_policy, restrict_execute,
+    DetectedAbi, LandlockScopePolicy, MAX_ENFORCED_ABI, detect_abi, kernel_abi_version,
+    landlock_scope_policy, restrict_execute,
 };
 
 // Re-export Linux opt-in namespace isolation mechanism (NEP-0004)
