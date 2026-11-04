@@ -127,7 +127,8 @@ for i in "${!topics[@]}"; do
   sha="$(git -C "$repo" rev-parse "refs/integration/topic/$t")"
   shas+=("$sha")
   before="$(git -C "$tree" rev-parse 'HEAD^{tree}')"
-  if ! git -C "$tree" merge -q --no-ff --no-edit -m "Merge $t into $BRANCH" "$sha" >/dev/null 2>&1; then
+  # rerere off: a resolution this clone remembers would stage the conflict and hide its files.
+  if ! git -C "$tree" -c rerere.enabled=false merge -q --no-ff --no-edit -m "Merge $t into $BRANCH" "$sha" >/dev/null 2>&1; then
     files="$(git -C "$tree" diff --name-only --diff-filter=U | tr '\n' ' ')"
     git -C "$tree" merge --abort >/dev/null 2>&1 || true
     fail "topic branch $t (${sha:0:12}) does not merge onto $onto${files:+: conflicts in ${files% }}"
