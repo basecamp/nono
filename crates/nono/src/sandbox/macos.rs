@@ -279,6 +279,75 @@ fn path_filters_for_cap(cap: &crate::capability::FsCapability) -> Result<Vec<Str
     Ok(filters)
 }
 
+/// `(deny file-write-unlink (literal "R"))` for the root R of each directory
+/// write grant, so the grant's root stays in place as it does on Linux.
+///
+/// Landlock checks removing or renaming a directory against write access to
+/// its parent, which a grant on the directory doesn't give: `rmdir R` and
+/// `mv R elsewhere` fail there, while everything inside R can be written,
+/// removed and renamed. On macOS, `(allow file-write* (subpath "R"))` covers R
+/// itself, so both succeed. The deny matches R alone (`literal`, not
+/// `subpath`), leaving every rule inside R as it was.
+///
+/// One deny per spelling the write rules emit for the grant: the resolved
+/// path, and `original` when it differs (as in `path_filters_for_cap`). A
+/// spelling whose parent lies within a directory write grant gets none, since
+/// Landlock allows that removal too. Containment is decided as Landlock
+/// decides it, on the parent's identity: the canonical parent against the
+/// grants' resolved roots, so `/tmp/r/c` lies within a grant on
+/// `/private/tmp/r` (as does a spelling that differs only in case on a
+/// case-insensitive volume), and `/r/link/c` does not when `link` leads out of
+/// `/r`. A parent that can't be canonicalized (missing, or unreadable) counts
+/// as not granted, and the root keeps its deny: failing to see a grant only
+/// narrows.
+///
+/// Single-file grants are left as they are. Landlock refuses to unlink a
+/// granted file whose parent isn't write-granted, too, but on macOS a file
+/// write grant's unlink is what lets a tool replace the file at its own path
+/// (unlink and recreate, or rename over it), so that difference stays.
+fn write_root_unlink_denies(caps: &CapabilitySet) -> Result<Vec<String>> {
+    let dir_writes = || {
+        caps.fs_capabilities().iter().filter(|cap| {
+            !cap.is_file && matches!(cap.access, AccessMode::Write | AccessMode::ReadWrite)
+        })
+    };
+    let parent_write_granted = |path: &Path| {
+        path.parent()
+            .and_then(|parent| std::fs::canonicalize(parent).ok())
+            .is_some_and(|parent| dir_writes().any(|cap| parent.starts_with(&cap.resolved)))
+    };
+
+    let mut rules = Vec::new();
+    for cap in dir_writes() {
+        let resolved_str = cap.resolved.to_str().ok_or_else(|| {
+            NonoError::SandboxInit(format!(
+                "path contains non-UTF-8 bytes: {}",
+                cap.resolved.display()
+            ))
+        })?;
+        let mut spellings = vec![(cap.resolved.as_path(), resolved_str)];
+        // A non-UTF-8 original gets no write rule, so it needs no deny.
+        if cap.original != cap.resolved
+            && let Some(original_str) = cap.original.to_str()
+        {
+            spellings.push((cap.original.as_path(), original_str));
+        }
+        for (path, path_str) in spellings {
+            if parent_write_granted(path) {
+                continue;
+            }
+            let rule = format!(
+                "(deny file-write-unlink (literal \"{}\"))",
+                escape_path(path_str)?
+            );
+            if !rules.contains(&rule) {
+                rules.push(rule);
+            }
+        }
+    }
+    Ok(rules)
+}
+
 /// Escape a path for use in Seatbelt profile strings.
 ///
 /// Paths are placed inside double-quoted S-expression strings where `\` and `"`
@@ -857,6 +926,15 @@ pub(crate) fn generate_profile(caps: &CapabilitySet) -> Result<String> {
                      filtering (routed through the proxy) or ProxyOnly mode instead."
                 .to_string(),
         });
+    }
+
+    // Keep each directory write grant's root in place, as Landlock does.
+    // Last in the profile: under last-matching-rule, any later allow (a
+    // client's `(allow file-write-unlink (subpath "R"))` override, in either
+    // platform-rule loop) would let R go again.
+    for rule in write_root_unlink_denies(caps)? {
+        profile.push_str(&rule);
+        profile.push('\n');
     }
 
     Ok(profile)
@@ -2400,5 +2478,367 @@ mod tests {
         assert!(profile.contains("(allow network-outbound (remote tcp \"localhost:4001\"))"));
         assert!(profile.contains("(allow network-outbound (remote tcp \"localhost:4002\"))"));
         assert!(profile.contains("(allow network-bind)"));
+    }
+
+    fn dir_cap(original: &str, resolved: &str, access: AccessMode) -> FsCapability {
+        FsCapability {
+            original: PathBuf::from(original),
+            resolved: PathBuf::from(resolved),
+            access,
+            is_file: false,
+            source: CapabilitySource::User,
+        }
+    }
+
+    fn unlink_denies(profile: &str) -> Vec<&str> {
+        profile
+            .lines()
+            .filter(|line| line.starts_with("(deny file-write-unlink (literal "))
+            .collect()
+    }
+
+    #[test]
+    fn dir_write_grant_root_is_kept() {
+        for access in [AccessMode::ReadWrite, AccessMode::Write] {
+            let mut caps = CapabilitySet::new();
+            caps.add_fs(dir_cap("/test", "/test", access));
+
+            let profile = generate_profile(&caps).unwrap();
+
+            assert_eq!(
+                unlink_denies(&profile),
+                ["(deny file-write-unlink (literal \"/test\"))"],
+                "{access:?}"
+            );
+            // The deny is the root's literal alone; the grant's write rule is unchanged.
+            assert_eq!(
+                profile
+                    .lines()
+                    .filter(|line| line.contains("\"/test\""))
+                    .filter(|line| line.contains("file-write"))
+                    .collect::<Vec<_>>(),
+                [
+                    "(allow file-write* (subpath \"/test\"))",
+                    "(deny file-write-unlink (literal \"/test\"))",
+                ],
+                "{access:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dir_write_grant_root_is_kept_in_both_spellings() {
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(dir_cap(
+            "/tmp/mydir",
+            "/private/tmp/mydir",
+            AccessMode::ReadWrite,
+        ));
+
+        let profile = generate_profile(&caps).unwrap();
+
+        assert!(profile.contains("(allow file-write* (subpath \"/private/tmp/mydir\"))"));
+        assert!(profile.contains("(allow file-write* (subpath \"/tmp/mydir\"))"));
+        assert_eq!(
+            unlink_denies(&profile),
+            [
+                "(deny file-write-unlink (literal \"/private/tmp/mydir\"))",
+                "(deny file-write-unlink (literal \"/tmp/mydir\"))",
+            ]
+        );
+    }
+
+    #[test]
+    fn dir_write_grant_root_deny_is_escaped() {
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(dir_cap("/te\"st\\x", "/te\"st\\x", AccessMode::ReadWrite));
+
+        let profile = generate_profile(&caps).unwrap();
+
+        assert_eq!(
+            unlink_denies(&profile),
+            ["(deny file-write-unlink (literal \"/te\\\"st\\\\x\"))"]
+        );
+    }
+
+    #[test]
+    fn read_dir_grant_root_is_not_kept() {
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(dir_cap("/test", "/test", AccessMode::Read));
+
+        let profile = generate_profile(&caps).unwrap();
+
+        assert!(unlink_denies(&profile).is_empty(), "{profile}");
+    }
+
+    #[test]
+    fn file_write_grant_is_not_kept() {
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(FsCapability {
+            original: PathBuf::from("/test.txt"),
+            resolved: PathBuf::from("/test.txt"),
+            access: AccessMode::ReadWrite,
+            is_file: true,
+            source: CapabilitySource::User,
+        });
+
+        let profile = generate_profile(&caps).unwrap();
+
+        assert!(unlink_denies(&profile).is_empty(), "{profile}");
+    }
+
+    #[test]
+    fn dir_write_grant_root_under_write_grant_is_not_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let path = |rel: &str| base.join(rel).to_str().unwrap().to_string();
+        for rel in ["test/child", "test/a/b", "testx/c"] {
+            std::fs::create_dir_all(base.join(rel)).unwrap();
+        }
+
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(dir_cap(&path("test"), &path("test"), AccessMode::ReadWrite));
+        // Child of the grant, and deeper within it: Landlock allows removing both.
+        caps.add_fs(dir_cap(
+            &path("test/child"),
+            &path("test/child"),
+            AccessMode::ReadWrite,
+        ));
+        caps.add_fs(dir_cap(
+            &path("test/a/b"),
+            &path("test/a/b"),
+            AccessMode::Write,
+        ));
+        // A sibling whose name extends the grant's is not within it.
+        caps.add_fs(dir_cap(
+            &path("testx/c"),
+            &path("testx/c"),
+            AccessMode::ReadWrite,
+        ));
+
+        let profile = generate_profile(&caps).unwrap();
+
+        assert!(profile.contains(&format!(
+            "(allow file-write* (subpath \"{}\"))",
+            path("test/child")
+        )));
+        assert_eq!(
+            unlink_denies(&profile),
+            [
+                format!("(deny file-write-unlink (literal \"{}\"))", path("test")),
+                format!("(deny file-write-unlink (literal \"{}\"))", path("testx/c")),
+            ]
+        );
+    }
+
+    #[test]
+    fn dir_write_grant_root_whose_parent_is_missing_is_kept() {
+        // A parent that can't be canonicalized has no identity to check, so
+        // the root keeps its deny even under a grant as written.
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(dir_cap(
+            "/nono-missing/p",
+            "/nono-missing/p",
+            AccessMode::ReadWrite,
+        ));
+        caps.add_fs(dir_cap(
+            "/nono-missing/p/c",
+            "/nono-missing/p/c",
+            AccessMode::ReadWrite,
+        ));
+
+        let profile = generate_profile(&caps).unwrap();
+
+        assert_eq!(
+            unlink_denies(&profile),
+            [
+                "(deny file-write-unlink (literal \"/nono-missing/p\"))",
+                "(deny file-write-unlink (literal \"/nono-missing/p/c\"))",
+            ]
+        );
+    }
+
+    #[test]
+    fn dir_write_grant_root_under_either_spelling_is_not_kept() {
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(dir_cap("/tmp", "/private/tmp", AccessMode::ReadWrite));
+        caps.add_fs(dir_cap("/tmp/c", "/private/tmp/c", AccessMode::ReadWrite));
+
+        let profile = generate_profile(&caps).unwrap();
+
+        assert_eq!(
+            unlink_denies(&profile),
+            [
+                "(deny file-write-unlink (literal \"/private/tmp\"))",
+                "(deny file-write-unlink (literal \"/tmp\"))",
+            ]
+        );
+    }
+
+    #[test]
+    fn dir_write_grant_root_under_write_grant_through_a_link_is_not_kept() {
+        // The parent granted by its resolved path, the child through a link to
+        // it: Landlock sees one parent, so neither spelling is kept.
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let real = base.join("real");
+        std::fs::create_dir_all(real.join("child")).unwrap();
+        std::os::unix::fs::symlink(&real, base.join("link")).unwrap();
+        let real_str = real.to_str().unwrap();
+        let child_str = real.join("child").to_str().unwrap().to_string();
+        let linked_child = base.join("link").join("child");
+
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(dir_cap(real_str, real_str, AccessMode::ReadWrite));
+        caps.add_fs(dir_cap(
+            linked_child.to_str().unwrap(),
+            &child_str,
+            AccessMode::ReadWrite,
+        ));
+
+        let profile = generate_profile(&caps).unwrap();
+
+        assert!(profile.contains(&format!(
+            "(allow file-write* (subpath \"{}\"))",
+            linked_child.display()
+        )));
+        assert_eq!(
+            unlink_denies(&profile),
+            [format!("(deny file-write-unlink (literal \"{real_str}\"))")]
+        );
+    }
+
+    #[test]
+    fn dir_write_grant_root_named_by_a_link_outside_write_grants_is_kept() {
+        // The original spelling is a link in an ungranted directory to a dir
+        // within a write grant: the resolved root may go, the link may not.
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let granted = base.join("granted");
+        std::fs::create_dir_all(granted.join("real")).unwrap();
+        std::fs::create_dir_all(base.join("other")).unwrap();
+        let link = base.join("other").join("link");
+        std::os::unix::fs::symlink(granted.join("real"), &link).unwrap();
+        let granted_str = granted.to_str().unwrap();
+
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(dir_cap(granted_str, granted_str, AccessMode::ReadWrite));
+        caps.add_fs(dir_cap(
+            link.to_str().unwrap(),
+            granted.join("real").to_str().unwrap(),
+            AccessMode::ReadWrite,
+        ));
+
+        let profile = generate_profile(&caps).unwrap();
+
+        assert_eq!(
+            unlink_denies(&profile),
+            [
+                format!("(deny file-write-unlink (literal \"{granted_str}\"))"),
+                format!("(deny file-write-unlink (literal \"{}\"))", link.display()),
+            ]
+        );
+    }
+
+    #[test]
+    fn dir_write_grant_root_through_a_link_out_of_a_write_grant_is_kept() {
+        // The original spelling runs through a link inside a write grant that
+        // leads out of it: its parent, as Landlock sees it, is not granted.
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let granted = base.join("granted");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&granted).unwrap();
+        std::fs::create_dir_all(outside.join("child")).unwrap();
+        std::os::unix::fs::symlink(&outside, granted.join("link")).unwrap();
+        let granted_str = granted.to_str().unwrap();
+        let linked_child = granted.join("link").join("child");
+        let outside_child = outside.join("child");
+
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(dir_cap(granted_str, granted_str, AccessMode::ReadWrite));
+        caps.add_fs(dir_cap(
+            linked_child.to_str().unwrap(),
+            outside_child.to_str().unwrap(),
+            AccessMode::ReadWrite,
+        ));
+
+        let profile = generate_profile(&caps).unwrap();
+
+        assert_eq!(
+            unlink_denies(&profile),
+            [
+                format!("(deny file-write-unlink (literal \"{granted_str}\"))"),
+                format!(
+                    "(deny file-write-unlink (literal \"{}\"))",
+                    outside_child.display()
+                ),
+                format!(
+                    "(deny file-write-unlink (literal \"{}\"))",
+                    linked_child.display()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn dir_write_grant_root_under_read_grant_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::create_dir_all(base.join("test/child")).unwrap();
+        let parent = base.join("test").to_str().unwrap().to_string();
+        let child = base.join("test/child").to_str().unwrap().to_string();
+
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(dir_cap(&parent, &parent, AccessMode::Read));
+        caps.add_fs(dir_cap(&child, &child, AccessMode::ReadWrite));
+
+        let profile = generate_profile(&caps).unwrap();
+
+        assert_eq!(
+            unlink_denies(&profile),
+            [format!("(deny file-write-unlink (literal \"{child}\"))")]
+        );
+    }
+
+    #[test]
+    fn dir_write_grant_root_deny_follows_platform_rules() {
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(dir_cap("/test", "/test", AccessMode::ReadWrite));
+        caps.add_platform_rule("(deny file-write-unlink)").unwrap();
+        caps.add_platform_rule("(allow file-write-unlink (subpath \"/test\"))")
+            .unwrap();
+
+        let profile = generate_profile(&caps).unwrap();
+
+        // Last matching rule wins: after the client's unlink override, or that
+        // override would allow removing the root again.
+        let override_pos = profile
+            .find("(allow file-write-unlink (subpath \"/test\"))")
+            .expect("override not found");
+        let deny_pos = profile
+            .find("(deny file-write-unlink (literal \"/test\"))")
+            .expect("root deny not found");
+        assert!(override_pos < deny_pos, "{profile}");
+    }
+
+    #[test]
+    fn dir_write_grant_root_deny_is_last() {
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(dir_cap("/test", "/test", AccessMode::ReadWrite));
+        // Read as a network rule (it starts with one), so it is emitted with
+        // the network rules, after the filesystem ones.
+        caps.add_platform_rule(
+            "(allow network-outbound) (allow file-write-unlink (subpath \"/test\"))",
+        )
+        .unwrap();
+
+        let profile = generate_profile(&caps).unwrap();
+
+        assert_eq!(
+            profile.lines().last(),
+            Some("(deny file-write-unlink (literal \"/test\"))"),
+            "{profile}"
+        );
     }
 }
