@@ -31,9 +31,10 @@ pub struct CheckResult {
 pub struct ProxyFilter {
     inner: HostFilter,
     /// IP addresses the allowlist names as exact entries (`10.1.2.3`,
-    /// `[fd00::1]:8443`): an address named outright is permitted by a
-    /// public-only address policy.
-    named_ips: Arc<Vec<IpAddr>>,
+    /// `[fd00::1]:8443`), with the port an entry names: an address named
+    /// outright is permitted by a public-only address policy, on that port
+    /// only when the entry names one.
+    named_ips: Arc<Vec<(IpAddr, Option<u16>)>>,
     /// The public-only address gate, when the policy sets `public_only`.
     address_gate: Option<Arc<AddressGate>>,
 }
@@ -152,7 +153,7 @@ impl ProxyFilter {
         let resolved_ips: Vec<IpAddr> = resolved.iter().map(|a| a.ip()).collect();
         let result = proxy_metadata_filter_result(host, &resolved_ips)
             .unwrap_or_else(|| self.check_host_result(host, port, &resolved_ips));
-        let result = self.gate_addresses(host, &resolved_ips, result);
+        let result = self.gate_addresses(host, Some(port), &resolved_ips, result);
 
         // Only return resolved addrs on allow to prevent misuse
         let addrs = if result.is_allowed() {
@@ -213,7 +214,7 @@ impl ProxyFilter {
         // result, any denial included, stands.
         let result = match self.check_host_with_ips(host, &resolved_ips) {
             FilterResult::DenyNotAllowed { .. } => {
-                self.gate_addresses(host, &resolved_ips, FilterResult::Allow)
+                self.gate_addresses(host, Some(port), &resolved_ips, FilterResult::Allow)
             }
             other => other,
         };
@@ -228,21 +229,25 @@ impl ProxyFilter {
         })
     }
 
-    /// Check a host with pre-resolved IPs (no DNS lookup).
+    /// Check a host with pre-resolved IPs (no DNS lookup). With no port, an
+    /// allowlist entry that names a port names no address for the policy.
     #[must_use]
     pub fn check_host_with_ips(&self, host: &str, resolved_ips: &[IpAddr]) -> FilterResult {
         let result = proxy_metadata_filter_result(host, resolved_ips)
             .unwrap_or_else(|| self.inner.check_host(host, resolved_ips));
-        self.gate_addresses(host, resolved_ips, result)
+        self.gate_addresses(host, None, resolved_ips, result)
     }
 
     /// Under a public-only policy, turn an allow into a deny when any of
     /// `resolved_ips` is in a non-public class the policy does not permit for
     /// `host`. Any one such address denies the host, as a link-local one
     /// does: the caller connects to whichever resolved address answers.
+    /// `port` is the one being connected to: an allowlist entry that names a
+    /// port (`127.0.0.1:8080`) names its address for that port only.
     fn gate_addresses(
         &self,
         host: &str,
+        port: Option<u16>,
         resolved_ips: &[IpAddr],
         result: FilterResult,
     ) -> FilterResult {
@@ -258,7 +263,11 @@ impl ProxyFilter {
             let Some(class) = address_class(ip) else {
                 continue;
             };
-            let named = literal == Some(*ip) && self.named_ips.contains(ip);
+            let named = literal == Some(*ip)
+                && self
+                    .named_ips
+                    .iter()
+                    .any(|(named, scope)| named == ip && (scope.is_none() || *scope == port));
             let excepted = gate.exceptions.iter().any(|(pattern, classes)| {
                 classes.contains(&class) && host_pattern_matches(pattern, &normalized)
             });
@@ -313,21 +322,23 @@ impl ProxyFilter {
 /// The IP addresses among `allowed_hosts` written as exact entries: a bare
 /// literal (`10.1.2.3`, `fd00::1`, `[fd00::1]`) or one with a port
 /// (`10.1.2.3:8080`, `[fd00::1]:8443`). Wildcard entries name no address.
-fn named_ips(allowed_hosts: &[String]) -> Vec<IpAddr> {
+fn named_ips(allowed_hosts: &[String]) -> Vec<(IpAddr, Option<u16>)> {
     allowed_hosts
         .iter()
         .filter(|entry| !entry.contains('*'))
         .filter_map(|entry| {
             let entry = entry.trim();
-            parse_host_ip_literal(entry).or_else(|| {
-                let (host, port) = entry.rsplit_once(':')?;
-                port.parse::<u16>().ok()?;
-                if host.contains(':') && !host.starts_with('[') {
-                    // An unbracketed IPv6 literal: its last group is not a port.
-                    return None;
-                }
-                parse_host_ip_literal(host)
-            })
+            parse_host_ip_literal(entry)
+                .map(|ip| (ip, None))
+                .or_else(|| {
+                    let (host, port) = entry.rsplit_once(':')?;
+                    let port = port.parse::<u16>().ok()?;
+                    if host.contains(':') && !host.starts_with('[') {
+                        // An unbracketed IPv6 literal: its last group is not a port.
+                        return None;
+                    }
+                    parse_host_ip_literal(host).map(|ip| (ip, Some(port)))
+                })
         })
         .collect()
 }
@@ -765,7 +776,10 @@ mod tests {
                 .check_host_with_ips("10.1.2.3", &[ip("10.1.2.3")])
                 .is_allowed()
         );
-        assert_eq!(*filter.named_ips, vec![ip("10.1.2.3"), ip("fd00::5")]);
+        assert_eq!(
+            *filter.named_ips,
+            vec![(ip("10.1.2.3"), None), (ip("fd00::5"), Some(8443))]
+        );
 
         // A wildcard names no address: a literal it matches is still gated.
         let wildcard =
@@ -800,13 +814,57 @@ mod tests {
         assert_eq!(
             named_ips(&entries),
             vec![
-                ip("10.1.2.3"),
-                ip("127.0.0.1"),
-                ip("fd00::1"),
-                ip("fd00::2"),
-                ip("fd00::3")
+                (ip("10.1.2.3"), None),
+                (ip("127.0.0.1"), Some(8080)),
+                (ip("fd00::1"), None),
+                (ip("fd00::2"), None),
+                (ip("fd00::3"), Some(443))
             ]
         );
+    }
+
+    /// An entry that names a port names its address for that port only: a
+    /// broader entry that also admits the literal (`*` here) on another port
+    /// leaves that connection to the policy.
+    #[test]
+    fn test_public_only_names_a_port_scoped_literal_for_its_port_only() {
+        for allowlist in [
+            vec!["*".to_string(), "127.0.0.1:8080".to_string()],
+            vec!["*".to_string(), "[::1]:8080".to_string()],
+        ] {
+            let filter =
+                ProxyFilter::new(&allowlist).with_resolved_address_policy(&public_only(&[]));
+            let (host, addr) = if allowlist[1].starts_with('[') {
+                ("::1", ip("::1"))
+            } else {
+                ("127.0.0.1", ip("127.0.0.1"))
+            };
+            let check = |port| {
+                let result = filter.check_host_result(host, port, &[addr]);
+                filter.gate_addresses(host, Some(port), &[addr], result)
+            };
+            assert!(check(8080).is_allowed(), "{allowlist:?}");
+            assert!(
+                matches!(check(9090), FilterResult::DenyAddressClass { .. }),
+                "{allowlist:?}"
+            );
+            // With no port to compare, a port-scoped entry names nothing.
+            assert!(matches!(
+                filter.check_host_with_ips(host, &[addr]),
+                FilterResult::DenyAddressClass { .. }
+            ));
+        }
+        // An entry with no port names its address on every port.
+        let unscoped = ProxyFilter::new(&["*".to_string(), "127.0.0.1".to_string()])
+            .with_resolved_address_policy(&public_only(&[]));
+        for port in [8080, 9090] {
+            let result = unscoped.check_host_result("127.0.0.1", port, &[ip("127.0.0.1")]);
+            assert!(
+                unscoped
+                    .gate_addresses("127.0.0.1", Some(port), &[ip("127.0.0.1")], result)
+                    .is_allowed()
+            );
+        }
     }
 
     #[test]
