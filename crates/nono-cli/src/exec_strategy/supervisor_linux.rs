@@ -207,7 +207,9 @@ pub(super) fn flush_suppressed_rate_limited_capabilities(
         "{count} capability requests were refused by the approval rate limiter but not \
          individually recorded (audit rate limit exceeded); this is the most recent"
     );
-    if let nono::supervisor::ApprovalRequest::Capability { reason, .. } = &mut request {
+    if let nono::supervisor::ApprovalRequest::Capability { reason, .. }
+    | nono::supervisor::ApprovalRequest::UnixSocket { reason, .. } = &mut request
+    {
         *reason = Some(summary.clone());
     }
     let reason = format!("{RATE_LIMITED_CAPABILITY_REASON}: {summary}");
@@ -237,6 +239,7 @@ pub(super) type UnixSocketSessionDecisions =
 struct UnixSocketApproval<'a> {
     child: Pid,
     rate_limiter: &'a mut RateLimiter,
+    rate_limited_audit: &'a mut RateLimitedCapabilityAudit,
     pty: Option<&'a mut crate::pty_proxy::PtyProxy>,
     decisions: &'a mut UnixSocketSessionDecisions,
 }
@@ -1209,12 +1212,6 @@ fn request_unix_socket_approval(
     if let Some(decision) = approval.decisions.get(&key) {
         return Ok(decision.clone());
     }
-    if !approval.rate_limiter.try_acquire() {
-        debug!("Rate limited unix socket approval for {}", path.display());
-        return Ok(ApprovalDecision::Denied {
-            reason: "approval rate limit exceeded".to_string(),
-        });
-    }
 
     let request = nono::supervisor::ApprovalRequest::UnixSocket {
         request_id: format!("unix-socket-{}", unique_request_id()),
@@ -1224,6 +1221,22 @@ fn request_unix_socket_approval(
         child_pid: approval.child.as_raw() as u32,
         session_id: config.session_id.to_string(),
     };
+    // The limiter, not the approval backend, decides these requests, so they
+    // are audited too, within the same budget as refused file opens.
+    if !approval.rate_limiter.try_acquire() {
+        debug!("Rate limited unix socket approval for {}", path.display());
+        if approval.rate_limited_audit.admit(&request) {
+            flush_suppressed_rate_limited_capabilities(config, approval.rate_limited_audit);
+            record_rate_limited_capability(
+                config,
+                request,
+                RATE_LIMITED_CAPABILITY_REASON.to_string(),
+            )?;
+        }
+        return Ok(ApprovalDecision::Denied {
+            reason: RATE_LIMITED_CAPABILITY_REASON.to_string(),
+        });
+    }
     let decision_started = Instant::now();
     let decision = match super::request_approval_with_relay_paused(
         config,
@@ -1361,6 +1374,7 @@ pub(super) fn handle_combined_notification(
             Some(UnixSocketApproval {
                 child,
                 rate_limiter: state.rate_limiter,
+                rate_limited_audit: state.rate_limited_audit,
                 pty: state.pty,
                 decisions: state.unix_socket_decisions,
             }),
@@ -2706,10 +2720,12 @@ mod tests {
             let mut config = make_elevated_config(&backend);
             config.audit_recorder = Some(std::sync::Arc::new(std::sync::Mutex::new(recorder)));
             let mut limiter = RateLimiter::new(10, 10);
+            let mut rate_limited_audit = super::super::RateLimitedCapabilityAudit::new();
             let mut decisions = Default::default();
             let mut approval = UnixSocketApproval {
                 child: nix::unistd::Pid::this(),
                 rate_limiter: &mut limiter,
+                rate_limited_audit: &mut rate_limited_audit,
                 pty: None,
                 decisions: &mut decisions,
             };
@@ -2780,10 +2796,12 @@ mod tests {
                 });
                 let config = make_elevated_config(&backend);
                 let mut limiter = RateLimiter::new(10, 10);
+                let mut rate_limited_audit = super::super::RateLimitedCapabilityAudit::new();
                 let mut decisions = Default::default();
                 let mut approval = UnixSocketApproval {
                     child: nix::unistd::Pid::this(),
                     rate_limiter: &mut limiter,
+                    rate_limited_audit: &mut rate_limited_audit,
                     pty: None,
                     decisions: &mut decisions,
                 };
@@ -2825,10 +2843,12 @@ mod tests {
             });
             let config = make_elevated_config(&backend);
             let mut limiter = RateLimiter::new(0, 1);
+            let mut rate_limited_audit = super::super::RateLimitedCapabilityAudit::new();
             let mut decisions = Default::default();
             let mut approval = UnixSocketApproval {
                 child: nix::unistd::Pid::this(),
                 rate_limiter: &mut limiter,
+                rate_limited_audit: &mut rate_limited_audit,
                 pty: None,
                 decisions: &mut decisions,
             };
@@ -2852,6 +2872,88 @@ mod tests {
                 assert!(reason.contains(expected), "{reason}");
             }
             assert!(decisions.is_empty());
+        }
+
+        /// A unix socket request the approval rate limiter refuses never
+        /// reaches the backend, so it is audited like a refused file open:
+        /// individually within the budget, then in one summary entry.
+        #[test]
+        fn rate_limited_unix_socket_requests_are_audited() {
+            use super::super::{RateLimiter, UnixSocketApproval, request_unix_socket_approval};
+            let backend = TestApprovalBackend(|_: &ApprovalRequest| {
+                panic!("a rate-limited request must not reach the backend")
+            });
+            let audit_dir = tempfile::tempdir().expect("tempdir");
+            let mut config = make_elevated_config(&backend);
+            config.audit_recorder = Some(std::sync::Arc::new(std::sync::Mutex::new(
+                crate::audit_integrity::AuditRecorder::new(audit_dir.path().to_path_buf())
+                    .expect("recorder"),
+            )));
+            let mut limiter = RateLimiter::new(0, 0);
+            let mut rate_limited_audit = super::super::RateLimitedCapabilityAudit::new();
+            let mut decisions = Default::default();
+            let mut approval = UnixSocketApproval {
+                child: nix::unistd::Pid::this(),
+                rate_limiter: &mut limiter,
+                rate_limited_audit: &mut rate_limited_audit,
+                pty: None,
+                decisions: &mut decisions,
+            };
+            // Twice the burst: the audit budget refills at 20 a second, so a
+            // slow run may record a few more individually, never all of them.
+            let burst = super::super::RATE_LIMITED_CAPABILITY_AUDIT_BURST as usize;
+            let refused = 2 * burst;
+            for _ in 0..refused {
+                let decision = request_unix_socket_approval(
+                    &config,
+                    Some(&mut approval),
+                    Path::new("/spin.sock"),
+                    nono::UnixSocketOp::Connect,
+                )
+                .expect("decision");
+                let ApprovalDecision::Denied { reason } = decision else {
+                    panic!("expected denial")
+                };
+                assert_eq!(reason, "approval rate limit exceeded");
+            }
+            assert!(approval.decisions.is_empty());
+            super::super::flush_suppressed_rate_limited_capabilities(
+                &config,
+                approval.rate_limited_audit,
+            );
+
+            let events = std::fs::read_to_string(audit_dir.path().join("audit-events.ndjson"))
+                .expect("audit log");
+            let entries: Vec<serde_json::Value> = events
+                .lines()
+                .map(|line| {
+                    let record: serde_json::Value = serde_json::from_str(line).expect("json");
+                    record["event"]["entry"].clone()
+                })
+                .collect();
+            for entry in &entries {
+                assert_eq!(entry["backend"], "supervisor-rate-limit");
+                assert_eq!(entry["request"]["path"], "/spin.sock");
+            }
+            let (summary, individual) = entries.split_last().expect("entries");
+            assert!(individual.len() >= burst, "{events}");
+            for entry in individual {
+                assert_eq!(
+                    entry["decision"]["Denied"]["reason"],
+                    "approval rate limit exceeded"
+                );
+            }
+            let suppressed = refused - individual.len();
+            let expected = format!("{suppressed} capability requests");
+            let decision_reason = summary["decision"]["Denied"]["reason"]
+                .as_str()
+                .unwrap_or_default();
+            assert!(
+                decision_reason.starts_with(&format!("approval rate limit exceeded: {expected}")),
+                "{decision_reason}"
+            );
+            let request_reason = summary["request"]["reason"].as_str().unwrap_or_default();
+            assert!(request_reason.starts_with(&expected), "{request_reason}");
         }
 
         #[test]
