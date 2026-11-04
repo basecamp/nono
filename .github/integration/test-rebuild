@@ -72,7 +72,8 @@ run --push
 grep -qx 'changed=true' "$t/out" || die "1: not changed"
 after="$(tip)"; [ "$after" != "$before" ] || die "1: nothing pushed"
 grep -qx "sha=$after" "$t/out" || die "1: sha line is not the pushed tip"
-grep -qx "base=$(up)" "$t/out" && grep -qx "pin=$(up)" "$t/out" || die "1: base/pin lines: $(cat "$t/out")"
+grep -qx "base=$(up)" "$t/out" && grep -qx "pin=$(up)" "$t/out" && grep -qx "layer=$before" "$t/out" \
+  || die "1: base/pin/layer lines: $(cat "$t/out")"
 [ "$(g "$t/fork.git" ls-tree --name-only "$after" .github/workflows/ | sort | tr '\n' ' ')" \
   = ".github/workflows/build-integration.yml .github/workflows/rebuild-integration.yml " ] \
   || die "1: workflows on integration: $(g "$t/fork.git" ls-tree --name-only "$after" .github/workflows/)"
