@@ -4,11 +4,14 @@
 #
 #   .github/integration/test-rebuild
 #
-# Cases: a rebuild that pushes (upstream's workflows removed, the fork layer and the recipe's
-# topics in, INTEGRATION.md written); a rerun that finds integration current and pushes nothing;
-# upstream moving; a topic that does not merge, and one that is missing (exit 1, a reason, nothing
+# Cases: a rebuild that pushes, on the pinned upstream commit (upstream's workflows removed, the
+# fork layer and the recipe's topics in, INTEGRATION.md written); a rerun that finds integration
+# current and pushes nothing; upstream moving (integration stays on the pin, the trial builds on
+# the tip, moving the pin rebuilds there); a topic that does not merge onto the tip (the trial
+# names it, the pinned rebuild is unaffected), and one that is missing (exit 1, a reason, nothing
 # pushed); a topic already upstream (noted, still a rebuild); a push whose lease is stale; a layer
-# without the recipe.
+# without the recipe; a pin missing, malformed, or not on upstream main (exit 1, named, nothing
+# pushed).
 # shellcheck disable=SC2015,SC2016 # `A && B || die` (die exits); backticks are Markdown
 set -euo pipefail
 
@@ -42,6 +45,7 @@ g "$w" switch -q -c integration main
 mkdir -p "$w/.github/integration"
 cp "$here/rebuild" "$here/issue" "$w/.github/integration/"
 printf '# recipe\n\nfix/one  Fixes one\nfix/two  Fixes `two` | pipes\n' > "$w/.github/integration/topics"
+printf '# pin\n\n%s\n' "$(g "$t/up" rev-parse main)" > "$w/.github/integration/upstream"
 echo 'name: build' > "$w/.github/workflows/build-integration.yml"
 echo 'name: rebuild' > "$w/.github/workflows/rebuild-integration.yml"
 g "$w" add -A; g "$w" commit -q -m 'fork layer'
@@ -52,6 +56,14 @@ run() { # run ARGS...: the rebuild from the clone, stdout to $t/out, stderr to $
   rc=0; (cd "$w" && REBUILD_REASON_FILE="$t/reason" "$w/.github/integration/rebuild" "$@") >"$t/out" 2>"$t/err" || rc=$?
 }
 tip() { g "$t/fork.git" rev-parse refs/heads/integration; }
+up() { g "$t/up" rev-parse main; }
+# setpin SHA [TOPICS]: commit a new pin (and recipe) onto the fork's integration, as a merged PR would.
+setpin() {
+  g "$w" fetch -q origin && g "$w" switch -q --detach origin/integration
+  printf '# pin\n%s\n' "$1" > "$w/.github/integration/upstream"
+  [ $# -lt 2 ] || printf '%s' "$2" > "$w/.github/integration/topics"
+  g "$w" commit -q -am "pin ${1:0:12}" && g "$w" push -q -f origin HEAD:integration
+}
 
 # 1. A rebuild that pushes.
 before="$(tip)"
@@ -60,42 +72,63 @@ run --push
 grep -qx 'changed=true' "$t/out" || die "1: not changed"
 after="$(tip)"; [ "$after" != "$before" ] || die "1: nothing pushed"
 grep -qx "sha=$after" "$t/out" || die "1: sha line is not the pushed tip"
+grep -qx "base=$(up)" "$t/out" && grep -qx "pin=$(up)" "$t/out" || die "1: base/pin lines: $(cat "$t/out")"
 [ "$(g "$t/fork.git" ls-tree --name-only "$after" .github/workflows/ | sort | tr '\n' ' ')" \
   = ".github/workflows/build-integration.yml .github/workflows/rebuild-integration.yml " ] \
   || die "1: workflows on integration: $(g "$t/fork.git" ls-tree --name-only "$after" .github/workflows/)"
 [ "$(g "$t/fork.git" show "$after:src/a.txt")" = "$(printf 'one\nTWO\nthree')" ] || die "1: fix/two not merged"
 g "$t/fork.git" cat-file -e "$after:src/one.txt" || die "1: fix/one not merged"
 g "$t/fork.git" show "$after:INTEGRATION.md" | grep -q '| \[`fix/two`\].*| Fixes `two` \\| pipes |$' || die "1: INTEGRATION.md row"
-g "$t/fork.git" merge-base --is-ancestor "$(g "$t/up" rev-parse main)" "$after" || die "1: not on upstream main"
-ok "1: rebuild pushes upstream main + topics + fork layer, upstream workflows removed"
+g "$t/fork.git" merge-base --is-ancestor "$(up)" "$after" || die "1: not on upstream main"
+g "$t/fork.git" show "$after:INTEGRATION.md" | grep -q "^Pinned: nolabs-ai/nono \`main\` at \[\`$(up | cut -c1-12)\`\]" || die "1: INTEGRATION.md pin"
+ok "1: rebuild pushes the pinned upstream + topics + fork layer, upstream workflows removed"
 
 # 2. A rerun finds it current.
 run --push
 [ "$rc" = 0 ] && grep -qx 'changed=false' "$t/out" && [ "$(tip)" = "$after" ] || die "2: rc=$rc $(cat "$t/out" "$t/err")"
 ok "2: rerun is current, pushes nothing"
 
-# 3. Upstream moves: rebuilt onto it.
+# 3. Upstream moves: integration stays on the pin; the trial builds on the tip; moving the pin
+#    rebuilds there.
+pinned="$(up)"
 echo 'upstream two' > "$t/up/src/b.txt"; g "$t/up" add -A; g "$t/up" commit -q -m 'upstream: two'
 run --push
-[ "$rc" = 0 ] && grep -qx 'changed=true' "$t/out" || die "3: rc=$rc $(cat "$t/err")"
-g "$t/fork.git" merge-base --is-ancestor "$(g "$t/up" rev-parse main)" "$(tip)" || die "3: not rebuilt onto the new upstream main"
-ok "3: upstream moved, rebuilt onto it"
+[ "$rc" = 0 ] && grep -qx 'changed=false' "$t/out" && grep -qx "base=$pinned" "$t/out" && [ "$(tip)" = "$after" ] \
+  || die "3: upstream moving moved integration: rc=$rc $(cat "$t/out" "$t/err")"
+run --try-upstream
+[ "$rc" = 0 ] && grep -qx 'changed=true' "$t/out" && grep -qx "base=$(up)" "$t/out" && grep -qx "pin=$pinned" "$t/out" \
+  && [ "$(tip)" = "$after" ] || die "3: trial: rc=$rc $(cat "$t/out" "$t/err")"
+g "$w" merge-base --is-ancestor "$(up)" "$(sed -n 's/^sha=//p' "$t/out")" || die "3: trial not built on the tip"
+setpin "$(up)"
+run --push
+[ "$rc" = 0 ] && grep -qx 'changed=true' "$t/out" && grep -qx "base=$(up)" "$t/out" || die "3: rc=$rc $(cat "$t/err")"
+g "$t/fork.git" merge-base --is-ancestor "$(up)" "$(tip)" || die "3: not rebuilt onto the new pin"
+ok "3: upstream moved: integration stays on the pin, the trial builds on the tip, a new pin rebuilds"
 
-# 4. A topic that does not merge stops it.
+# 4. A topic that does not merge onto the tip: the trial names it; the pinned rebuild is unaffected.
 printf 'one\nUPSTREAM\nthree\n' > "$t/up/src/a.txt"; g "$t/up" commit -q -am 'upstream: conflicts with fix/two'
 before="$(tip)"; rm -f "$t/reason"
-run --push
+run --try-upstream
 [ "$rc" = 1 ] || die "4: rc=$rc"
-[ "$(tip)" = "$before" ] || die "4: pushed despite a conflict"
-grep -q '^topic branch fix/two (.*) does not merge onto upstream main .*: conflicts in src/a.txt$' "$t/reason" || die "4: reason: $(cat "$t/reason" 2>/dev/null)"
+[ "$(tip)" = "$before" ] || die "4: trial moved integration"
+grep -q "^topic branch fix/two (.*) does not merge onto upstream main's tip $(up | cut -c1-12): conflicts in src/a.txt$" "$t/reason" \
+  || die "4: reason: $(cat "$t/reason" 2>/dev/null)"
 [ "$(g "$w" worktree list | wc -l)" = 1 ] || die "4: temporary worktree left behind"
-ok "4: a conflicting topic stops the rebuild, names the files, pushes nothing"
+run --push
+[ "$rc" = 0 ] && grep -qx 'changed=false' "$t/out" && [ "$(tip)" = "$before" ] || die "4: pinned rebuild: rc=$rc $(cat "$t/err")"
+run --try-upstream --push
+[ "$rc" = 2 ] && grep -q 'never pushes' "$t/err" && [ "$(tip)" = "$before" ] || die "4: --try-upstream --push: rc=$rc"
+setpin "$(up)"
+before="$(tip)"; rm -f "$t/reason"
+run --push
+[ "$rc" = 1 ] && [ "$(tip)" = "$before" ] || die "4: conflicting pin: rc=$rc"
+grep -q "^topic branch fix/two (.*) does not merge onto pinned upstream main .*: conflicts in src/a.txt$" "$t/reason" \
+  || die "4: reason: $(cat "$t/reason" 2>/dev/null)"
+ok "4: a topic that does not merge: the trial names it and its files, the pin holds, --push refused; pinned there, the rebuild stops"
 
 # 5. A topic missing from the fork stops it.
 g "$t/up" revert --no-edit HEAD >/dev/null
-g "$w" fetch -q origin && g "$w" switch -q --detach origin/integration
-printf 'fix/one  Fixes one\nfix/gone  Gone\n' > "$w/.github/integration/topics"
-g "$w" commit -q -am 'recipe: fix/gone' && g "$w" push -q -f origin HEAD:integration
+setpin "$(up)" $'fix/one  Fixes one\nfix/gone  Gone\n'
 before="$(tip)"; rm -f "$t/reason"
 run --push
 [ "$rc" = 1 ] && [ "$(tip)" = "$before" ] || die "5: rc=$rc"
@@ -104,10 +137,9 @@ ok "5: a missing topic stops the rebuild, pushes nothing"
 
 # 6. A topic already upstream is noted, and the rebuild goes on.
 g "$t/up" fetch -q "$t/fork.git" fix/one && g "$t/up" cherry-pick FETCH_HEAD >/dev/null
-printf 'fix/one  Fixes one\n' > "$w/.github/integration/topics"
-g "$w" commit -q -am 'recipe: fix/one only' && g "$w" push -q -f origin HEAD:integration
+setpin "$(up)" $'fix/one  Fixes one\n'
 run --push
-[ "$rc" = 0 ] && grep -q 'note: fix/one .* changes nothing on upstream main' "$t/err" || die "6: rc=$rc $(cat "$t/err")"
+[ "$rc" = 0 ] && grep -q 'note: fix/one .* changes nothing on pinned upstream main' "$t/err" || die "6: rc=$rc $(cat "$t/err")"
 ok "6: a topic already upstream is noted"
 
 # 7. --layer takes the recipe from another commit; without --push nothing moves.
@@ -123,6 +155,7 @@ ok "7: --layer uses the proposed recipe; no --push, nothing pushed"
 
 # 8. A push whose lease went stale (integration moved meanwhile) is refused.
 echo 'upstream three' > "$t/up/src/c.txt"; g "$t/up" add -A; g "$t/up" commit -q -m 'upstream: three'
+setpin "$(up)"
 # Move the fork's integration after the rebuild fetched it: a pre-push hook in the clone does it
 # (--git-dir: a hook runs with the pushing repository's GIT_DIR set).
 cat > "$w/.git/hooks/pre-push" <<EOF
@@ -146,5 +179,26 @@ run --push --layer HEAD
 [ "$rc" = 1 ] && [ "$(tip)" = "$before" ] || die "9: rc=$rc $(cat "$t/err")"
 grep -q '^cannot read .github/integration/topics' "$t/reason" || die "9: reason: $(cat "$t/reason" 2>/dev/null)"
 ok "9: a layer without the recipe stops the rebuild, pushes nothing"
+
+# 10. A pin missing, malformed, or not on upstream main stops it: never a fallback to main's tip.
+badpin() { # badpin CASE CONTENT|- REASON-PATTERN: a layer whose pin is CONTENT (- removes it)
+  g "$w" switch -q --detach "$sha"
+  if [ "$2" = - ]; then g "$w" rm -q .github/integration/upstream; else printf '%s' "$2" > "$w/.github/integration/upstream"; fi
+  g "$w" commit -q -am "pin: $1"
+  before="$(tip)"; rm -f "$t/reason"
+  run --push --layer HEAD
+  [ "$rc" = 1 ] && [ "$(tip)" = "$before" ] || die "10 $1: rc=$rc $(cat "$t/err")"
+  grep -q "$3" "$t/reason" || die "10 $1: reason: $(cat "$t/reason" 2>/dev/null)"
+}
+badpin missing - '^cannot read .github/integration/upstream'
+badpin short $'# pin\nabc123\n' '^.github/integration/upstream in HEAD .* does not hold one upstream commit'
+badpin two "$(printf '%s\n%s\n' "$(up)" "$(up)")" 'does not hold one upstream commit'
+badpin upper "$(up | tr a-f A-F)" 'does not hold one upstream commit'
+badpin branch "$(g "$t/fork.git" rev-parse refs/heads/fix/one)" '^.github/integration/upstream pins .*, which is not on upstream main'
+badpin unknown "$(printf '%040d' 0)" 'which is not on upstream main'
+# The trial does not build on the pin, so one no longer on upstream does not stop it.
+run --try-upstream --layer HEAD
+[ "$rc" = 0 ] && grep -qx "base=$(up)" "$t/out" || die "10: trial with a lost pin: rc=$rc $(cat "$t/err")"
+ok "10: a pin missing, malformed or not on upstream main stops the rebuild, names it, pushes nothing"
 
 echo "all $pass passed"
