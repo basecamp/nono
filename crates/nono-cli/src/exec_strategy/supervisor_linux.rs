@@ -211,10 +211,13 @@ pub(super) fn flush_suppressed_rate_limited_capabilities(
         "{count} capability requests were refused by the approval rate limiter but not \
          individually recorded (audit rate limit exceeded); this is the most recent"
     );
-    if let nono::supervisor::ApprovalRequest::Capability { reason, .. }
-    | nono::supervisor::ApprovalRequest::UnixSocket { reason, .. } = &mut request
+    if let nono::supervisor::ApprovalRequest::Capability { path, reason, .. }
+    | nono::supervisor::ApprovalRequest::UnixSocket { path, reason, .. } = &mut request
     {
         *reason = Some(summary.clone());
+        // The example's path, made UTF-8: a path the audit log can't
+        // serialize must not lose the count with it.
+        *path = std::path::PathBuf::from(path.to_string_lossy().into_owned());
     }
     let reason = format!("{RATE_LIMITED_CAPABILITY_REASON}: {summary}");
     if let Err(err) = record_rate_limited_capability(config, request, reason) {
@@ -2424,6 +2427,45 @@ mod tests {
                 child_pid: 42,
                 session_id: "test-net-decision".to_string(),
             }
+        }
+
+        /// A child can make the most recent suppressed request one whose
+        /// path isn't UTF-8, which the audit log can't serialize. The summary
+        /// still lands, with the path made UTF-8, and keeps its count.
+        #[test]
+        fn rate_limited_capability_summary_survives_a_non_utf8_path() {
+            use std::os::unix::ffi::OsStrExt;
+            let backend = DenyAllBackend;
+            let audit_dir = tempfile::tempdir().expect("tempdir");
+            let recorder =
+                crate::audit_integrity::AuditRecorder::new(audit_dir.path().to_path_buf())
+                    .expect("recorder");
+            let mut config = make_config(&backend, 8080, vec![], &[]);
+            config.audit_recorder = Some(std::sync::Arc::new(std::sync::Mutex::new(recorder)));
+            let mut audit = super::super::RateLimitedCapabilityAudit::with_budget(0, 0);
+            assert!(!audit.admit(&capability_request("/first")));
+            let mut request = capability_request("/unused");
+            if let nono::supervisor::ApprovalRequest::Capability { path, .. } = &mut request {
+                *path = PathBuf::from(std::ffi::OsStr::from_bytes(b"/work/\xff.sock"));
+            }
+            assert!(!audit.admit(&request));
+
+            super::super::flush_suppressed_rate_limited_capabilities(&config, &mut audit);
+
+            let events = std::fs::read_to_string(audit_dir.path().join("audit-events.ndjson"))
+                .expect("audit log");
+            let lines: Vec<&str> = events.lines().collect();
+            assert_eq!(lines.len(), 1, "one summary entry:\n{events}");
+            let record: serde_json::Value = serde_json::from_str(lines[0]).expect("json");
+            let entry = &record["event"]["entry"];
+            assert_eq!(entry["request"]["path"], "/work/\u{fffd}.sock");
+            let reason = entry["decision"]["Denied"]["reason"]
+                .as_str()
+                .unwrap_or_default();
+            assert!(
+                reason.starts_with("approval rate limit exceeded: 2 capability requests"),
+                "{reason}"
+            );
         }
 
         #[test]
