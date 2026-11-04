@@ -435,20 +435,40 @@ fn args_request_bare_mode(cmd_args: &[std::ffi::OsString]) -> bool {
     cmd_args.iter().any(|arg| arg == "--bare")
 }
 
+/// Whether the LaunchServices auto-enable below would have to read Claude
+/// Code's login from the Keychain to decide: what a dry run, which reads no
+/// credential, leaves undecided.
+#[cfg(target_os = "macos")]
+pub(crate) fn claude_launch_services_needs_login(
+    args: &SandboxArgs,
+    program: &std::ffi::OsStr,
+    cmd_args: &[std::ffi::OsString],
+) -> bool {
+    !args.allow_launch_services
+        && args
+            .profile
+            .as_deref()
+            .is_some_and(|profile| profile_selects_claude_code(profile, &args.extends))
+        && command_is_claude(program)
+        && !claude_session_has_non_browser_auth(cmd_args)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn claude_launch_services_needs_login(
+    _args: &SandboxArgs,
+    _program: &std::ffi::OsStr,
+    _cmd_args: &[std::ffi::OsString],
+) -> bool {
+    false
+}
+
 #[cfg(target_os = "macos")]
 pub(crate) fn should_auto_enable_claude_launch_services(
     args: &SandboxArgs,
     program: &std::ffi::OsStr,
     cmd_args: &[std::ffi::OsString],
 ) -> bool {
-    if args.allow_launch_services
-        || !args
-            .profile
-            .as_deref()
-            .is_some_and(|profile| profile_selects_claude_code(profile, &args.extends))
-        || !command_is_claude(program)
-        || claude_session_has_non_browser_auth(cmd_args)
-    {
+    if !claude_launch_services_needs_login(args, program, cmd_args) {
         return false;
     }
 
@@ -1880,6 +1900,13 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
             Some(DetachedCwdPromptResponse::Deny)
         ) {
             info!("Detached launch declined CWD sharing. Continuing without automatic CWD access.");
+        } else if crate::credential_runtime::plan_only() {
+            // (A JSON dry run asks nothing: it plans without the working
+            // directory, which a run shares only if the person confirms.)
+            crate::credential_runtime::note_undecided(format!(
+                "the working directory ({}) is shared only if the person confirms at launch (or with --allow-cwd)",
+                request.cwd_canonical.display()
+            ));
         } else if missing_cwd_prompt_must_fail(silent, detached_launch, detached_prompt_response) {
             return Err(NonoError::CwdPromptRequired);
         } else {
