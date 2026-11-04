@@ -143,11 +143,15 @@ const RATE_LIMITED_CAPABILITY_REASON: &str = "approval rate limit exceeded";
 
 impl RateLimitedCapabilityAudit {
     pub(super) fn new() -> Self {
+        Self::with_budget(
+            RATE_LIMITED_CAPABILITY_AUDIT_RATE,
+            RATE_LIMITED_CAPABILITY_AUDIT_BURST,
+        )
+    }
+
+    fn with_budget(rate: u32, burst: u32) -> Self {
         Self {
-            limiter: RateLimiter::new(
-                RATE_LIMITED_CAPABILITY_AUDIT_RATE,
-                RATE_LIMITED_CAPABILITY_AUDIT_BURST,
-            ),
+            limiter: RateLimiter::new(rate, burst),
             suppressed: 0,
             last_suppressed: None,
         }
@@ -2890,7 +2894,11 @@ mod tests {
                     .expect("recorder"),
             )));
             let mut limiter = RateLimiter::new(0, 0);
-            let mut rate_limited_audit = super::super::RateLimitedCapabilityAudit::new();
+            // The default budget, with no refill, so the burst and the summary
+            // are exact however slowly the test runs.
+            let burst = super::super::RATE_LIMITED_CAPABILITY_AUDIT_BURST as usize;
+            let mut rate_limited_audit =
+                super::super::RateLimitedCapabilityAudit::with_budget(0, burst as u32);
             let mut decisions = Default::default();
             let mut approval = UnixSocketApproval {
                 child: nix::unistd::Pid::this(),
@@ -2899,10 +2907,7 @@ mod tests {
                 pty: None,
                 decisions: &mut decisions,
             };
-            // Twice the burst: the audit budget refills at 20 a second, so a
-            // slow run may record a few more individually, never all of them.
-            let burst = super::super::RATE_LIMITED_CAPABILITY_AUDIT_BURST as usize;
-            let refused = 2 * burst;
+            let refused = burst + 3;
             for _ in 0..refused {
                 let decision = request_unix_socket_approval(
                     &config,
@@ -2935,16 +2940,19 @@ mod tests {
                 assert_eq!(entry["backend"], "supervisor-rate-limit");
                 assert_eq!(entry["request"]["path"], "/spin.sock");
             }
+            assert_eq!(
+                entries.len(),
+                burst + 1,
+                "burst plus one summary:\n{events}"
+            );
             let (summary, individual) = entries.split_last().expect("entries");
-            assert!(individual.len() >= burst, "{events}");
             for entry in individual {
                 assert_eq!(
                     entry["decision"]["Denied"]["reason"],
                     "approval rate limit exceeded"
                 );
             }
-            let suppressed = refused - individual.len();
-            let expected = format!("{suppressed} capability requests");
+            let expected = "3 capability requests";
             let decision_reason = summary["decision"]["Denied"]["reason"]
                 .as_str()
                 .unwrap_or_default();
@@ -2953,7 +2961,7 @@ mod tests {
                 "{decision_reason}"
             );
             let request_reason = summary["request"]["reason"].as_str().unwrap_or_default();
-            assert!(request_reason.starts_with(&expected), "{request_reason}");
+            assert!(request_reason.starts_with(expected), "{request_reason}");
         }
 
         #[test]
