@@ -283,9 +283,10 @@ jobs:
       # An open bump is only ever what this run's trial proposed on the integration it read: a run
       # that does not propose closes it, so no bump stays mergeable once a trial stops vouching for it
       # (a topic moved, a carry PR merged, upstream's tip stopped merging). The next trial that
-      # succeeds opens a new one.
+      # succeeds opens a new one. integration moving after the proposal's check is not rechecked: that
+      # move is a push, which queues the next run, and its trial refreshes or closes the bump.
       - name: Close a bump this run does not propose
-        if: always() && (needs.try-upstream.result == 'failure' || steps.propose.outcome == 'failure' || steps.propose.outputs.deferred == 'true')
+        if: always() && (steps.propose.outcome != 'success' || steps.propose.outputs.deferred == 'true')
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -297,7 +298,7 @@ jobs:
           open="$(gh api "repos/$GH_REPO/pulls?state=open&base=integration&head=${GH_REPO%%/*}:$bump" --jq '.[0].number // empty')"
           [ -n "$open" ] || exit 0
           why="integration moved during this run's trial, so this was not tried on what it now carries"
-          [ "$PROPOSED" != failure ] || why="proposing the pin failed partway (see the integration-upstream issue), so this may not be what the trial vouched for"
+          [ "$PROPOSED" = success ] || why="proposing the pin failed (see the integration-upstream issue), so this may not be what the trial vouched for"
           [ "$TRIED" = success ] || why="upstream main's tip no longer merges (see the integration-upstream issue), so this was not tried on what integration now carries"
           gh api "repos/$GH_REPO/issues/$open/comments" -f body="Closing: $why. The next trial that succeeds opens a new one." >/dev/null
           gh api -X PATCH "repos/$GH_REPO/pulls/$open" -f state=closed >/dev/null
