@@ -24,8 +24,8 @@
 # space-separated>` on stdout (for $GITHUB_OUTPUT). Commits carry the caller's git identity.
 #
 # Exit 0: rebuilt, or already current (same tree as the fork's tip: nothing to push).
-# Exit 1: the pin is unreadable or not on upstream `main`, a topic branch is missing, is based on
-#         upstream past the pin, or does not merge, or the push was refused; nothing was pushed. The reason is on stderr and, when
+# Exit 1: the pin is unreadable or not on upstream `main`, a topic branch is missing or does not
+#         merge, or the push was refused; nothing was pushed. The reason is on stderr and, when
 #         REBUILD_REASON_FILE is set, in that file as one line.
 # Exit 2: usage, or a fetch failed; no reason is written (the workflow reads one as a verdict).
 #
@@ -128,11 +128,6 @@ for i in "${!topics[@]}"; do
   t="${topics[$i]}"
   sha="$(git -C "$repo" rev-parse "refs/integration/topic/$t")"
   shas+=("$sha")
-  # Based at or before the base: a topic based past the pin would bring upstream past it, unreviewed
-  # (on main's tip, the trial's base, every topic is).
-  ubase="$(git -C "$repo" merge-base "$sha" "$main" 2>/dev/null || true)"
-  [ -z "$ubase" ] || git -C "$repo" merge-base --is-ancestor "$ubase" "$base" \
-    || fail "topic branch $t (${sha:0:12}) is based on upstream main ${ubase:0:12}, past $onto: rebase it onto the pin, or move the pin first"
   before="$(git -C "$tree" rev-parse 'HEAD^{tree}')"
   # rerere off: a resolution this clone remembers would stage the conflict and hide its files.
   if ! git -C "$tree" -c rerere.enabled=false merge -q --no-ff --no-edit -m "Merge $t into $BRANCH" "$sha" >/dev/null 2>&1; then
@@ -161,7 +156,8 @@ rebuilds it daily and after every change to it (\`.github/integration/rebuild\`)
 the upstream \`main\` commit pinned in \`.github/integration/upstream\`, the topic branches
 in \`.github/integration/topics\` merged in order, upstream's workflows removed,
 force-pushed. So never base work on it: base topic branches on the pinned upstream commit or an
-earlier one (one based past it stops the rebuild: it would bring upstream past the pin), and
+earlier one (a topic is merged whole, so one based on a later upstream commit brings that history
+with it, past the pin), and
 change what it carries with a pull request to \`.github/integration/topics\`. A topic
 branch that does not merge stops the rebuild and opens an issue labelled
 \`integration-rebuild\`.
