@@ -139,7 +139,15 @@ before="$(tip)"; rm -f "$t/reason"
 run --push
 [ "$rc" = 1 ] && [ "$(tip)" = "$before" ] || die "5: rc=$rc"
 grep -qx "topic branch fix/gone is in .github/integration/topics but not on $t/fork.git" "$t/reason" || die "5: reason: $(cat "$t/reason")"
-ok "5: a missing topic stops the rebuild, pushes nothing"
+# The fork unreachable for the topics alone (a git that fails their fetch and ls-remote, as a dropped
+# connection does): no verdict, so exit 2 and no reason, not a topic named missing.
+mkdir -p "$t/flaky"; real="$(command -v git)"
+printf '#!/bin/sh\ncase " $* " in *" ls-remote "*|*refs/integration/topic/*) echo "fatal: unable to access" >&2; exit 128 ;; esac\nexec "%s" "$@"\n' "$real" > "$t/flaky/git"
+chmod +x "$t/flaky/git"
+rm -f "$t/reason"; PATH="$t/flaky:$PATH" run --try-upstream
+[ "$rc" = 2 ] && [ ! -s "$t/reason" ] && grep -q 'fetching the topic branches failed' "$t/err" \
+  || die "5: unreachable topics: rc=$rc reason: $(cat "$t/reason" 2>/dev/null)"
+ok "5: a missing topic stops the rebuild, pushes nothing; topics that cannot be fetched are no verdict"
 
 # 6. A topic already upstream is noted, and the rebuild goes on.
 g "$t/up" fetch -q "$t/fork.git" fix/one && g "$t/up" cherry-pick FETCH_HEAD >/dev/null

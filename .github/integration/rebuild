@@ -108,9 +108,10 @@ if [ "${#topics[@]}" -gt 0 ]; then
   specs=()
   for t in "${topics[@]}"; do specs+=("+refs/heads/$t:refs/integration/topic/$t"); done
   if ! err="$(git -C "$repo" fetch -q --no-tags "$FORK_URL" "${specs[@]}" 2>&1)"; then
+    # ls-remote --exit-code: 2 is "no such ref"; anything else is the fetch failing, no verdict.
     for t in "${topics[@]}"; do
-      git -C "$repo" ls-remote --exit-code -q "$FORK_URL" "refs/heads/$t" >/dev/null 2>&1 \
-        || fail "topic branch $t is in $RECIPE but not on $FORK_URL"
+      lrc=0; git -C "$repo" ls-remote --exit-code -q "$FORK_URL" "refs/heads/$t" >/dev/null 2>&1 || lrc=$?
+      [ "$lrc" != 2 ] || fail "topic branch $t is in $RECIPE but not on $FORK_URL"
     done
     say "fetching the topic branches failed: $err"; exit 2
   fi
