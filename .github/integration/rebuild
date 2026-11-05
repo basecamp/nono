@@ -27,7 +27,7 @@
 # Exit 1: the pin is unreadable or not on upstream `main`, a topic branch is missing or does not
 #         merge, or the push was refused; nothing was pushed. The reason is on stderr and, when
 #         REBUILD_REASON_FILE is set, in that file as one line.
-# Exit 2: usage, or a fetch failed.
+# Exit 2: usage, or a fetch failed; no reason is written (the workflow reads one as a verdict).
 #
 # Upstream's workflows are removed rather than left disabled: the fork's Actions settings disable
 # each upstream workflow by path, so one upstream adds later would run here on its first push.

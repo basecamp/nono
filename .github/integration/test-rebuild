@@ -121,13 +121,16 @@ run --push
 [ "$rc" = 0 ] && grep -qx 'changed=false' "$t/out" && [ "$(tip)" = "$before" ] || die "4: pinned rebuild: rc=$rc $(cat "$t/err")"
 run --try-upstream --push
 [ "$rc" = 2 ] && grep -q 'never pushes' "$t/err" && [ "$(tip)" = "$before" ] || die "4: --try-upstream --push: rc=$rc"
+# A fetch that fails is no verdict: exit 2 and no reason, so the workflow leaves an open bump be.
+rm -f "$t/reason"; UPSTREAM_URL="$t/nowhere" run --try-upstream
+[ "$rc" = 2 ] && [ ! -s "$t/reason" ] || die "4: failed fetch: rc=$rc reason: $(cat "$t/reason" 2>/dev/null)"
 setpin "$(up)"
 before="$(tip)"; rm -f "$t/reason"
 run --push
 [ "$rc" = 1 ] && [ "$(tip)" = "$before" ] || die "4: conflicting pin: rc=$rc"
 grep -q "^topic branch fix/two (.*) does not merge onto pinned upstream main .*: conflicts in src/a.txt$" "$t/reason" \
   || die "4: reason: $(cat "$t/reason" 2>/dev/null)"
-ok "4: a topic that does not merge: the trial names it and its files, the pin holds, --push refused; pinned there, the rebuild stops"
+ok "4: a topic that does not merge: the trial names it and its files, the pin holds, --push refused, a failed fetch gives no reason; pinned there, the rebuild stops"
 
 # 5. A topic missing from the fork stops it.
 g "$t/up" revert --no-edit HEAD >/dev/null

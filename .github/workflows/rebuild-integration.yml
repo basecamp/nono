@@ -13,10 +13,10 @@
 # integration that changes only the pin, and opens or updates one pull request from it, labelled
 # integration-upstream; merging that rebuilds on the new pin. When one does not merge, one issue
 # labelled integration-upstream names the topic branch and its files, the pin stays, and an open
-# bump pull request is closed. A run that reaches no verdict (integration moved during the trial,
-# the trial was cancelled or timed out, the proposal failed) leaves the bump as it is: its body
-# names the run and the topic commits it was tried on, and what guards it is the rebuild its merge
-# starts, which stops (nothing pushed or built, the integration-rebuild issue naming the topic)
+# bump pull request is closed. A run that reaches no verdict (a fetch failed, integration moved
+# during the trial, the trial was cancelled or timed out, the proposal failed) leaves the bump as
+# it is: its body names the run and the topic commits it was tried on, and what guards it is the
+# rebuild its merge starts, which stops (nothing pushed or built, the integration-rebuild issue naming the topic)
 # when the recipe no longer merges onto the new pin. It is opened with GITHUB_TOKEN, so it needs "Allow GitHub Actions to create and approve pull requests"
 # (Settings > Actions > General); without it the issue says so.
 #
@@ -158,6 +158,7 @@ jobs:
       layer: ${{ steps.try.outputs.layer }}
       topics: ${{ steps.try.outputs.topics }}
       reason: ${{ steps.reason.outputs.reason }}
+      verdict: ${{ steps.reason.outputs.verdict }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -175,6 +176,8 @@ jobs:
           set -euo pipefail
           .github/integration/rebuild --try-upstream | tee -a "$GITHUB_OUTPUT"
 
+      # A reason is a verdict: rebuild writes one only when the recipe does not merge onto the tip
+      # or cannot be read (exit 1), never when a fetch failed (exit 2) or the job broke first.
       - name: Reason
         id: reason
         if: failure()
@@ -182,9 +185,9 @@ jobs:
           REASON_FILE: ${{ runner.temp }}/reason
         run: |
           set -euo pipefail
-          reason="the trial failed before it could say why"
-          [ ! -s "$REASON_FILE" ] || reason="$(head -1 "$REASON_FILE")"
-          printf 'reason=%s\n' "$reason" >> "$GITHUB_OUTPUT"
+          reason="the trial failed before it reached a verdict" verdict=none
+          [ ! -s "$REASON_FILE" ] || reason="$(head -1 "$REASON_FILE")" verdict=fails
+          printf 'reason=%s\nverdict=%s\n' "$reason" "$verdict" >> "$GITHUB_OUTPUT"
 
   propose:
     needs: try-upstream
@@ -290,11 +293,12 @@ jobs:
           gh api "repos/$GH_REPO/issues/$open/labels" -f 'labels[]=integration-upstream' >/dev/null
 
       # Only a verdict changes the bump: a trial that succeeds refreshes it (above), one that fails
-      # closes it. A run with none (integration moved during the trial, the proposal failed, the trial
-      # cancelled or timed out, which skips this job) leaves it as its body describes it; merging it
-      # rebuilds, and that rebuild stops when the recipe no longer merges onto the new pin.
+      # closes it. A run with none (a fetch failed, integration moved during the trial, the proposal
+      # failed, the trial cancelled or timed out, which skips this job) leaves it as its body
+      # describes it; merging it rebuilds, and that rebuild stops when the recipe no longer merges
+      # onto the new pin.
       - name: Close the bump when upstream's tip does not merge
-        if: always() && needs.try-upstream.result == 'failure'
+        if: always() && needs.try-upstream.outputs.verdict == 'fails'
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -316,6 +320,7 @@ jobs:
           PROPOSED: ${{ steps.propose.outcome }}
           DEFERRED: ${{ steps.propose.outputs.deferred }}
           TRY_REASON: ${{ needs.try-upstream.outputs.reason }}
+          VERDICT: ${{ needs.try-upstream.outputs.verdict }}
           REASON_FILE: ${{ runner.temp }}/reason
           BASE: ${{ needs.try-upstream.outputs.base }}
           PIN: ${{ needs.try-upstream.outputs.pin }}
@@ -323,9 +328,12 @@ jobs:
         run: |
           set -euo pipefail
           day="$(date -u +%F)"
-          if [ "$TRIED" != success ]; then
+          if [ "$TRIED" != success ] && [ "$VERDICT" = fails ]; then
             .github/integration/issue integration-upstream failure "Upstream main does not merge: the pin stays" \
               "$day: $TRY_REASON ([run]($RUN_URL)). Nothing changed; integration stays on its pin."
+          elif [ "$TRIED" != success ]; then
+            .github/integration/issue integration-upstream failure "Upstream main could not be tried: the pin stays" \
+              "$day: $TRY_REASON ([run]($RUN_URL)); see the run's log. Nothing changed; integration stays on its pin, and an open bump stays as it was."
           elif [ "$DEFERRED" = true ]; then
             echo "the trial's integration moved on: the next run reports"
           elif [ "$PROPOSED" != success ]; then
