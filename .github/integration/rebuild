@@ -19,9 +19,9 @@
 #
 # Works in a temporary worktree of the clone it runs from, which it leaves as it was apart from
 # refs under refs/integration/. Prints `sha=<commit>`, `changed=<true|false>`, `base=<the
-# upstream commit it merged onto>`, `pin=<the pinned one>` and `layer=<the commit the pin, recipe
-# and fork layer came from>` on stdout (for $GITHUB_OUTPUT). Commits carry the caller's git
-# identity.
+# upstream commit it merged onto>`, `pin=<the pinned one>`, `layer=<the commit the pin, recipe
+# and fork layer came from>` and `topics=<each topic branch it merged, as BRANCH@SHA, in order,
+# space-separated>` on stdout (for $GITHUB_OUTPUT). Commits carry the caller's git identity.
 #
 # Exit 0: rebuilt, or already current (same tree as the fork's tip: nothing to push).
 # Exit 1: the pin is unreadable or not on upstream `main`, a topic branch is missing or does not
@@ -194,10 +194,11 @@ git -C "$tree" add -A -- INTEGRATION.md .github
 } > "$work/msg"
 git -C "$tree" commit -q -F "$work/msg"
 new="$(git -C "$tree" rev-parse HEAD)"
+merged=""; for i in "${!topics[@]}"; do merged="${merged:+$merged }${topics[$i]}@${shas[$i]}"; done
 
 if [ "$(git -C "$repo" rev-parse "$new^{tree}")" = "$(git -C "$repo" rev-parse "$old^{tree}")" ]; then
   say "$BRANCH ${old:0:12} is current (upstream ${base:0:12}, ${#topics[@]} topic(s))"
-  printf 'sha=%s\nchanged=false\nbase=%s\npin=%s\nlayer=%s\n' "$old" "$base" "$pin" "$layer_commit"
+  printf 'sha=%s\nchanged=false\nbase=%s\npin=%s\nlayer=%s\ntopics=%s\n' "$old" "$base" "$pin" "$layer_commit" "$merged"
   exit 0
 fi
 say "built ${new:0:12}: upstream ${base:0:12} + ${#topics[@]} topic(s) + fork layer (was ${old:0:12})"
@@ -210,4 +211,4 @@ if [ "$push" = 1 ]; then
   fi
   say "pushed ${new:0:12} to $FORK_URL $BRANCH"
 fi
-printf 'sha=%s\nchanged=true\nbase=%s\npin=%s\nlayer=%s\n' "$new" "$base" "$pin" "$layer_commit"
+printf 'sha=%s\nchanged=true\nbase=%s\npin=%s\nlayer=%s\ntopics=%s\n' "$new" "$base" "$pin" "$layer_commit" "$merged"
