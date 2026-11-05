@@ -11,7 +11,7 @@
 # names it, the pinned rebuild is unaffected), and one that is missing (exit 1, a reason, nothing
 # pushed); a topic already upstream (noted, still a rebuild); a push whose lease is stale; a layer
 # without the recipe; a pin missing, malformed, or not on upstream main (exit 1, named, nothing
-# pushed).
+# pushed); a topic based past the pin (the rebuild stops, the trial takes it).
 # shellcheck disable=SC2015,SC2016 # `A && B || die` (die exits); backticks are Markdown
 set -euo pipefail
 
@@ -214,5 +214,21 @@ badpin unknown "$(printf '%040d' 0)" 'which is not on upstream main'
 run --try-upstream --layer HEAD
 [ "$rc" = 0 ] && grep -qx "base=$(up)" "$t/out" || die "10: trial with a lost pin: rc=$rc $(cat "$t/err")"
 ok "10: a pin missing, malformed or not on upstream main stops the rebuild, names it, pushes nothing"
+
+# 11. A topic based past the pin would bring upstream past it: the rebuild stops, the trial takes it.
+old="$(up)"
+echo 'upstream four' > "$t/up/src/d.txt"; g "$t/up" add -A; g "$t/up" commit -q -m 'upstream: four'
+g "$w" fetch -q "$t/up" main && g "$w" switch -q --detach FETCH_HEAD
+echo ahead > "$w/src/ahead.txt"; g "$w" add -A; g "$w" commit -q -m 'fix ahead'; g "$w" push -q origin HEAD:refs/heads/fix/ahead
+g "$w" push -q -f origin "$sha:refs/heads/integration"   # case 7's rebuild: case 8 left fix/one there
+setpin "$old" $'fix/one  Fixes one\nfix/ahead  Ahead\n'
+before="$(tip)"; rm -f "$t/reason"
+run --push
+[ "$rc" = 1 ] && [ "$(tip)" = "$before" ] || die "11: rc=$rc $(cat "$t/err")"
+grep -q "^topic branch fix/ahead (.*) is based on upstream main $(up | cut -c1-12), past pinned upstream main ${old:0:12}: rebase it onto the pin" "$t/reason" \
+  || die "11: reason: $(cat "$t/reason" 2>/dev/null)"
+run --try-upstream
+[ "$rc" = 0 ] && grep -qx "base=$(up)" "$t/out" || die "11: trial: rc=$rc $(cat "$t/err")"
+ok "11: a topic based past the pin stops the rebuild, names it, pushes nothing; the trial takes it"
 
 echo "all $pass passed"

@@ -3,8 +3,8 @@
 # (.github/integration/rebuild, see INTEGRATION.md), daily and after every change to this branch,
 # then starts build-integration.yml on the result.
 #
-# A pin that is unreadable or not on upstream main, a topic branch that is missing or does not
-# merge, or a push that is refused, stops the rebuild: nothing is pushed or built, and one issue
+# A pin that is unreadable or not on upstream main, a topic branch that is missing, is based on
+# upstream past the pin, or does not merge, or a push that is refused, stops the rebuild: nothing is pushed or built, and one issue
 # labelled integration-rebuild stays open until a rebuild succeeds (it needs Issues turned on for
 # this repository).
 #
