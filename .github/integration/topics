@@ -1,6 +1,7 @@
-# The topic branches `integration` carries, merged onto upstream nolabs-ai/nono `main` in this
-# order by .github/integration/rebuild. One per line: the branch, then what it fixes (Markdown,
-# copied into INTEGRATION.md). Each branch is based on upstream `main`.
+# The topic branches `integration` carries, merged in this order by .github/integration/rebuild
+# onto the upstream nolabs-ai/nono `main` commit pinned in `upstream`. One per line: the branch,
+# then what it fixes (Markdown, copied into INTEGRATION.md). Each branch is based on upstream
+# `main`, and merges onto the pin.
 #
 # A branch here that is missing or does not merge stops the rebuild: nothing is pushed or built,
 # and an issue stays open until a rebuild succeeds. Drop a line when its fix lands upstream.

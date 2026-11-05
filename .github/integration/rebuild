@@ -1,27 +1,33 @@
 #!/usr/bin/env bash
 # Rebuild basecamp/nono `integration` from its recipe:
 #
-#   1. upstream nolabs-ai/nono `main`;
+#   1. the upstream nolabs-ai/nono `main` commit pinned in .github/integration/upstream;
 #   2. each topic branch in .github/integration/topics, merged --no-ff in the order listed;
 #   3. the fork layer, as one commit: upstream's workflows removed, this directory and the fork's
 #      two workflows taken from LAYER, and INTEGRATION.md written from what went in.
 #
-#   .github/integration/rebuild [--push] [--layer REF]
+#   .github/integration/rebuild [--push] [--layer REF] [--try-upstream]
 #
-#   --push       force-push the result to the fork's `integration`, leased on the tip it was
-#                built from; without it, build and report only
-#   --layer REF  take the recipe and the fork layer from REF, a commit-ish in this clone (a branch
-#                proposing a change to them), instead of the fork's current `integration`
+#   --push          force-push the result to the fork's `integration`, leased on the tip it was
+#                   built from; without it, build and report only
+#   --layer REF     take the pin, the recipe and the fork layer from REF, a commit-ish in this
+#                   clone (a branch proposing a change to them), instead of the fork's current
+#                   `integration`
+#   --try-upstream  merge onto upstream `main`'s tip instead of the pin: whether the pin could move
+#                   there (the daily trial, which proposes the move as a pull request). Never with
+#                   --push: integration is only ever built on its pin.
 #
 # Works in a temporary worktree of the clone it runs from, which it leaves as it was apart from
-# refs under refs/integration/. Prints `sha=<commit>` and `changed=<true|false>` on stdout (for
-# $GITHUB_OUTPUT). Commits carry the caller's git identity.
+# refs under refs/integration/. Prints `sha=<commit>`, `changed=<true|false>`, `base=<the
+# upstream commit it merged onto>`, `pin=<the pinned one>`, `layer=<the commit the pin, recipe
+# and fork layer came from>` and `topics=<each topic branch it merged, as BRANCH@SHA, in order,
+# space-separated>` on stdout (for $GITHUB_OUTPUT). Commits carry the caller's git identity.
 #
 # Exit 0: rebuilt, or already current (same tree as the fork's tip: nothing to push).
-# Exit 1: a topic branch is missing or does not merge, or the push was refused; nothing was
-#         pushed. The reason is on stderr and, when REBUILD_REASON_FILE is set, in that file as
-#         one line.
-# Exit 2: usage, or a fetch failed.
+# Exit 1: the pin is unreadable or not on upstream `main`, a topic branch is missing or does not
+#         merge, or the push was refused; nothing was pushed. The reason is on stderr and, when
+#         REBUILD_REASON_FILE is set, in that file as one line.
+# Exit 2: usage, or a fetch failed; no reason is written (the workflow reads one as a verdict).
 #
 # Upstream's workflows are removed rather than left disabled: the fork's Actions settings disable
 # each upstream workflow by path, so one upstream adds later would run here on its first push.
@@ -35,17 +41,20 @@ UPSTREAM_WEB=https://github.com/nolabs-ai/nono
 FORK_WEB=https://github.com/basecamp/nono
 BRANCH=integration
 RECIPE=.github/integration/topics
+PIN=.github/integration/upstream
 LAYER_PATHS=(.github/integration .github/workflows/build-integration.yml .github/workflows/rebuild-integration.yml)
 
-push=0 layer=""
+push=0 layer="" try=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --push) push=1; shift ;;
     --layer) [ $# -ge 2 ] || { echo "rebuild: --layer needs a REF" >&2; exit 2; }; layer="$2"; shift 2 ;;
+    --try-upstream) try=1; shift ;;
     -h|--help) sed -n '2,/^set -euo/{/^set -euo/d;s/^# \{0,1\}//;p}' "$0"; exit 0 ;;
     *) echo "rebuild: unknown argument: $1" >&2; exit 2 ;;
   esac
 done
+[ "$push" = 0 ] || [ "$try" = 0 ] || { echo "rebuild: --try-upstream never pushes: integration is built on its pin" >&2; exit 2; }
 
 say() { printf 'rebuild: %s\n' "$*" >&2; }
 fail() { # fail REASON: exit 1 with REASON, nothing pushed
@@ -60,9 +69,26 @@ git -C "$repo" fetch -q --no-tags "$UPSTREAM_URL" "+refs/heads/main:refs/integra
 git -C "$repo" fetch -q --no-tags "$FORK_URL" "+refs/heads/$BRANCH:refs/integration/old" \
   || { say "fetching $FORK_URL $BRANCH failed"; exit 2; }
 old="$(git -C "$repo" rev-parse refs/integration/old)"
-base="$(git -C "$repo" rev-parse refs/integration/upstream)"
+main="$(git -C "$repo" rev-parse refs/integration/upstream)"
 layer_commit="$(git -C "$repo" rev-parse --verify -q "${layer:-refs/integration/old}^{commit}")" \
   || { say "--layer $layer: no such commit in $repo"; exit 2; }
+
+# The pin: one line, an upstream `main` commit as 40 hex digits; blank lines and # comments
+# skipped. One that cannot be read, or is not on upstream `main` (a typo, or upstream rewrote its
+# history), stops the rebuild: never a fallback to `main`'s tip. The trial does not build on the
+# pin, so only its form is checked there: a trial can still propose the move off a lost pin.
+pin="$(git -C "$repo" show "$layer_commit:$PIN" 2>/dev/null)" \
+  || fail "cannot read $PIN in ${layer:-$BRANCH} ${layer_commit:0:12}: nothing rebuilt"
+pin="$(printf '%s\n' "$pin" | grep -v -e '^[[:space:]]*$' -e '^#' || true)"
+[[ "$pin" =~ ^[0-9a-f]{40}$ ]] \
+  || fail "$PIN in ${layer:-$BRANCH} ${layer_commit:0:12} does not hold one upstream commit (40 hex digits on a line of its own): nothing rebuilt"
+if [ "$try" = 1 ]; then
+  base="$main" onto="upstream main's tip ${main:0:12}"
+else
+  git -C "$repo" merge-base --is-ancestor "$pin" "$main" 2>/dev/null \
+    || fail "$PIN pins ${pin:0:12}, which is not on upstream main ${main:0:12}: nothing rebuilt"
+  base="$pin" onto="pinned upstream main ${pin:0:12}"
+fi
 
 # The recipe: "<branch> <description>" lines; blank lines and # comments skipped. Read whole
 # first: a recipe that cannot be read stops the rebuild, never reads as one with no topics.
@@ -82,9 +108,10 @@ if [ "${#topics[@]}" -gt 0 ]; then
   specs=()
   for t in "${topics[@]}"; do specs+=("+refs/heads/$t:refs/integration/topic/$t"); done
   if ! err="$(git -C "$repo" fetch -q --no-tags "$FORK_URL" "${specs[@]}" 2>&1)"; then
+    # ls-remote --exit-code: 2 is "no such ref"; anything else is the fetch failing, no verdict.
     for t in "${topics[@]}"; do
-      git -C "$repo" ls-remote --exit-code -q "$FORK_URL" "refs/heads/$t" >/dev/null 2>&1 \
-        || fail "topic branch $t is in $RECIPE but not on $FORK_URL"
+      lrc=0; git -C "$repo" ls-remote --exit-code -q "$FORK_URL" "refs/heads/$t" >/dev/null 2>&1 || lrc=$?
+      [ "$lrc" != 2 ] || fail "topic branch $t is in $RECIPE but not on $FORK_URL"
     done
     say "fetching the topic branches failed: $err"; exit 2
   fi
@@ -102,13 +129,14 @@ for i in "${!topics[@]}"; do
   sha="$(git -C "$repo" rev-parse "refs/integration/topic/$t")"
   shas+=("$sha")
   before="$(git -C "$tree" rev-parse 'HEAD^{tree}')"
-  if ! git -C "$tree" merge -q --no-ff --no-edit -m "Merge $t into $BRANCH" "$sha" >/dev/null 2>&1; then
+  # rerere off: a resolution this clone remembers would stage the conflict and hide its files.
+  if ! git -C "$tree" -c rerere.enabled=false merge -q --no-ff --no-edit -m "Merge $t into $BRANCH" "$sha" >/dev/null 2>&1; then
     files="$(git -C "$tree" diff --name-only --diff-filter=U | tr '\n' ' ')"
     git -C "$tree" merge --abort >/dev/null 2>&1 || true
-    fail "topic branch $t (${sha:0:12}) does not merge onto upstream main ${base:0:12}${files:+: conflicts in ${files% }}"
+    fail "topic branch $t (${sha:0:12}) does not merge onto $onto${files:+: conflicts in ${files% }}"
   fi
   [ "$(git -C "$tree" rev-parse 'HEAD^{tree}')" != "$before" ] \
-    || say "note: $t (${sha:0:12}) changes nothing on upstream main ${base:0:12}: already upstream? Drop it from $RECIPE"
+    || say "note: $t (${sha:0:12}) changes nothing on $onto: already upstream? Drop it from $RECIPE"
 done
 
 # The fork layer.
@@ -125,11 +153,19 @@ code() { printf '`%s`' "${1//\`/}"; }
 This branch is upstream [nolabs-ai/nono]($UPSTREAM_WEB) \`main\` plus fixes we have
 prepared for upstream that have not landed yet. \`.github/workflows/rebuild-integration.yml\`
 rebuilds it daily and after every change to it (\`.github/integration/rebuild\`): reset to
-upstream \`main\`, the topic branches in \`.github/integration/topics\` merged in order,
-upstream's workflows removed, force-pushed. So never base work on it: base topic branches
-on upstream \`main\`, and change what it carries with a pull request to
-\`.github/integration/topics\`. A topic branch that does not merge stops the rebuild and
-opens an issue labelled \`integration-rebuild\`.
+the upstream \`main\` commit pinned in \`.github/integration/upstream\`, the topic branches
+in \`.github/integration/topics\` merged in order, upstream's workflows removed,
+force-pushed. So never base work on it: base topic branches on the pinned upstream commit or an
+earlier one (a topic is merged whole, so one based on a later upstream commit brings that history
+with it, past the pin), and
+change what it carries with a pull request to \`.github/integration/topics\`. A topic
+branch that does not merge stops the rebuild and opens an issue labelled
+\`integration-rebuild\`.
+
+Upstream moving does not move it. Each day the same workflow tries upstream \`main\`'s tip:
+when every topic branch merges onto it, a pull request labelled \`integration-upstream\`
+moves the pin there; when one does not, an issue with that label names the topic branch
+and its conflicting files, and the pin stays.
 
 \`.github/workflows/build-integration.yml\` builds each rebuild for x86_64-unknown-linux-gnu,
 aarch64-apple-darwin and x86_64-apple-darwin, attests build provenance, and publishes a
@@ -137,7 +173,7 @@ prerelease tagged \`integration-<sha12>\`.
 
 ## Upstream base
 
-nolabs-ai/nono \`main\` at [\`${base:0:12}\`]($UPSTREAM_WEB/commit/$base) ($(code "$(git -C "$repo" log -1 --format=%s "$base")")).
+Pinned: nolabs-ai/nono \`main\` at [\`${base:0:12}\`]($UPSTREAM_WEB/commit/$base) ($(code "$(git -C "$repo" log -1 --format=%s "$base")")).
 
 ## Carried topic branches
 
@@ -161,10 +197,11 @@ git -C "$tree" add -A -- INTEGRATION.md .github
 } > "$work/msg"
 git -C "$tree" commit -q -F "$work/msg"
 new="$(git -C "$tree" rev-parse HEAD)"
+merged=""; for i in "${!topics[@]}"; do merged="${merged:+$merged }${topics[$i]}@${shas[$i]}"; done
 
 if [ "$(git -C "$repo" rev-parse "$new^{tree}")" = "$(git -C "$repo" rev-parse "$old^{tree}")" ]; then
   say "$BRANCH ${old:0:12} is current (upstream ${base:0:12}, ${#topics[@]} topic(s))"
-  printf 'sha=%s\nchanged=false\n' "$old"
+  printf 'sha=%s\nchanged=false\nbase=%s\npin=%s\nlayer=%s\ntopics=%s\n' "$old" "$base" "$pin" "$layer_commit" "$merged"
   exit 0
 fi
 say "built ${new:0:12}: upstream ${base:0:12} + ${#topics[@]} topic(s) + fork layer (was ${old:0:12})"
@@ -177,4 +214,4 @@ if [ "$push" = 1 ]; then
   fi
   say "pushed ${new:0:12} to $FORK_URL $BRANCH"
 fi
-printf 'sha=%s\nchanged=true\n' "$new"
+printf 'sha=%s\nchanged=true\nbase=%s\npin=%s\nlayer=%s\ntopics=%s\n' "$new" "$base" "$pin" "$layer_commit" "$merged"
