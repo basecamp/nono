@@ -8891,6 +8891,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn public_only_refuses_an_approved_name_at_loopback_over_plain_http() {
+        // The plain-HTTP forward path offers network approval too. As on
+        // CONNECT, the approval stands in for the allowlist miss only: under
+        // public_only the approved name's loopback answer is refused, and the
+        // origin is never reached.
+        let (origin, reached) = spawn_echo_origin().await;
+        let authority = format!("localhost:{}", origin.port());
+        let target = format!("http://{authority}/hello");
+        let (handle, calls) = start_forward_approval_proxy(
+            ProxyConfig {
+                resolved_addresses: public_only_policy(&[]),
+                ..not_allowlisted_config()
+            },
+            nono::ApprovalDecision::Granted,
+        )
+        .await;
+        let refused = send_forward_get(&handle, &target, &authority).await;
+        assert!(
+            refused.starts_with("HTTP/1.1 403 Forbidden: host localhost resolved to loopback"),
+            "public_only: {refused:?}"
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        handle.shutdown();
+
+        // Control: the same approval is forwarded with an exception for the
+        // class, to the same origin, which serves one connection.
+        let (handle, _) = start_forward_approval_proxy(
+            ProxyConfig {
+                resolved_addresses: public_only_policy(&[(
+                    "localhost",
+                    &[nono::net_filter::AddressClass::Loopback],
+                )]),
+                ..not_allowlisted_config()
+            },
+            nono::ApprovalDecision::Granted,
+        )
+        .await;
+        let excepted = send_forward_get(&handle, &target, &authority).await;
+        assert!(
+            excepted.starts_with("HTTP/1.1 200"),
+            "exception: {excepted:?}"
+        );
+        assert!(reached.await.unwrap().starts_with("GET /hello HTTP/1.1"));
+        handle.shutdown();
+    }
+
+    #[tokio::test]
     async fn public_only_gates_route_upstreams_too() {
         // A reverse route's upstream is the profile's, but its name resolves
         // like any other: under public_only a loopback route upstream needs
