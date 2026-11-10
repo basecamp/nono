@@ -166,6 +166,12 @@ impl<'t, M: Sandboxing> Sandboxed<'t, M> {
         self
     }
 
+    /// `--allow-connect-port <PORT>`, repeatable.
+    pub fn allow_connect_port(mut self, port: u16) -> Self {
+        self.inner.opt("--allow-connect-port", port.to_string());
+        self
+    }
+
     pub fn config(mut self, path: impl AsRef<Path>) -> Self {
         self.inner.opt("--config", path.as_ref());
         self
@@ -223,6 +229,25 @@ impl<'t, M: Sandboxing> Sandboxed<'t, M> {
 }
 
 impl Sandboxed<'_, RunMode> {
+    /// `--dry-run --json`: the resolved capability report on stdout.
+    pub fn dry_run_json(mut self) -> Self {
+        self.inner.flag("--dry-run");
+        self.inner.flag("--json");
+        self
+    }
+
+    /// `--memory <SIZE>`. `run`-only: `wrap` cannot apply a cgroup limit.
+    pub fn memory(mut self, size: &str) -> Self {
+        self.inner.opt("--memory", size);
+        self
+    }
+
+    /// `--read <PATH>`, repeatable.
+    pub fn read(mut self, path: impl AsRef<Path>) -> Self {
+        self.inner.opt("--read", path.as_ref());
+        self
+    }
+
     /// `--audit-sign-key`. `run`-only, same reason as [`Self::rollback`].
     pub fn audit_sign_key(mut self, key: &KeyRef) -> Self {
         self.inner.opt("--audit-sign-key", key.as_str());
