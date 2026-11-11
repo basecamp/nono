@@ -995,7 +995,8 @@
               "type": "string",
               "minLength": 1,
               "maxLength": 512,
-              "pattern": "^[ -z|~]*(\\{host\\}[ -z|~]*)*$"
+              "pattern": "^[ -z|~]*(\\{host\\}[ -z|~]*)*$",
+              "not": { "pattern": "^ *$" }
             },
             { "type": "null" }
           ],
