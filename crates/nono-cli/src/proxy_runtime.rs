@@ -1655,6 +1655,7 @@ pub(crate) fn prepare_proxy_launch_options(
         audit_disabled: false,
         network_approval_backends,
         network_approval_defaults,
+        allowlist_denial_message: prepared.allowlist_denial_message.clone(),
     };
 
     // Infra-only flags make no sense without an activating proxy feature.
@@ -2574,6 +2575,7 @@ pub(crate) fn build_proxy_config_from_flags(
     }
     proxy_config.leaf_validity = proxy.proxy_leaf_validity;
     proxy_config.enable_h2 = proxy.enable_h2;
+    proxy_config.allowlist_denial_message = proxy.allowlist_denial_message.clone();
     proxy_config.no_proxy = proxy.no_proxy.clone();
     proxy_config.enable_network_audit = !proxy.audit_disabled;
     synthesize_credential_provider_proxy_config(proxy, &mut proxy_config)?;
@@ -4441,6 +4443,7 @@ mod tests {
             set_vars: None,
             profile_network_block: false,
             allow_http2_requested: false,
+            allowlist_denial_message: None,
         };
 
         let args = crate::cli::SandboxArgs::default();
@@ -4523,6 +4526,7 @@ mod tests {
             set_vars: None,
             profile_network_block: false,
             allow_http2_requested: false,
+            allowlist_denial_message: None,
         };
         let args = crate::cli::SandboxArgs {
             allow_proxy: vec!["api.internal.corp".to_string()],
@@ -4600,6 +4604,7 @@ mod tests {
             set_vars: None,
             profile_network_block: false,
             allow_http2_requested: false,
+            allowlist_denial_message: None,
         };
         let args = crate::cli::SandboxArgs::default();
         let intent = prepare_proxy_launch_options(&args, &prepared, true, String::new())?;

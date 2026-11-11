@@ -216,6 +216,8 @@ where
 ///
 /// `first_line` is the already-read CONNECT line (e.g., "CONNECT api.openai.com:443 HTTP/1.1").
 /// `stream` is the raw TCP stream from the client.
+/// `denial_message` is the profile's allowlist denial message (see
+/// [`crate::denial`]).
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_connect(
     first_line: &str,
@@ -226,6 +228,7 @@ pub async fn handle_connect(
     auth_mode: ConnectAuthMode,
     audit_log: Option<&audit::SharedAuditLog>,
     network_approval: Option<&NetworkApproval<'_>>,
+    denial_message: Option<&str>,
 ) -> Result<()> {
     // Parse host:port from CONNECT line
     let (host, port) = parse_connect_target(first_line)?;
@@ -264,8 +267,22 @@ pub async fn handle_connect(
             addrs,
             approval_backend,
         } => (addrs, approval_backend),
-        HostAuthorization::Denied { reason } => {
-            send_response(stream, 403, &format!("Forbidden: {}", reason)).await?;
+        HostAuthorization::Denied {
+            reason,
+            static_refusal,
+        } => {
+            match static_refusal {
+                // The filter's own refusal: the profile may word it.
+                Some(result) => {
+                    let response =
+                        crate::denial::host_denial_response(denial_message, &host, &result);
+                    stream.write_all(response.as_bytes()).await?;
+                    stream.flush().await?;
+                }
+                // An approval backend's refusal keeps the default response:
+                // `denial_message` words only the allowlist's.
+                None => send_response(stream, 403, &format!("Forbidden: {}", reason)).await?,
+            }
             return Err(ProxyError::HostDenied { host, reason });
         }
     };
@@ -351,7 +368,17 @@ pub(crate) enum HostAuthorization {
     },
     /// The host is denied and the denial is already audited. The caller writes
     /// its own 403 carrying `reason`.
-    Denied { reason: String },
+    ///
+    /// `static_refusal` is the host filter's result when that refusal stands
+    /// (no approval backend decided), so the caller can word an allowlist
+    /// refusal with the profile's `allowlist_denial_message`
+    /// ([`crate::denial`]). It is `None` when an approval backend refused, or
+    /// approved and the re-vet refused the answers: that refusal is the
+    /// backend's, and keeps the default response.
+    Denied {
+        reason: String,
+        static_refusal: Option<FilterResult>,
+    },
 }
 
 /// Turn a host-filter result into the vetted upstream addresses to connect to,
@@ -405,7 +432,10 @@ pub(crate) async fn authorize_host(
                 nono::undo::NetworkAuditDecision::ApproveDenied,
                 Some(&reason),
             );
-            Ok(HostAuthorization::Denied { reason })
+            Ok(HostAuthorization::Denied {
+                reason,
+                static_refusal: None,
+            })
         }
         ApprovalOutcome::NotApplicable => {
             // Not approval-eligible (hard SSRF/deny-list denial) or no
@@ -422,7 +452,10 @@ pub(crate) async fn authorize_host(
                 port,
                 &reason,
             );
-            Ok(HostAuthorization::Denied { reason })
+            Ok(HostAuthorization::Denied {
+                reason,
+                static_refusal: Some(check.result),
+            })
         }
     }
 }
