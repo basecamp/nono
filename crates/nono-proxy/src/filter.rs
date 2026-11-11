@@ -60,6 +60,17 @@ pub struct ProxyFilter {
     address_gate: Option<Arc<AddressGate>>,
 }
 
+/// A host or exception pattern in the form exceptions are matched in: an IP
+/// literal in its canonical spelling, so `::1`, `[::1]` and `0:0::1` are one
+/// key (a CONNECT target keeps its brackets, a profile may not write them);
+/// anything else normalized as the allowlist normalizes it.
+fn exception_key(host: &str) -> String {
+    parse_host_ip_literal(host).map_or_else(
+        || HostFilter::normalize_authority_host(host),
+        |ip| ip.to_string(),
+    )
+}
+
 /// A public-only [`ResolvedAddressPolicy`], normalized for matching.
 #[derive(Debug)]
 struct AddressGate {
@@ -111,12 +122,7 @@ impl ProxyFilter {
         let exceptions = policy
             .exceptions
             .iter()
-            .map(|(pattern, classes)| {
-                (
-                    HostFilter::normalize_authority_host(pattern),
-                    classes.clone(),
-                )
-            })
+            .map(|(pattern, classes)| (exception_key(pattern), classes.clone()))
             .collect();
         Self {
             address_gate: Some(Arc::new(AddressGate { exceptions })),
@@ -277,7 +283,7 @@ impl ProxyFilter {
         if !result.is_allowed() {
             return result;
         }
-        let normalized = HostFilter::normalize_authority_host(host);
+        let normalized = exception_key(host);
         let literal = parse_host_ip_literal(host);
         for ip in resolved_ips {
             let Some(class) = address_class(ip) else {
@@ -773,6 +779,39 @@ mod tests {
         assert!(
             !filter
                 .check_host_with_ips("corp.example", &[ip("10.0.0.1")])
+                .is_allowed()
+        );
+    }
+
+    #[test]
+    fn test_public_only_ip_exception_matches_in_any_spelling() {
+        // CONNECT keeps an IPv6 target's brackets (`[::1]`); a profile may
+        // write the exception with or without them, or uncompressed.
+        for pattern in ["::1", "[::1]", "0:0::1"] {
+            let filter =
+                ProxyFilter::new(&["*".to_string()]).with_resolved_address_policy(&public_only(&[
+                    (pattern, &[AddressClass::Loopback]),
+                ]));
+            for host in ["::1", "[::1]", "[0:0::1]"] {
+                assert!(
+                    filter.check_host_with_ips(host, &[ip("::1")]).is_allowed(),
+                    "exception {pattern}, host {host}"
+                );
+            }
+            // Only the address it names: another loopback address is refused.
+            assert!(
+                matches!(
+                    filter.check_host_with_ips("[::2]", &[ip("::1")]),
+                    FilterResult::DenyAddressClass { .. }
+                ),
+                "exception {pattern}, host [::2]"
+            );
+        }
+        let filter = ProxyFilter::new(&["*".to_string()])
+            .with_resolved_address_policy(&public_only(&[("10.1.2.3", &[AddressClass::Private])]));
+        assert!(
+            filter
+                .check_host_with_ips("10.1.2.3", &[ip("10.1.2.3")])
                 .is_allowed()
         );
     }
