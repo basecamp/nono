@@ -52,6 +52,100 @@ fn test_groups_unknown_exits_error() {
     assert!(!output.status.success(), "expected non-zero exit");
 }
 
+fn groups_stdout(args: &[&str]) -> Vec<u8> {
+    let output = nono_bin()
+        .args(["profile", "groups"])
+        .args(args)
+        .output()
+        .expect("failed to run nono");
+    assert!(
+        output.status.success(),
+        "nono profile groups {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output.stdout
+}
+
+/// Two groups that exist on every platform, and one listed twice.
+const BATCH: [&str; 3] = ["deny_credentials", "deny_shell_history", "deny_credentials"];
+
+#[test]
+fn test_groups_several_json_is_each_single_output_in_order() {
+    let mut expected = Vec::new();
+    for name in BATCH {
+        expected.extend(groups_stdout(&[name, "--json"]));
+    }
+    let mut args = BATCH.to_vec();
+    args.push("--json");
+    assert_eq!(
+        String::from_utf8(groups_stdout(&args)).expect("UTF-8 output"),
+        String::from_utf8(expected).expect("UTF-8 output")
+    );
+}
+
+#[test]
+fn test_groups_several_json_splits_into_one_document_per_name() {
+    let mut args = BATCH.to_vec();
+    args.push("--json");
+    let stdout = groups_stdout(&args);
+    let docs: Vec<serde_json::Value> = serde_json::Deserializer::from_slice(&stdout)
+        .into_iter::<serde_json::Value>()
+        .collect::<Result<_, _>>()
+        .expect("each document parses");
+    let names: Vec<&str> = docs
+        .iter()
+        .map(|d| d["name"].as_str().expect("each document names its group"))
+        .collect();
+    assert_eq!(names, BATCH);
+    for (doc, name) in docs.iter().zip(BATCH) {
+        let single: serde_json::Value =
+            serde_json::from_slice(&groups_stdout(&[name, "--json"])).expect("single call is JSON");
+        assert_eq!(*doc, single);
+    }
+}
+
+#[test]
+fn test_groups_several_text_is_each_single_output_blank_line_apart() {
+    let singles: Vec<String> = BATCH
+        .iter()
+        .map(|name| String::from_utf8(groups_stdout(&[name])).expect("UTF-8 output"))
+        .collect();
+    let batched = String::from_utf8(groups_stdout(&BATCH)).expect("UTF-8 output");
+    assert_eq!(batched, singles.join("\n"));
+}
+
+#[test]
+fn test_groups_several_with_an_unknown_name_prints_nothing() {
+    for args in [
+        vec!["deny_credentials", "nonexistent_group_xyz", "--json"],
+        vec!["nonexistent_group_xyz", "deny_credentials"],
+    ] {
+        let output = nono_bin()
+            .args(["profile", "groups"])
+            .args(&args)
+            .output()
+            .expect("failed to run nono");
+        assert!(
+            !output.status.success(),
+            "expected non-zero exit for {args:?}"
+        );
+        assert!(
+            output.stdout.is_empty(),
+            "expected no stdout for {args:?}, got:\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let single = nono_bin()
+            .args(["profile", "groups", "nonexistent_group_xyz"])
+            .output()
+            .expect("failed to run nono");
+        assert_eq!(output.status.code(), single.status.code());
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&single.stderr)
+        );
+    }
+}
+
 #[test]
 fn test_list_output() {
     let output = nono_bin()
