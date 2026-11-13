@@ -1347,21 +1347,17 @@ pub async fn start_with_network_approval(
     // crypto providers are in the dependency tree.
     // Must be created before CredentialStore::load_with_diagnostics() because OAuth2 token
     // exchange needs TLS.
-    let mut root_store = rustls::RootCertStore::empty();
-    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let native = rustls_native_certs::load_native_certs();
-    if !native.errors.is_empty() {
+    // The store is webpki roots plus the OS trust store, loaded once per
+    // process and shared with the route store and the intercept bundle.
+    let native = crate::native_roots::native_roots();
+    if native.error_count > 0 {
         debug!(
             "failed to load {} native cert(s); continuing with webpki roots + any that succeeded",
-            native.errors.len()
+            native.error_count
         );
     }
     let native_count = native.certs.len();
-    for cert in native.certs {
-        if let Err(e) = root_store.add(cert) {
-            debug!("skipping unparseable native cert: {e}");
-        }
-    }
+    let root_store = crate::native_roots::base_root_store();
     if native_count > 0 {
         debug!("added {native_count} native system CA(s) to upstream trust store");
     }
