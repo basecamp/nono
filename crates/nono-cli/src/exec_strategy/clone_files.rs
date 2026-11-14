@@ -125,16 +125,25 @@ fn notify_filter(
     config: &ExecConfig<'_>,
     caps: &CapabilitySet,
 ) -> Option<PreparedSeccompNotifyFilter> {
+    // One listener carries every notification this session mediates: the
+    // network program (if any), file metadata, then openat.
     let policy = config.seccomp_policy;
     let network = if policy.proxy_fallback {
         let has_bind = matches!(caps.network_mode(), nono::NetworkMode::ProxyOnly { bind_ports, .. } if !bind_ports.is_empty());
         sandbox::prepare_seccomp_proxy_filter(has_bind)
     } else if policy.af_unix_mediation {
         sandbox::prepare_seccomp_af_unix_filter()
+    } else if policy.metadata_mediation {
+        sandbox::prepare_seccomp_metadata_filter()
     } else if policy.needs_openat_notify() {
         return Some(sandbox::prepare_seccomp_openat_filter());
     } else {
         return None;
+    };
+    let network = if policy.metadata_mediation && policy.needs_network_notify() {
+        network.with_metadata_notifications()
+    } else {
+        network
     };
     Some(if policy.needs_openat_notify() {
         network.with_openat_notifications()
