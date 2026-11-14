@@ -77,6 +77,7 @@ fn test_schema_network_config_matches_rust_model() {
             "no_proxy",
             "custom_credentials",
             "tls_intercept",
+            "allowlist_denial_message",
             "upstream_proxy",
             "upstream_bypass",
             "approval_backends",
@@ -1614,6 +1615,35 @@ fn test_schema_rejects_aws_auth_profiles_bad_key() {
         assert!(
             validator.validate(&profile).is_err(),
             "aws_auth.profiles {profiles} should be rejected"
+        );
+    }
+}
+
+#[test]
+fn test_schema_allowlist_denial_message_matches_profile_validation() {
+    let schema = load_schema();
+    let validator = jsonschema::validator_for(&schema).expect("schema compiles");
+    let profile =
+        |message: serde_json::Value| json!({ "network": { "allowlist_denial_message": message } });
+
+    for message in [
+        "Ask the person running you to allow {host}.",
+        " x ",
+        "{host}",
+    ] {
+        assert!(
+            validator.is_valid(&profile(json!(message))),
+            "schema must accept {message:?}"
+        );
+    }
+    assert!(validator.is_valid(&profile(serde_json::Value::Null)));
+    // Profile loading refuses these (`denial::validate_message`), so the
+    // schema does too: empty or spaces only, a brace outside `{host}`, a
+    // control character.
+    for message in ["", " ", "   ", "a {b}", "{host", "line\nbreak"] {
+        assert!(
+            !validator.is_valid(&profile(json!(message))),
+            "schema must refuse {message:?}"
         );
     }
 }
