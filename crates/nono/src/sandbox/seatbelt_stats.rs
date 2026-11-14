@@ -182,11 +182,16 @@ fn form_kind(form: &str) -> String {
 }
 
 /// The symbol at the start of `s`: up to whitespace, a paren, a quote or a
-/// `;` comment.
+/// comment (`;`, or `#|`).
 fn symbol(s: &str) -> &str {
     let end = s
-        .find(|c: char| c.is_whitespace() || c == '(' || c == ')' || c == '"' || c == ';')
-        .unwrap_or(s.len());
+        .char_indices()
+        .find(|&(i, c)| {
+            c.is_whitespace()
+                || matches!(c, '(' | ')' | '"' | ';')
+                || (c == '#' && s[i + 1..].starts_with('|'))
+        })
+        .map_or(s.len(), |(i, _)| i);
     &s[..end]
 }
 
@@ -335,12 +340,13 @@ mod tests {
 (allow file-read* #| why |# (subpath \"/opt\"))
 (allow file-read*;why\n (subpath \"/a\"))
 (allow file-read* ( ; first\n subpath \"/b\"))
+(allow file-read*#|why|#(subpath#|why|# \"/d\"))
 (allow file-read* (subpath \"/c\"))
 ";
         let stats = seatbelt_profile_stats(profile);
-        assert_eq!(stats.rules, 5);
+        assert_eq!(stats.rules, 6);
         assert_eq!(stats.kinds.len(), 1, "{:?}", stats.kinds);
-        assert_eq!(kind(&stats, "allow file-read* subpath").count, 5);
+        assert_eq!(kind(&stats, "allow file-read* subpath").count, 6);
     }
 
     #[test]
