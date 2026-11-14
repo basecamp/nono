@@ -23,6 +23,32 @@ mod macos;
 #[cfg(target_os = "macos")]
 pub use macos::{extension_consume, extension_issue_file, extension_release};
 
+/// The Seatbelt profile text `apply_auto` would enforce for `caps` (macOS).
+///
+/// A caller that must decide what a run grants — the dry run reading its own
+/// launch back — parses this, the same bytes enforcement applies, rather than
+/// rebuilding the grants from the capability set and risking a missed emitter.
+///
+/// # Errors
+///
+/// Returns an error if a path in `caps` is not valid UTF-8 or holds a byte the
+/// profile's escaping refuses (a control character), the same as enforcement.
+#[cfg(target_os = "macos")]
+pub fn seatbelt_profile(caps: &crate::capability::CapabilitySet) -> crate::error::Result<String> {
+    macos::generate_profile(caps)
+}
+
+/// Escape `path` as the macOS profile's `(regex "^…/[^/]+$")` direct-children
+/// rule does, so a reader can render that rule and match it byte for byte.
+///
+/// # Errors
+///
+/// Returns an error if `path` holds a control character, as enforcement does.
+#[cfg(target_os = "macos")]
+pub fn seatbelt_path_regex(path: &str) -> crate::error::Result<String> {
+    macos::regex_escape_path_for_seatbelt(path)
+}
+
 // Re-export Linux Landlock ABI detection and scope policy reporting
 #[cfg(target_os = "linux")]
 pub use linux::{
