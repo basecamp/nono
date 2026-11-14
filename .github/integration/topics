@@ -1,0 +1,33 @@
+# The topic branches `integration` carries, merged in this order by .github/integration/rebuild
+# onto the upstream nolabs-ai/nono `main` commit pinned in `upstream`. One per line: the branch,
+# then what it fixes (Markdown, copied into INTEGRATION.md). Each branch is based on upstream
+# `main`, and merges onto the pin.
+#
+# A branch here that is missing or does not merge stops the rebuild: nothing is pushed or built,
+# and an issue stays open until a rebuild succeeds. Drop a line when its fix lands upstream.
+#
+# A PR that changes this file is a carry PR, under the fork's rules (AGENTS.md here): upstream's
+# NEP, DCO sign-off and disclosure apply when a topic is submitted upstream, not to a carry.
+#
+# Not carried:
+#   fix/credential-capture-owned-children  superseded by nolabs-ai/nono#2073, which fixes
+#     nolabs-ai/nono#1620 and also covers supervisor credential sources (the branch is kept)
+#   fix/claude-securestorage-config-dir  superseded by nolabs-ai/nono#2085, which fixes
+#     nolabs-ai/nono#1950 the same way and also matches the preflight Keychain lookup to it
+#     (the branch is kept)
+#   perf/elf-bounded-reads  landed upstream as nolabs-ai/nono#2195 (4c03401d), which fixes
+#     nolabs-ai/nono#2143 with the topic's change, so merging the branch changes nothing
+#     (the branch is kept)
+#   fix/proxy-upstream-liveness  landed upstream as ef107f94, "fix(proxy): fail upstream
+#     connections that go silent", so merging the branch changes nothing (the branch is kept)
+
+fix/supervisor-audit-rate-limited-capability-requests  Remainder of nolabs-ai/nono#2043 after #2047: capability requests, and requests for unix socket approvals, refused by the approval rate limiter left no audit record
+fix/drain-command-proxy-audit  Follow-up to nolabs-ai/nono#1981: command-scoped proxy audit events were never drained into the session audit record
+fix/profile-show-sandbox-policy  `nono profile show` / `profile diff` omitted `linux.sandbox_policy` in text and JSON
+metadata-ops-confine  nolabs-ai/nono#914: Landlock does not mediate chmod/utime; `linux.metadata_mediation = "write_grants"` confines them to write grants
+feat/proxy-resolved-address-classes-cd5af88  `network.resolved_addresses`: with `public_only`, an allowed name that resolves to a loopback, private or shared (CGNAT) address is refused unless an exception names that class for it, and one that resolves to an unspecified address is refused with no exception possible (a link-local one is refused in any case) (upstream draft not filed)
+feat/dry-run-json  `nono run --dry-run --json`: the launch plan's capability set as JSON (filesystem and Unix-socket grants with resolved and written paths, access and source; network mode and port exceptions; resource limits; each brokered command's sandbox as its launch builds it; on macOS, every file rule of the Seatbelt profile the launch applies, read back from the profile itself into `seatbelt_grants` with its scope — `literal`, `subpath`, `children` or `atomic_temp` — and any rule not shown bounded named in `incomplete`), planned without reading any credential source, so a launcher checks what a run applies without parsing the text summary (report version 3, which drops `metadata_paths` and `metadata_children`; upstream draft not filed)
+fix/open-port-bind-loopback  An open port (`network.open_port`, `open_port_range`) binds only on loopback in Linux proxy mode, as its connect already reaches only loopback: a bind to `0.0.0.0`, `::` or a LAN address on it fails with `EADDRNOTAVAIL`, which port probers skip (macOS unchanged: Seatbelt cannot hold a bind to loopback) (upstream draft not filed)
+fix/cli-stdout-broken-pipe  A closed stdout or stderr (`nono why … | head -n 1`) ends nono by SIGPIPE, status 141 and no core, instead of a "failed printing to stdout: Broken pipe" panic that aborted with SIGABRT and dumped core under `panic = "abort"`; SIGPIPE stays ignored, so the supervisor and proxy still see EPIPE as an error (upstream draft not filed)
+feat/proxy-host-denial-message-cd5af88  `network.allowlist_denial_message`: the profile words the 403 that refuses a host outside the allowlist (`{host}` replaced by the host, ` [rule: net.allowlist]` appended, sent as the reason phrase and a plain-text body with an `X-Nono-Denied-By: net.allowlist` header), so an agent reading it is told what to do instead of retrying; what is allowed, denied and audited is unchanged, other refusals keep the default response, and with no message the response is byte for byte today's (upstream draft not filed)
+fix/seatbelt-keep-write-grant-root  On macOS, a directory write grant's root stays in place, as Landlock keeps it on Linux (where removing or renaming a directory needs write access to its parent): the Seatbelt profile denies `file-write-unlink` on the root alone, in each spelling the grant's write rules use, so `rmdir R` and `mv R elsewhere` fail with EPERM while writing, removing and renaming inside R are unchanged; a root whose parent lies within a directory write grant stays removable, and single-file grants are unchanged (upstream draft not filed)

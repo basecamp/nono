@@ -1,0 +1,346 @@
+# Rebuilds `integration` from the upstream nolabs-ai/nono `main` commit pinned in
+# .github/integration/upstream and the topic branches in .github/integration/topics
+# (.github/integration/rebuild, see INTEGRATION.md), daily and after every change to this branch,
+# then starts build-integration.yml on the result.
+#
+# A pin that is unreadable or not on upstream main, a topic branch that is missing or does not
+# merge, or a push that is refused, stops the rebuild: nothing is pushed or built, and one issue
+# labelled integration-rebuild stays open until a rebuild succeeds (it needs Issues turned on for
+# this repository).
+#
+# Then it tries upstream main's tip (rebuild --try-upstream, which pushes nothing). When every
+# topic branch merges onto it in order, it force-pushes integration-upstream-bump, one commit on
+# integration that changes only the pin, and opens or updates one pull request from it, labelled
+# integration-upstream; merging that rebuilds on the new pin. When one does not merge, one issue
+# labelled integration-upstream names the topic branch and its files, the pin stays, and an open
+# bump pull request is closed. A run that reaches no verdict (a fetch failed, integration moved
+# during the trial, the trial was cancelled or timed out, the proposal failed) leaves the bump as
+# it is: its body names the run and the topic commits it was tried on, and what guards it is the
+# rebuild its merge starts, which stops (nothing pushed or built, the integration-rebuild issue naming the topic)
+# when the recipe no longer merges onto the new pin. It is opened with GITHUB_TOKEN, so it needs "Allow GitHub Actions to create and approve pull requests"
+# (Settings > Actions > General); without it the issue says so.
+#
+# The push: GITHUB_TOKEN unless the INTEGRATION_PUSH_TOKEN secret is set (a fine-grained token or
+# GitHub App token for basecamp/nono only, Contents and Workflows read/write). GitHub refuses a
+# GITHUB_TOKEN push that changes files under .github/workflows; when a rebuild needs one, the
+# issue says so. The same token pushes integration-upstream-bump. Set the secret on the
+# integration-rebuild environment, with integration as its only deployment branch, so no other
+# branch's workflow can read it.
+name: Rebuild integration
+
+on:
+  schedule:
+    - cron: "17 5 * * *"
+  push:
+    branches: [integration]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: integration-rebuild
+  cancel-in-progress: false
+
+jobs:
+  rebuild:
+    if: github.repository == 'basecamp/nono' && github.ref == 'refs/heads/integration'
+    name: Rebuild
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: integration-rebuild
+    permissions:
+      contents: write # force-push integration (GITHUB_TOKEN, when INTEGRATION_PUSH_TOKEN is unset)
+      actions: write # start build-integration.yml on the result
+    outputs:
+      sha: ${{ steps.rebuild.outputs.sha }}
+      changed: ${{ steps.rebuild.outputs.changed }}
+      reason: ${{ steps.reason.outputs.reason }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Rebuild and push
+        id: rebuild
+        env:
+          GH_TOKEN: ${{ secrets.INTEGRATION_PUSH_TOKEN || github.token }}
+          REBUILD_REASON_FILE: ${{ runner.temp }}/reason
+          GIT_AUTHOR_NAME: github-actions[bot]
+          GIT_AUTHOR_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+          GIT_COMMITTER_NAME: github-actions[bot]
+          GIT_COMMITTER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+        run: |
+          set -euo pipefail
+          gh auth setup-git
+          .github/integration/rebuild --push | tee -a "$GITHUB_OUTPUT"
+
+      # Whenever integration's tip has no release and no build queued or running, not only when this
+      # run changed it: a dispatch that failed after an earlier push is retried by the next run.
+      - name: Start the build
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SHA: ${{ steps.rebuild.outputs.sha }}
+        run: |
+          set -euo pipefail
+          tag="integration-${SHA:0:12}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "$tag is already built"
+          elif [ -n "$(gh run list --workflow build-integration.yml --commit "$SHA" --limit 20 \
+                         --json status --jq '.[] | select(.status != "completed") | .status')" ]; then
+            echo "a build of ${SHA:0:12} is queued or running"
+          else
+            gh workflow run build-integration.yml --ref integration
+            echo "started build-integration.yml on ${SHA:0:12}"
+          fi
+
+      - name: Reason
+        id: reason
+        if: failure()
+        env:
+          REASON_FILE: ${{ runner.temp }}/reason
+          REBUILT: ${{ steps.rebuild.outcome }}
+          SHA: ${{ steps.rebuild.outputs.sha }}
+        run: |
+          set -euo pipefail
+          reason="the rebuild failed before it could say why"
+          [ "$REBUILT" != success ] || reason="integration was pushed at ${SHA:0:12}, but starting build-integration.yml on it failed: start it by hand"
+          [ ! -s "$REASON_FILE" ] || reason="$(head -1 "$REASON_FILE")"
+          printf 'reason=%s\n' "$reason" >> "$GITHUB_OUTPUT"
+
+  report:
+    needs: rebuild
+    if: always() && github.repository == 'basecamp/nono' && github.ref == 'refs/heads/integration' && (needs.rebuild.result == 'success' || needs.rebuild.result == 'failure')
+    name: Report
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read # check out .github/integration/issue
+      issues: write # open, comment on and close the integration-rebuild issue
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/integration
+
+      - name: Open, update or close the issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RESULT: ${{ needs.rebuild.result }}
+          REASON: ${{ needs.rebuild.outputs.reason }}
+          SHA: ${{ needs.rebuild.outputs.sha }}
+          CHANGED: ${{ needs.rebuild.outputs.changed }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          if [ "$RESULT" = success ]; then
+            what="integration is at ${SHA:0:12}"; [ "$CHANGED" = true ] && what="rebuilt integration at ${SHA:0:12}"
+            .github/integration/issue integration-rebuild success "$what ([run]($RUN_URL))."
+          else
+            .github/integration/issue integration-rebuild failure "Rebuilding integration failed" \
+              "$(date -u +%F): $REASON ([run]($RUN_URL)). Nothing was pushed or built; integration stays where it was."
+          fi
+
+  # Every run, after the rebuild whatever its result: a trial needs no pushed integration, and a run
+  # after the rebuild bases the proposal on the integration it just pushed.
+  try-upstream:
+    needs: rebuild
+    if: always() && github.repository == 'basecamp/nono' && github.ref == 'refs/heads/integration'
+    name: Try upstream main
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read # check out .github/integration (upstream and the fork are fetched anonymously)
+    outputs:
+      base: ${{ steps.try.outputs.base }}
+      pin: ${{ steps.try.outputs.pin }}
+      layer: ${{ steps.try.outputs.layer }}
+      topics: ${{ steps.try.outputs.topics }}
+      reason: ${{ steps.reason.outputs.reason }}
+      verdict: ${{ steps.reason.outputs.verdict }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Merge every topic branch onto upstream main's tip
+        id: try
+        env:
+          REBUILD_REASON_FILE: ${{ runner.temp }}/reason
+          GIT_AUTHOR_NAME: github-actions[bot]
+          GIT_AUTHOR_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+          GIT_COMMITTER_NAME: github-actions[bot]
+          GIT_COMMITTER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+        run: |
+          set -euo pipefail
+          .github/integration/rebuild --try-upstream | tee -a "$GITHUB_OUTPUT"
+
+      # A reason is a verdict: rebuild writes one only when the recipe does not merge onto the tip
+      # or cannot be read (exit 1), never when a fetch failed (exit 2) or the job broke first.
+      - name: Reason
+        id: reason
+        if: failure()
+        env:
+          REASON_FILE: ${{ runner.temp }}/reason
+        run: |
+          set -euo pipefail
+          reason="the trial failed before it reached a verdict" verdict=none
+          [ ! -s "$REASON_FILE" ] || reason="$(head -1 "$REASON_FILE")" verdict=fails
+          printf 'reason=%s\nverdict=%s\n' "$reason" "$verdict" >> "$GITHUB_OUTPUT"
+
+  propose:
+    needs: try-upstream
+    if: always() && github.repository == 'basecamp/nono' && github.ref == 'refs/heads/integration' && (needs.try-upstream.result == 'success' || needs.try-upstream.result == 'failure')
+    name: Propose the pin
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: integration-rebuild
+    permissions:
+      contents: write # push integration-upstream-bump (GITHUB_TOKEN, when INTEGRATION_PUSH_TOKEN is unset)
+      pull-requests: write # open, update or close the pull request from it
+      issues: write # label it; open, comment on and close the integration-upstream issue
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/integration
+
+      - name: Push the bump and open or update its pull request
+        id: propose
+        if: needs.try-upstream.result == 'success'
+        env:
+          PUSH_TOKEN: ${{ secrets.INTEGRATION_PUSH_TOKEN || github.token }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          BASE: ${{ needs.try-upstream.outputs.base }}
+          PIN: ${{ needs.try-upstream.outputs.pin }}
+          LAYER: ${{ needs.try-upstream.outputs.layer }}
+          TOPICS: ${{ needs.try-upstream.outputs.topics }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          REASON_FILE: ${{ runner.temp }}/reason
+          GIT_AUTHOR_NAME: github-actions[bot]
+          GIT_AUTHOR_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+          GIT_COMMITTER_NAME: github-actions[bot]
+          GIT_COMMITTER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+        run: |
+          set -euo pipefail
+          fail() { printf '%s\n' "$1" > "$REASON_FILE"; echo "::error::$1"; exit 1; }
+          pin_file=.github/integration/upstream bump=integration-upstream-bump
+          git fetch -q --no-tags --depth 1 "https://github.com/$GH_REPO.git" "+refs/heads/integration:refs/integration/tip"
+          tip="$(git rev-parse refs/integration/tip)"
+          # The trial's verdict holds only for the pin and recipe it read: a carry PR merged since
+          # may add a topic that does not merge onto BASE.
+          if [ "$tip" != "$LAYER" ]; then
+            echo "::notice::integration moved from ${LAYER:0:12} to ${tip:0:12} during the trial: the next run proposes"
+            echo deferred=true >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          open="$(gh api "repos/$GH_REPO/pulls?state=open&base=integration&head=${GH_REPO%%/*}:$bump" --jq '.[0].number // empty')"
+          if [ "$BASE" = "$PIN" ]; then
+            echo "integration is pinned at upstream main's tip ${PIN:0:12}"
+            if [ -n "$open" ]; then
+              gh api "repos/$GH_REPO/issues/$open/comments" -f body="integration is pinned at upstream main's tip ${PIN:0:12}: nothing to move." >/dev/null
+              gh api -X PATCH "repos/$GH_REPO/pulls/$open" -f state=closed >/dev/null
+              echo "closed #$open"
+            fi
+            exit 0
+          fi
+
+          # The same integration and tip make the same commit (its dates are integration's), so an
+          # unchanged proposal pushes nothing and leaves the pull request and its reviews alone.
+          git -c advice.detachedHead=false checkout -q --detach "$tip"
+          GIT_AUTHOR_DATE="$(git log -1 --format=%cI "$tip")" GIT_COMMITTER_DATE="$GIT_AUTHOR_DATE"
+          export GIT_AUTHOR_DATE GIT_COMMITTER_DATE
+          sed -i -E "s/^[0-9a-f]{40}$/$BASE/" "$pin_file"
+          [ "$(git diff --name-only)" = "$pin_file" ] || fail "could not rewrite the pin in $pin_file at ${tip:0:12}"
+          compare="https://github.com/nolabs-ai/nono/compare/$PIN...$BASE"
+          title="Pin upstream main at ${BASE:0:12}"
+          git commit -q -a -m "$title" -m "Every topic branch in .github/integration/topics merges onto nolabs-ai/nono main $BASE in order. Was $PIN: $compare"
+          new="$(git rev-parse HEAD)"
+          # Push only a changed proposal; the title, body and label are reconciled every run, so one
+          # that failed partway is finished by the next.
+          if [ -n "$open" ] && [ "$(gh api "repos/$GH_REPO/pulls/$open" --jq .head.sha)" = "$new" ]; then
+            echo "#$open already proposes ${BASE:0:12} on integration ${tip:0:12}"
+          else
+            # gh's credential helper reads GH_TOKEN when git asks, so the push carries it, not setup-git.
+            gh auth setup-git
+            err="$(GH_TOKEN="$PUSH_TOKEN" git push -q --force "https://github.com/$GH_REPO.git" "HEAD:refs/heads/$bump" 2>&1)" \
+              || fail "pushing $bump was refused: $(printf '%s' "$err" | tr '\n' ' ' | cut -c1-300)"
+          fi
+
+          tried=""
+          for bt in $TOPICS; do tried="$tried"$'\n'"- \`${bt%@*}\` at \`${bt##*@}\`"; done
+          body="$(printf '%s\n\n%s%s\n\n%s\n\n%s\n' \
+            "Moves the pin in \`$pin_file\` from \`${PIN:0:12}\` to upstream main's tip \`${BASE:0:12}\` ([what changed upstream]($compare))." \
+            "[This run]($RUN_URL)'s trial merged every topic branch in \`.github/integration/topics\` onto it, in order:" "$tried" \
+            "Merging it rebuilds \`integration\` on the new pin. If a topic has moved since and no longer merges, that rebuild stops: nothing is pushed or built, and the integration-rebuild issue names the topic. Each later trial that succeeds refreshes this; one that fails closes it." \
+            "Opened by rebuild-integration.yml.")"
+          if [ -z "$open" ]; then
+            out="$(gh api "repos/$GH_REPO/pulls" -f title="$title" -f head="$bump" -f base=integration -f body="$body" --jq .number 2>&1)" || {
+              hint=""
+              case "$out" in *"not permitted to create"*) hint=" (turn on Settings > Actions > General > Allow GitHub Actions to create and approve pull requests)" ;; esac
+              fail "opening the pull request from $bump was refused: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-300)$hint"
+            }
+            open="$out"
+            echo "opened #$open"
+          elif [ "$(gh api "repos/$GH_REPO/pulls/$open" --jq '.title + "\n" + .body')" != "$title"$'\n'"$body" ]; then
+            gh api -X PATCH "repos/$GH_REPO/pulls/$open" -f title="$title" -f body="$body" >/dev/null
+            echo "updated #$open"
+          fi
+          gh label create integration-upstream -R "$GH_REPO" --color 0e8a16 --force \
+            --description "Opened and closed by the integration workflows" >/dev/null
+          gh api "repos/$GH_REPO/issues/$open/labels" -f 'labels[]=integration-upstream' >/dev/null
+
+      # Only a verdict changes the bump: a trial that succeeds refreshes it (above), one that fails
+      # closes it. A run with none (a fetch failed, integration moved during the trial, the proposal
+      # failed, the trial cancelled or timed out, which skips this job) leaves it as its body
+      # describes it; merging it rebuilds, and that rebuild stops when the recipe no longer merges
+      # onto the new pin.
+      - name: Close the bump when upstream's tip does not merge
+        if: always() && needs.try-upstream.outputs.verdict == 'fails'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          bump=integration-upstream-bump
+          open="$(gh api "repos/$GH_REPO/pulls?state=open&base=integration&head=${GH_REPO%%/*}:$bump" --jq '.[0].number // empty')"
+          [ -n "$open" ] || exit 0
+          gh api "repos/$GH_REPO/issues/$open/comments" -f body="Closing: upstream main's tip no longer merges with every topic branch (see the integration-upstream issue). The next trial that succeeds opens a new one." >/dev/null
+          gh api -X PATCH "repos/$GH_REPO/pulls/$open" -f state=closed >/dev/null
+          echo "closed #$open"
+
+      - name: Open, update or close the issue
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TRIED: ${{ needs.try-upstream.result }}
+          PROPOSED: ${{ steps.propose.outcome }}
+          DEFERRED: ${{ steps.propose.outputs.deferred }}
+          TRY_REASON: ${{ needs.try-upstream.outputs.reason }}
+          VERDICT: ${{ needs.try-upstream.outputs.verdict }}
+          REASON_FILE: ${{ runner.temp }}/reason
+          BASE: ${{ needs.try-upstream.outputs.base }}
+          PIN: ${{ needs.try-upstream.outputs.pin }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          day="$(date -u +%F)"
+          if [ "$TRIED" != success ] && [ "$VERDICT" = fails ]; then
+            .github/integration/issue integration-upstream failure "Upstream main does not merge: the pin stays" \
+              "$day: $TRY_REASON ([run]($RUN_URL)). Nothing changed; integration stays on its pin."
+          elif [ "$TRIED" != success ]; then
+            .github/integration/issue integration-upstream failure "Upstream main could not be tried: the pin stays" \
+              "$day: $TRY_REASON ([run]($RUN_URL)); see the run's log. Nothing changed; integration stays on its pin, and an open bump stays as it was."
+          elif [ "$DEFERRED" = true ]; then
+            echo "the trial's integration moved on: the next run reports"
+          elif [ "$PROPOSED" != success ]; then
+            reason="proposing the pin failed before it could say why"
+            [ ! -s "$REASON_FILE" ] || reason="$(head -1 "$REASON_FILE")"
+            .github/integration/issue integration-upstream failure "Upstream main merges, but the pin could not be proposed" \
+              "$day: every topic branch merges onto upstream main ${BASE:0:12}, but $reason ([run]($RUN_URL)). integration stays on its pin."
+          else
+            .github/integration/issue integration-upstream success "every topic branch merges onto upstream main ${BASE:0:12} (pinned: ${PIN:0:12}) ([run]($RUN_URL))."
+          fi

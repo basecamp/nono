@@ -1,0 +1,12 @@
+# The upstream nolabs-ai/nono `main` commit that `integration` is rebuilt on, by
+# .github/integration/rebuild: one line, the full 40-hex sha. Upstream moving does not move
+# `integration`; this line does.
+#
+# Each day rebuild-integration.yml tries upstream `main`'s tip. When every topic branch in
+# `topics` merges onto it in order, it opens or updates one pull request, labelled
+# `integration-upstream`, that changes only this line; merging it rebuilds on the new pin. When
+# one does not merge, it opens or updates an issue with that label naming the topic branch and
+# its conflicting files, closes any open bump, and leaves this line alone.
+#
+# A line that is not one 40-hex sha, or a commit not on upstream `main`, stops the rebuild.
+f1e0a7ac2cf44709a2982c07b5ca1273e0d5a9ba
