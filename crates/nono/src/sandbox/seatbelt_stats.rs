@@ -39,8 +39,9 @@ pub(crate) struct SeatbeltRuleKindStats {
 
 /// Break `profile` down by rule kind.
 ///
-/// Bytes outside any form (blank lines, comments, a newline not directly
-/// after a form) are counted in `total_bytes` only. An unbalanced form runs to
+/// Bytes outside any form (blank lines, `;` and `#| |#` comments, a newline
+/// not directly after a form) are counted in `total_bytes` only; a comment
+/// inside a form counts in its bytes and never in its kind. An unbalanced form runs to
 /// the end of the profile.
 pub(crate) fn seatbelt_profile_stats(profile: &str) -> SeatbeltProfileStats {
     let mut by_kind: HashMap<String, (usize, usize)> = HashMap::new();
@@ -79,10 +80,8 @@ fn top_level_forms(profile: &str) -> Vec<(usize, usize)> {
     while i < bytes.len() {
         match bytes[i] {
             b'"' => i = skip_string(bytes, i),
-            b';' => {
-                while i < bytes.len() && bytes[i] != b'\n' {
-                    i += 1;
-                }
+            b';' | b'#' if comment_end(bytes, i) > i => {
+                i = comment_end(bytes, i);
                 continue;
             }
             b'(' => {
@@ -107,6 +106,36 @@ fn top_level_forms(profile: &str) -> Vec<(usize, usize)> {
     forms
 }
 
+/// Index just past the comment starting at `at`: a `;` comment through the
+/// end of its line, a `#|` comment through its `|#` (or the end of the
+/// profile, when it is unterminated). `at` itself when no comment starts
+/// there.
+fn comment_end(bytes: &[u8], at: usize) -> usize {
+    match (bytes.get(at), bytes.get(at + 1)) {
+        (Some(b';'), _) => bytes[at..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(bytes.len(), |n| at + n),
+        (Some(b'#'), Some(b'|')) => bytes[at + 2..]
+            .windows(2)
+            .position(|w| w == b"|#")
+            .map_or(bytes.len(), |n| at + 2 + n + 2),
+        _ => at,
+    }
+}
+
+/// `s` from its first byte that is neither whitespace nor in a comment.
+fn skip_blank(s: &str) -> &str {
+    let mut rest = s.trim_start();
+    loop {
+        let end = comment_end(rest.as_bytes(), 0);
+        if end == 0 {
+            return rest;
+        }
+        rest = rest[end..].trim_start();
+    }
+}
+
 /// Index of the closing quote of the string opening at `open`, or the last
 /// index when it is unterminated. Backslash escapes the next byte.
 fn skip_string(bytes: &[u8], open: usize) -> usize {
@@ -126,13 +155,13 @@ fn skip_string(bytes: &[u8], open: usize) -> usize {
 fn form_kind(form: &str) -> String {
     let inner = form.strip_prefix('(').unwrap_or(form);
     let mut words: Vec<&str> = Vec::new();
-    let mut rest = inner.trim_start();
+    let mut rest = skip_blank(inner);
     loop {
         if rest.is_empty() || rest.starts_with(')') || rest.starts_with('"') {
             break;
         }
         if let Some(nested) = rest.strip_prefix('(') {
-            let head = symbol(nested.trim_start());
+            let head = symbol(skip_blank(nested));
             if !head.is_empty() {
                 words.push(head);
             }
@@ -143,7 +172,7 @@ fn form_kind(form: &str) -> String {
             break;
         }
         words.push(word);
-        rest = rest[word.len()..].trim_start();
+        rest = skip_blank(&rest[word.len()..]);
     }
     if words.is_empty() {
         "(empty)".to_string()
@@ -152,10 +181,11 @@ fn form_kind(form: &str) -> String {
     }
 }
 
-/// The symbol at the start of `s`: up to whitespace, a paren or a quote.
+/// The symbol at the start of `s`: up to whitespace, a paren, a quote or a
+/// `;` comment.
 fn symbol(s: &str) -> &str {
     let end = s
-        .find(|c: char| c.is_whitespace() || c == '(' || c == ')' || c == '"')
+        .find(|c: char| c.is_whitespace() || c == '(' || c == ')' || c == '"' || c == ';')
         .unwrap_or(s.len());
     &s[..end]
 }
@@ -271,6 +301,46 @@ mod tests {
             kind(&stats, "allow process-fork").bytes,
             "(allow process-fork)\n".len()
         );
+    }
+
+    #[test]
+    fn block_comments_are_not_structure() {
+        // Outside a form, and inside one, parens in a `#| |#` comment are
+        // neither a form nor a kind.
+        let profile = "#| (allow phantom) |#\n(allow process-fork) #| (deny x) |#\n(allow #| ) (phantom) |# process-exec)\n";
+        let stats = seatbelt_profile_stats(profile);
+        assert_eq!(stats.rules, 2);
+        assert_eq!(kind(&stats, "allow process-fork").count, 1);
+        assert_eq!(kind(&stats, "allow process-exec").count, 1);
+        assert_eq!(
+            kind(&stats, "allow process-exec").bytes,
+            "(allow #| ) (phantom) |# process-exec)\n".len()
+        );
+        assert!(stats.kinds.iter().all(|k| !k.kind.contains("phantom")));
+        // An unterminated one runs to the end, and hides what follows.
+        assert_eq!(
+            seatbelt_profile_stats("(allow process-fork)\n#| (allow x)").rules,
+            1
+        );
+        // A `#` that opens no comment is an ordinary byte.
+        let hash = seatbelt_profile_stats("(allow mach-lookup (global-name \"a#b\")) (allow #t)\n");
+        assert_eq!(hash.rules, 2);
+        assert_eq!(kind(&hash, "allow #t").count, 1);
+    }
+
+    #[test]
+    fn comments_inside_a_form_are_not_in_its_kind() {
+        let profile = "\
+(allow file-read* ; why\n (subpath \"/usr\"))
+(allow file-read* #| why |# (subpath \"/opt\"))
+(allow file-read*;why\n (subpath \"/a\"))
+(allow file-read* ( ; first\n subpath \"/b\"))
+(allow file-read* (subpath \"/c\"))
+";
+        let stats = seatbelt_profile_stats(profile);
+        assert_eq!(stats.rules, 5);
+        assert_eq!(stats.kinds.len(), 1, "{:?}", stats.kinds);
+        assert_eq!(kind(&stats, "allow file-read* subpath").count, 5);
     }
 
     #[test]
