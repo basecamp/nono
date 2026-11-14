@@ -19,6 +19,11 @@ mod metadata;
 #[cfg(target_os = "macos")]
 mod macos;
 
+// Seatbelt profile size by rule kind, for macOS's debug log. Pure text
+// analysis, so its tests run on every platform.
+#[cfg(any(target_os = "macos", test))]
+mod seatbelt_stats;
+
 // Re-export macOS extension functions for supervisor use
 #[cfg(target_os = "macos")]
 pub use macos::{extension_consume, extension_issue_file, extension_release};

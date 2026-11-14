@@ -946,6 +946,21 @@ pub(crate) fn generate_profile(caps: &CapabilitySet) -> Result<String> {
     Ok(profile)
 }
 
+/// Log the profile's size by rule kind, largest first, so the bytes
+/// `sandbox_init` compiles can be attributed. Reads the profile only.
+fn log_profile_stats(profile: &str) {
+    let stats = super::seatbelt_stats::seatbelt_profile_stats(profile);
+    debug!(
+        "Seatbelt profile: {} bytes, {} rules, {} kinds (bytes, rules, kind):",
+        stats.total_bytes,
+        stats.rules,
+        stats.kinds.len()
+    );
+    for kind in &stats.kinds {
+        debug!("  {:>9} {:>7}  {}", kind.bytes, kind.count, kind.kind);
+    }
+}
+
 /// Apply Seatbelt sandbox with the given capabilities
 ///
 /// This is a pure primitive - it applies ONLY the capabilities provided.
@@ -954,11 +969,15 @@ pub fn apply(caps: &CapabilitySet) -> Result<()> {
     let profile = generate_profile(caps)?;
 
     debug!("Generated Seatbelt profile ({} bytes)", profile.len());
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        log_profile_stats(&profile);
+    }
     let profile_cstr = CString::new(profile)
         .map_err(|e| NonoError::SandboxInit(format!("Invalid profile string: {}", e)))?;
 
     let mut error_buf: *mut c_char = ptr::null_mut();
 
+    let started = std::time::Instant::now();
     // SAFETY: sandbox_init is a stable macOS API. We pass:
     // - A valid null-terminated C string for the profile
     // - 0 for raw profile mode (not a named profile)
@@ -970,6 +989,11 @@ pub fn apply(caps: &CapabilitySet) -> Result<()> {
             &mut error_buf,
         )
     };
+    debug!(
+        "sandbox_init returned {} after {} ms",
+        result,
+        started.elapsed().as_millis()
+    );
 
     if result != 0 {
         let error_msg = if !error_buf.is_null() {
@@ -1407,6 +1431,54 @@ mod tests {
         assert!(escape_path("/path\x0bwith\x0cfeeds").is_err());
         assert!(escape_path("/path\x1bwith\x1bescape").is_err());
         assert!(escape_path("/path\x7fwith\x7fdel").is_err());
+    }
+
+    #[test]
+    fn profile_stats_account_for_every_byte_of_a_generated_profile() {
+        let mut caps = CapabilitySet::new();
+        for (path, access) in [
+            ("/test-read", AccessMode::Read),
+            ("/test-write", AccessMode::Write),
+            ("/test-readwrite", AccessMode::ReadWrite),
+        ] {
+            caps.add_fs(FsCapability {
+                original: PathBuf::from(path),
+                resolved: PathBuf::from(path),
+                access,
+                is_file: false,
+                source: CapabilitySource::User,
+            });
+        }
+        caps.add_platform_rule("(deny file-read-data (subpath \"/private/var/db\"))")
+            .unwrap();
+
+        let profile = generate_profile(&caps).unwrap();
+        let stats = super::super::seatbelt_stats::seatbelt_profile_stats(&profile);
+
+        // The generator writes one form per line, so the kinds add up to the
+        // whole profile, and each line is one rule.
+        let sum: usize = stats.kinds.iter().map(|k| k.bytes).sum();
+        assert_eq!(sum, profile.len());
+        assert_eq!(stats.rules, profile.lines().count());
+        // Each directory grant with read access emits these four kinds.
+        for kind in [
+            "allow file-read* subpath",
+            "allow process-exec* subpath",
+            "allow file-map-executable subpath",
+            "allow file-ioctl subpath",
+        ] {
+            assert!(
+                stats.kinds.iter().any(|k| k.kind == kind),
+                "no {kind:?} in {:?}",
+                stats.kinds
+            );
+        }
+        let ioctl = stats
+            .kinds
+            .iter()
+            .find(|k| k.kind == "allow file-ioctl subpath")
+            .unwrap();
+        assert_eq!(ioctl.count, 3);
     }
 
     #[test]
