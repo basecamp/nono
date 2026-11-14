@@ -326,6 +326,7 @@ mod tests {
             upstream_bypass: Vec::new(),
             network_approval_backends: std::collections::BTreeMap::new(),
             network_approval_defaults: None,
+            resolved_addresses: Default::default(),
             listen_ports: Vec::new(),
             capability_elevation: false,
             #[cfg(target_os = "linux")]
@@ -412,6 +413,7 @@ mod tests {
             upstream_bypass: Vec::new(),
             network_approval_backends: std::collections::BTreeMap::new(),
             network_approval_defaults: None,
+            resolved_addresses: Default::default(),
             listen_ports: Vec::new(),
             capability_elevation: false,
             #[cfg(target_os = "linux")]
