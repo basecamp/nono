@@ -405,10 +405,31 @@ fn cmd_guide(_args: ProfileGuideArgs) -> Result<()> {
 pub(crate) fn cmd_groups(args: ProfileGroupsArgs) -> Result<()> {
     let pol = policy::load_embedded_policy()?;
 
-    match args.name {
-        Some(name) => cmd_groups_detail(&pol, &name, args.json),
-        None => cmd_groups_list(&pol, args.json, args.all_platforms),
+    if args.names.is_empty() {
+        return cmd_groups_list(&pol, args.json, args.all_platforms);
     }
+
+    // Several names print each name's own output in turn, so a caller that
+    // asks for many groups in one process can split the answer back into
+    // exactly what one `profile groups NAME` call prints for each. Every name
+    // is checked first: an unknown one fails the call with nothing printed.
+    if let Some(unknown) = args.names.iter().find(|n| !pol.groups.contains_key(*n)) {
+        return Err(group_not_found(unknown));
+    }
+    for (i, name) in args.names.iter().enumerate() {
+        if i > 0 && !args.json {
+            println!();
+        }
+        cmd_groups_detail(&pol, name, args.json)?;
+    }
+    Ok(())
+}
+
+fn group_not_found(name: &str) -> NonoError {
+    NonoError::ProfileParse(format!(
+        "group '{}' not found in policy.json. Use `nono profile groups` to list available groups",
+        name
+    ))
 }
 
 fn cmd_groups_list(pol: &policy::Policy, json: bool, all_platforms: bool) -> Result<()> {
@@ -466,12 +487,7 @@ fn cmd_groups_list(pol: &policy::Policy, json: bool, all_platforms: bool) -> Res
 }
 
 fn cmd_groups_detail(pol: &policy::Policy, name: &str, json: bool) -> Result<()> {
-    let group = pol.groups.get(name).ok_or_else(|| {
-        NonoError::ProfileParse(format!(
-            "group '{}' not found in policy.json. Use `nono profile groups` to list available groups",
-            name
-        ))
-    })?;
+    let group = pol.groups.get(name).ok_or_else(|| group_not_found(name))?;
 
     if json {
         let val = group_to_json(name, group);
