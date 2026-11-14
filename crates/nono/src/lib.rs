@@ -90,7 +90,7 @@ pub use keystore::{
     validate_apple_password_uri, validate_bw_uri, validate_destination_env_var, validate_env_uri,
     validate_file_uri, validate_keyring_uri, validate_op_uri,
 };
-pub use net_filter::{FilterResult, HostFilter};
+pub use net_filter::{AddressClass, FilterResult, HostFilter, address_class};
 pub use path::try_canonicalize;
 pub use resource::ResourceLimits;
 #[cfg(target_os = "linux")]
