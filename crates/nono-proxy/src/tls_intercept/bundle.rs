@@ -54,12 +54,12 @@ pub struct BundleInputs<'a> {
 /// * unable to create the file with restrictive permissions
 /// * unable to write
 pub fn write_bundle(inputs: BundleInputs<'_>) -> Result<PathBuf> {
-    write_bundle_with_roots(inputs, crate::native_roots::native_roots())
+    write_bundle_with_roots(inputs, crate::native_roots::TrustRoots::new().native())
 }
 
-/// [`write_bundle`] with the system trust store supplied, so tests can stand
-/// in an empty or failing one.
-fn write_bundle_with_roots(
+/// [`write_bundle`] with the system trust store supplied: the proxy start's
+/// snapshot, which its connectors share, or in tests an empty or failing one.
+pub(crate) fn write_bundle_with_roots(
     inputs: BundleInputs<'_>,
     system_certs: &crate::native_roots::NativeRoots,
 ) -> Result<PathBuf> {

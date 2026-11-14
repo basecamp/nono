@@ -253,6 +253,23 @@ impl RouteStore {
         routes: &[RouteConfig],
         secret_registry: Option<&crate::secret_registry::SecretRegistry>,
     ) -> Result<Self> {
+        Self::load_with_roots(
+            routes,
+            secret_registry,
+            &crate::native_roots::TrustRoots::new(),
+        )
+        .await
+    }
+
+    /// Like [`Self::load_with_registry`], with the trust store taken from
+    /// `roots`: the proxy start's snapshot, which the server's upstream
+    /// connector and the intercept bundle share. It is loaded only when a
+    /// route needs a connector of its own.
+    pub(crate) async fn load_with_roots(
+        routes: &[RouteConfig],
+        secret_registry: Option<&crate::secret_registry::SecretRegistry>,
+        roots: &crate::native_roots::TrustRoots,
+    ) -> Result<Self> {
         let mut loaded = HashMap::new();
 
         // Two different routes under one prefix would leave only the last one
@@ -311,6 +328,7 @@ impl RouteStore {
                     route.tls_client_cert.is_some(),
                 );
                 let (connector, config) = build_tls_connector(
+                    roots,
                     route.tls_ca.as_deref(),
                     route.tls_client_cert.as_deref(),
                     route.tls_client_key.as_deref(),
@@ -991,18 +1009,18 @@ pub(crate) fn add_ca_file_to_store(
 }
 
 /// Build a per-route `TlsConnector`, optionally adding a custom CA
-/// and/or mTLS client certificate on top of the process's shared base root
-/// store (webpki roots plus the OS trust store, see [`crate::native_roots`]).
-/// Only a route with a custom CA gets a store of its own; the rest share the
-/// base store.
+/// and/or mTLS client certificate on top of `roots`' base root store (webpki
+/// roots plus the OS trust store, see [`crate::native_roots`]). Only a route
+/// with a custom CA gets a store of its own; the rest share the base store.
 /// Returns both the connector and the underlying `Arc<ClientConfig>` so the
 /// upstream pool can build per-route pooled clients.
 fn build_tls_connector(
+    roots: &crate::native_roots::TrustRoots,
     ca_path: Option<&str>,
     client_cert_path: Option<&str>,
     client_key_path: Option<&str>,
 ) -> Result<(tokio_rustls::TlsConnector, Arc<rustls::ClientConfig>)> {
-    let root_store = route_root_store(ca_path)?;
+    let root_store = route_root_store(roots, ca_path)?;
 
     let builder = rustls::ClientConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
@@ -1093,10 +1111,13 @@ fn build_tls_connector(
     Ok((connector, config_arc))
 }
 
-/// The roots a route's connector trusts: the shared base store, or a copy of
-/// it with the route's custom CA added.
-fn route_root_store(ca_path: Option<&str>) -> Result<Arc<rustls::RootCertStore>> {
-    let base = crate::native_roots::base_root_store();
+/// The roots a route's connector trusts: `roots`' base store, or a copy of it
+/// with the route's custom CA added.
+fn route_root_store(
+    roots: &crate::native_roots::TrustRoots,
+    ca_path: Option<&str>,
+) -> Result<Arc<rustls::RootCertStore>> {
+    let base = roots.base_root_store();
     match ca_path {
         Some(ca_path) => {
             let mut root_store = rustls::RootCertStore::clone(&base);
@@ -1110,7 +1131,12 @@ fn route_root_store(ca_path: Option<&str>) -> Result<Arc<rustls::RootCertStore>>
 /// Compatibility shim: build a connector with only a custom CA (no client cert).
 #[cfg(test)]
 fn build_tls_connector_with_ca(ca_path: &str) -> Result<tokio_rustls::TlsConnector> {
-    let (connector, _config) = build_tls_connector(Some(ca_path), None, None)?;
+    let (connector, _config) = build_tls_connector(
+        &crate::native_roots::TrustRoots::new(),
+        Some(ca_path),
+        None,
+        None,
+    )?;
     Ok(connector)
 }
 
@@ -1174,6 +1200,7 @@ mod tests {
     }
     use super::*;
     use crate::config::EndpointRule;
+    use crate::native_roots::TrustRoots;
 
     #[test]
     fn test_empty_route_store() {
@@ -2439,8 +2466,9 @@ AAAAAAAICAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
 
     #[test]
     fn route_without_ca_shares_the_base_root_store() {
-        let roots = route_root_store(None).unwrap();
-        assert!(Arc::ptr_eq(&roots, &crate::native_roots::base_root_store()));
+        let roots = TrustRoots::new();
+        let store = route_root_store(&roots, None).unwrap();
+        assert!(Arc::ptr_eq(&store, &roots.base_root_store()));
     }
 
     #[test]
@@ -2450,15 +2478,16 @@ AAAAAAAICAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
         let ca_path = dir.path().join("ca.pem");
         std::fs::write(&ca_path, ca.cert_pem()).unwrap();
 
-        let base = crate::native_roots::base_root_store();
+        let trust = TrustRoots::new();
+        let base = trust.base_root_store();
         let base_len = base.len();
-        let roots = route_root_store(Some(ca_path.to_str().unwrap())).unwrap();
+        let roots = route_root_store(&trust, Some(ca_path.to_str().unwrap())).unwrap();
 
         assert!(!Arc::ptr_eq(&roots, &base));
         assert_eq!(roots.len(), base_len + 1);
         assert_eq!(roots.roots[..base_len], base.roots[..]);
         // The route's CA is added to its own copy, never to the shared store.
-        assert_eq!(crate::native_roots::base_root_store().len(), base_len);
+        assert_eq!(trust.base_root_store().len(), base_len);
     }
 
     #[tokio::test]
@@ -2467,7 +2496,8 @@ AAAAAAAICAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
         let dir = tempfile::tempdir().unwrap();
         let ca_path = dir.path().join("ca.pem");
         std::fs::write(&ca_path, ca.cert_pem()).unwrap();
-        let base_len = crate::native_roots::base_root_store().len();
+        let trust = TrustRoots::new();
+        let base_len = trust.base_root_store().len();
 
         let route: RouteConfig = serde_json::from_value(serde_json::json!({
             "prefix": "internal",
@@ -2475,10 +2505,12 @@ AAAAAAAICAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
             "tls_ca": ca_path.to_str().unwrap(),
         }))
         .unwrap();
-        let store = RouteStore::load(&[route]).await.unwrap();
+        let store = RouteStore::load_with_roots(&[route], None, &trust)
+            .await
+            .unwrap();
 
         assert!(store.get("internal").unwrap().tls_connector.is_some());
-        assert_eq!(crate::native_roots::base_root_store().len(), base_len);
+        assert_eq!(trust.base_root_store().len(), base_len);
     }
 
     #[test]
@@ -2566,7 +2598,12 @@ h56ZLEEqHfVWFhJWIKRSabtxYPV/VJyMv+lo3L0QwSKsouHs3dtF1zVQ
         let cert_path = dir.path().join("client.crt");
         std::fs::write(&cert_path, TEST_CLIENT_CERT_PEM).unwrap();
 
-        let result = build_tls_connector(None, Some(cert_path.to_str().unwrap()), None);
+        let result = build_tls_connector(
+            &TrustRoots::new(),
+            None,
+            Some(cert_path.to_str().unwrap()),
+            None,
+        );
         let err = result
             .err()
             .expect("should fail with half-pair")
@@ -2584,7 +2621,12 @@ h56ZLEEqHfVWFhJWIKRSabtxYPV/VJyMv+lo3L0QwSKsouHs3dtF1zVQ
         let key_path = dir.path().join("client.key");
         std::fs::write(&key_path, TEST_CLIENT_KEY_PEM).unwrap();
 
-        let result = build_tls_connector(None, None, Some(key_path.to_str().unwrap()));
+        let result = build_tls_connector(
+            &TrustRoots::new(),
+            None,
+            None,
+            Some(key_path.to_str().unwrap()),
+        );
         let err = result
             .err()
             .expect("should fail with half-pair")
@@ -2603,6 +2645,7 @@ h56ZLEEqHfVWFhJWIKRSabtxYPV/VJyMv+lo3L0QwSKsouHs3dtF1zVQ
         std::fs::write(&key_path, TEST_CLIENT_KEY_PEM).unwrap();
 
         let result = build_tls_connector(
+            &TrustRoots::new(),
             None,
             Some("/nonexistent/client.crt"),
             Some(key_path.to_str().unwrap()),
@@ -2622,6 +2665,7 @@ h56ZLEEqHfVWFhJWIKRSabtxYPV/VJyMv+lo3L0QwSKsouHs3dtF1zVQ
         std::fs::write(&cert_path, TEST_CLIENT_CERT_PEM).unwrap();
 
         let result = build_tls_connector(
+            &TrustRoots::new(),
             None,
             Some(cert_path.to_str().unwrap()),
             Some("/nonexistent/client.key"),
@@ -2650,6 +2694,7 @@ h56ZLEEqHfVWFhJWIKRSabtxYPV/VJyMv+lo3L0QwSKsouHs3dtF1zVQ
         }
 
         let result = build_tls_connector(
+            &TrustRoots::new(),
             None,
             Some(cert_path.to_str().unwrap()),
             Some("/nonexistent/key"),
@@ -2671,6 +2716,7 @@ h56ZLEEqHfVWFhJWIKRSabtxYPV/VJyMv+lo3L0QwSKsouHs3dtF1zVQ
         std::fs::write(&key_path, TEST_CLIENT_KEY_PEM).unwrap();
 
         let result = build_tls_connector(
+            &TrustRoots::new(),
             None,
             Some(cert_path.to_str().unwrap()),
             Some(key_path.to_str().unwrap()),
@@ -2693,6 +2739,7 @@ h56ZLEEqHfVWFhJWIKRSabtxYPV/VJyMv+lo3L0QwSKsouHs3dtF1zVQ
         std::fs::write(&key_path, "not a key\n").unwrap();
 
         let result = build_tls_connector(
+            &TrustRoots::new(),
             None,
             Some(cert_path.to_str().unwrap()),
             Some(key_path.to_str().unwrap()),
