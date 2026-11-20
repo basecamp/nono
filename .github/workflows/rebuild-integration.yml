@@ -17,8 +17,10 @@
 # during the trial, the trial was cancelled or timed out, the proposal failed) leaves the bump as
 # it is: its body names the run and the topic commits it was tried on, and what guards it is the
 # rebuild its merge starts, which stops (nothing pushed or built, the integration-rebuild issue naming the topic)
-# when the recipe no longer merges onto the new pin. It is opened with GITHUB_TOKEN, so it needs "Allow GitHub Actions to create and approve pull requests"
-# (Settings > Actions > General); without it the issue says so.
+# when the recipe no longer merges onto the new pin. The basecamp org doesn't let GITHUB_TOKEN
+# create pull requests, so it is opened with a token for the org's PR bot App (org variable
+# PR_BOT_CLIENT_ID, org secret PR_BOT_PRIVATE_KEY, the App installed here), scoped to this
+# repository and to pull requests only; GITHUB_TOKEN still updates, labels and closes it.
 #
 # The push: GITHUB_TOKEN unless the INTEGRATION_PUSH_TOKEN secret is set (a fine-grained token or
 # GitHub App token for basecamp/nono only, Contents and Workflows read/write). GitHub refuses a
@@ -206,11 +208,24 @@ jobs:
           persist-credentials: false
           sparse-checkout: .github/integration
 
+      # Opens the bump's pull request: the org doesn't let GITHUB_TOKEN create one.
+      - name: Mint the PR bot token
+        id: pr-bot
+        if: needs.try-upstream.result == 'success'
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.PR_BOT_CLIENT_ID }}
+          private-key: ${{ secrets.PR_BOT_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-pull-requests: write
+
       - name: Push the bump and open or update its pull request
         id: propose
         if: needs.try-upstream.result == 'success'
         env:
           PUSH_TOKEN: ${{ secrets.INTEGRATION_PUSH_TOKEN || github.token }}
+          PR_BOT_TOKEN: ${{ steps.pr-bot.outputs.token }}
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           BASE: ${{ needs.try-upstream.outputs.base }}
@@ -277,9 +292,9 @@ jobs:
             "Merging it rebuilds \`integration\` on the new pin. If a topic has moved since and no longer merges, that rebuild stops: nothing is pushed or built, and the integration-rebuild issue names the topic. Each later trial that succeeds refreshes this; one that fails closes it." \
             "Opened by rebuild-integration.yml.")"
           if [ -z "$open" ]; then
-            out="$(gh api "repos/$GH_REPO/pulls" -f title="$title" -f head="$bump" -f base=integration -f body="$body" --jq .number 2>&1)" || {
+            out="$(GH_TOKEN="$PR_BOT_TOKEN" gh api "repos/$GH_REPO/pulls" -f title="$title" -f head="$bump" -f base=integration -f body="$body" --jq .number 2>&1)" || {
               hint=""
-              case "$out" in *"not permitted to create"*) hint=" (turn on Settings > Actions > General > Allow GitHub Actions to create and approve pull requests)" ;; esac
+              case "$out" in *"Resource not accessible by integration"*) hint=" (check that the PR bot App is installed on this repository with pull requests: write)" ;; esac
               fail "opening the pull request from $bump was refused: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-300)$hint"
             }
             open="$out"
