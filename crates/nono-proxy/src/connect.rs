@@ -808,7 +808,21 @@ async fn write_upstream_failure<S: AsyncWrite + Unpin>(
         port,
         reason,
     );
-    send_response(stream, 502, &format!("Upstream connect failed: {}", reason)).await
+    // The status line is unchanged; the body names the host the client asked
+    // for and the cause in fixed words (never `reason`, which can carry a
+    // resolved address).
+    let body =
+        crate::upstream_failure::UpstreamFailure::of_reason(reason).bad_gateway_body(host, port);
+    let status = format!("Upstream connect failed: {}", reason).replace(['\r', '\n'], " ");
+    let response = format!(
+        "HTTP/1.1 502 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        status,
+        body.len(),
+        body
+    );
+    stream.write_all(response.as_bytes()).await?;
+    stream.flush().await?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -909,6 +923,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn write_upstream_failure_body_names_the_host_and_the_cause() {
+        let (server, client) = duplex(1024);
+        let mut server = server;
+        let reason = "Connection refused (os error 111)";
+
+        write_upstream_failure(&mut server, None, "api.example.com", 443, reason)
+            .await
+            .unwrap();
+        drop(server);
+
+        let body = r#"{"error":"Bad Gateway","message":"nono proxy could not reach api.example.com:443: connection refused"}"#;
+        assert_eq!(
+            read_to_string(client).await,
+            format!(
+                "HTTP/1.1 502 Upstream connect failed: {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+        );
+    }
+
+    #[tokio::test]
     async fn write_upstream_failure_records_audit_entry() {
         let (mut server, _client) = duplex(1024);
         let log = audit::new_audit_log();
@@ -967,12 +1002,18 @@ mod tests {
 
         let response = read_to_string(client).await;
 
-        // The status line must contain neither raw CR nor LF until the
-        // single CRLFCRLF terminator at the end. Response splitting via a
-        // crafted reason string must not be possible.
-        let terminator = "\r\n\r\n";
-        let body_end = response.find(terminator).expect("response must terminate");
-        let status_line = &response[..body_end];
+        // The status line must contain neither raw CR nor LF before its own
+        // CRLF, and only the response's own two headers follow it. Response
+        // splitting via a crafted reason string must not be possible.
+        let head_end = response.find("\r\n\r\n").expect("response must terminate");
+        let mut head = response[..head_end].split("\r\n");
+        let status_line = head.next().unwrap();
+        assert_eq!(
+            head.map(|h| h.split(':').next().unwrap())
+                .collect::<Vec<_>>(),
+            ["Content-Type", "Content-Length"],
+            "only the response's own headers: {response:?}"
+        );
         assert!(
             !status_line.contains('\r'),
             "status line must not contain CR, got: {:?}",
