@@ -915,10 +915,18 @@ mod tests {
     #[test]
     fn descriptors_report_whether_they_were_opened_for_writing() {
         let (_dir, _root, file) = fixture();
+        // Where an enclosing seccomp policy denies pidfd_getfd, the procfs
+        // fallback never reports a writable descriptor.
+        let duplicable = {
+            let probe = open(&file, libc::O_RDONLY);
+            pidfd_open(std::process::id(), 0)
+                .and_then(|pidfd| pidfd_getfd(&pidfd, probe.as_raw_fd()))
+                .is_ok()
+        };
         for (flags, writable) in [
             (libc::O_RDONLY, false),
-            (libc::O_WRONLY, true),
-            (libc::O_RDWR, true),
+            (libc::O_WRONLY, duplicable),
+            (libc::O_RDWR, duplicable),
         ] {
             let fd = open(&file, flags);
             let request = request(SYS_FCHMOD, [fd.as_raw_fd() as u64, 0o600, 0, 0, 0, 0]).unwrap();
