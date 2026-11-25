@@ -177,6 +177,7 @@ impl ProfileDef {
             hooks: self.hooks.clone(),
             session_hooks: profile::SessionHooks::default(),
             rollback: self.rollback.clone(),
+            session_recording: None,
             open_urls: self.open_urls.clone(),
             allow_launch_services: self.allow_launch_services,
             allow_gpu: self.allow_gpu,
@@ -1041,6 +1042,8 @@ pub(crate) fn add_glob_deny_rules(
         let re = glob_to_seatbelt_regex_with_literal_prefix(&prefix_str, glob_suffix)?;
         caps.add_platform_rule(format!("(allow file-read-metadata (regex #\"{re}\"))"))?;
         caps.add_platform_rule(format!("(deny file-read-data (regex #\"{re}\"))"))?;
+        caps.add_platform_rule(format!("(deny process-exec* (regex #\"{re}\"))"))?;
+        caps.add_platform_rule(format!("(deny file-map-executable (regex #\"{re}\"))"))?;
         caps.add_platform_rule(format!("(deny file-write* (regex #\"{re}\"))"))?;
         // Unix socket connect(2) is mediated as network-outbound, not file I/O.
         caps.add_platform_rule(format!("(deny network-outbound (regex #\"{re}\"))"))?;
@@ -1175,6 +1178,9 @@ pub(crate) fn emit_macos_deny_rules_for_path(path: &Path, caps: &mut CapabilityS
 
     caps.add_platform_rule(format!("(allow file-read-metadata ({}))", file_filter))?;
     caps.add_platform_rule(format!("(deny file-read-data ({}))", file_filter))?;
+    // A denied read must not stay executable or mappable.
+    caps.add_platform_rule(format!("(deny process-exec* ({}))", file_filter))?;
+    caps.add_platform_rule(format!("(deny file-map-executable ({}))", file_filter))?;
     caps.add_platform_rule(format!("(deny file-write* ({}))", file_filter))?;
     caps.add_platform_rule(format!("(deny network-outbound ({}))", network_filter))?;
     Ok(())
@@ -1992,6 +1998,8 @@ pub fn apply_deny_overrides(
 
                 if grant_has_read {
                     caps.add_platform_rule(format!("(allow file-read-data ({}))", filter))?;
+                    caps.add_platform_rule(format!("(allow process-exec* ({}))", filter))?;
+                    caps.add_platform_rule(format!("(allow file-map-executable ({}))", filter))?;
                 }
                 if grant_has_write {
                     caps.add_platform_rule(format!("(allow file-write* ({}))", filter))?;
@@ -2399,11 +2407,25 @@ pub fn list_policy_profiles() -> Result<Vec<String>> {
     Ok(names)
 }
 
-/// Load the embedded policy and return the parsed Policy struct.
-///
-/// The policy JSON is embedded at compile time and never changes at runtime,
-/// so we parse it once and cache the result. This avoids re-parsing ~23 KB of
-/// JSON on every call (up to ~18 call sites per CLI invocation).
+pub(crate) fn delivered_policy(
+    groups: &std::collections::BTreeMap<String, serde_json::Value>,
+) -> Result<Policy> {
+    let mut policy = load_policy(crate::config::embedded::embedded_policy_json())?;
+    for (name, value) in groups {
+        if policy.groups.contains_key(name) {
+            return Err(NonoError::ProfileParse(format!(
+                "delivered group '{name}' collides with a built-in group"
+            )));
+        }
+        let group = serde_json::from_value::<Group>(value.clone()).map_err(|error| {
+            NonoError::ProfileParse(format!("invalid delivered group '{name}': {error}"))
+        })?;
+        policy.groups.insert(name.clone(), group);
+    }
+    Ok(policy)
+}
+
+/// Cache local policy independently of the policy delivered for any launch.
 pub fn load_embedded_policy() -> Result<Policy> {
     static CACHED: std::sync::OnceLock<Policy> = std::sync::OnceLock::new();
 
@@ -2424,42 +2446,52 @@ pub fn load_embedded_policy() -> Result<Policy> {
     Ok(policy)
 }
 
-pub fn load_package_groups(policy: &mut Policy) -> Result<()> {
-    // Tolerate missing config dir / lockfile — no packages installed means
-    // no groups to load. This is the common case in tests and fresh installs.
+pub(crate) fn package_group_documents()
+-> Result<std::collections::BTreeMap<String, serde_json::Value>> {
     let lockfile = match package::read_lockfile() {
-        Ok(lf) => lf,
-        Err(_) => return Ok(()),
+        Ok(lockfile) => lockfile,
+        Err(_) => return Ok(std::collections::BTreeMap::new()),
     };
+    let mut documents = std::collections::BTreeMap::new();
     for package_key in lockfile.packages.keys() {
         let (namespace, name) = package_key.split_once('/').ok_or_else(|| {
             NonoError::PackageInstall(format!("invalid lockfile package key '{package_key}'"))
         })?;
-        let groups_path = package::package_groups_path(namespace, name)?;
-        if !groups_path.exists() {
+        let path = package::package_groups_path(namespace, name)?;
+        if !path.exists() {
             continue;
         }
-
-        let content = std::fs::read_to_string(&groups_path).map_err(|e| NonoError::ConfigRead {
-            path: groups_path.clone(),
-            source: e,
+        let content = std::fs::read_to_string(&path).map_err(|source| NonoError::ConfigRead {
+            path: path.clone(),
+            source,
         })?;
-
-        let groups: HashMap<String, Group> = serde_json::from_str(&content).map_err(|e| {
-            NonoError::ConfigParse(format!("failed to parse {}: {e}", groups_path.display()))
-        })?;
-
-        for (group_name, group) in groups {
-            if policy.groups.contains_key(&group_name) {
+        let groups: std::collections::BTreeMap<String, serde_json::Value> =
+            serde_json::from_str(&content).map_err(|error| {
+                NonoError::ConfigParse(format!("failed to parse {}: {error}", path.display()))
+            })?;
+        for (name, group) in groups {
+            if documents.insert(name.clone(), group).is_some() {
                 return Err(NonoError::PackageInstall(format!(
-                    "package group '{}' collides with an existing policy group",
-                    group_name
+                    "package group '{name}' collides with an existing policy group"
                 )));
             }
-            policy.groups.insert(group_name, group);
         }
     }
+    Ok(documents)
+}
 
+pub fn load_package_groups(policy: &mut Policy) -> Result<()> {
+    for (name, value) in package_group_documents()? {
+        if policy.groups.contains_key(&name) {
+            return Err(NonoError::PackageInstall(format!(
+                "package group '{name}' collides with an existing policy group"
+            )));
+        }
+        let group = serde_json::from_value(value).map_err(|error| {
+            NonoError::ConfigParse(format!("invalid package group '{name}': {error}"))
+        })?;
+        policy.groups.insert(name, group);
+    }
     Ok(())
 }
 
@@ -2917,13 +2949,15 @@ mod tests {
         if cfg!(target_os = "macos") {
             // On macOS, Seatbelt platform rules should be generated
             let rules = caps.platform_rules();
-            assert_eq!(rules.len(), 4);
+            assert_eq!(rules.len(), 6);
             assert!(rules[0].contains("allow file-read-metadata"));
             assert!(rules[1].contains("deny file-read-data"));
-            assert!(rules[2].contains("deny file-write*"));
+            assert!(rules[2].contains("deny process-exec*"));
+            assert!(rules[3].contains("deny file-map-executable"));
+            assert!(rules[4].contains("deny file-write*"));
             assert!(
-                rules[3].contains("deny network-outbound")
-                    && rules[3].contains("subpath \"/nonexistent/test/deny\"")
+                rules[5].contains("deny network-outbound")
+                    && rules[5].contains("subpath \"/nonexistent/test/deny\"")
             );
         } else {
             // On Linux, no platform rules generated (Landlock has no deny semantics)
@@ -3178,9 +3212,13 @@ mod tests {
         );
 
         if cfg!(target_os = "macos") {
-            // Should have 8 rules: 4 for symlink path + 4 for resolved target
+            // Should have 12 rules: 6 for symlink path + 6 for resolved target
             let rules = caps.platform_rules();
-            assert_eq!(rules.len(), 8, "expected 8 Seatbelt rules for symlink deny");
+            assert_eq!(
+                rules.len(),
+                12,
+                "expected 12 Seatbelt rules for symlink deny"
+            );
         }
     }
 
@@ -3315,8 +3353,8 @@ mod tests {
                 let rules = caps.platform_rules();
                 assert_eq!(
                     rules.len(),
-                    8,
-                    "expected 8 Seatbelt rules (4 original + 4 resolved); got: {:?}",
+                    12,
+                    "expected 12 Seatbelt rules (6 original + 6 resolved); got: {:?}",
                     rules
                 );
             }
@@ -3916,6 +3954,10 @@ mod tests {
         assert!(
             read_paths.iter().any(|p| p == "/etc/mime.types"),
             "system_read_linux_core must grant read access to '/etc/mime.types'"
+        );
+        assert!(
+            read_paths.iter().any(|p| p == "/etc/debian_version"),
+            "system_read_linux_core must grant read access to '/etc/debian_version'"
         );
         assert!(
             !read_paths.iter().any(|p| p == "/etc"),
@@ -5778,6 +5820,29 @@ mod tests {
         assert!(
             read_paths.iter().any(|p| p == "/System/Volumes"),
             "system_read_macos should still grant /System/Volumes for firmlink resolution: {read_paths:?}"
+        );
+        // Exec is scoped to the read set, so platform helper dirs must be readable.
+        assert!(
+            read_paths.iter().any(|p| p == "/usr/libexec"),
+            "system_read_macos must grant /usr/libexec: {read_paths:?}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_deny_rules_also_deny_exec_and_map_executable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("bin");
+        std::fs::write(&file, b"x").expect("write");
+        let mut caps = CapabilitySet::new();
+        emit_macos_deny_rules_for_path(&file, &mut caps).expect("emit");
+        let rules = caps.platform_rules();
+        assert!(rules.iter().any(|r| r.contains("deny file-read-data")));
+        assert!(rules.iter().any(|r| r.contains("deny file-map-executable")));
+        assert!(
+            rules
+                .iter()
+                .any(|r| r.contains("deny process-exec*") && r.contains("literal"))
         );
     }
 

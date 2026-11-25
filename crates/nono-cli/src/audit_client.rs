@@ -1,15 +1,20 @@
-//! Durable final-session audit delivery for audit-only platform enrollment.
+//! Durable delivery of completed platform audit sessions.
+
+mod delivery;
+pub(crate) use delivery::DeliveryWorker;
 
 use crate::cli::{AuditStatusArgs, AuditSyncArgs};
+use crate::output::{SummaryKind, summary_heading, summary_row};
 use crate::platform_client::{
     PlatformState, REQUEST_PROTOCOL_V1, endpoint_url, http_agent, load_state, sign_request_v1,
     write_json_secure,
 };
+use crate::theme::{self, fg};
 use nono::audit::{
     AUDIT_EVENTS_FILENAME, canonical_session_digest_payload, compute_session_digest,
     verify_audit_log,
 };
-use nono::undo::{SessionMetadata, SnapshotManager};
+use nono::undo::SessionMetadata;
 use nono::{NonoError, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -20,6 +25,7 @@ use uuid::Uuid;
 
 const OUTBOX_DIRNAME: &str = "audit-outbox";
 const RECEIPT_FILENAME: &str = "platform-ingest-receipt.json";
+const PROFILE_FILENAME: &str = "platform-audit-profile.json";
 const RESPONSE_LIMIT_BYTES: u64 = 1024 * 1024;
 const QUEUE_SCHEMA_V2: u32 = 2;
 
@@ -47,6 +53,8 @@ struct QueuedAuditV2 {
     schema_version: u32,
     envelope: AuditIngestEnvelope,
     session_dir: PathBuf,
+    #[serde(default)]
+    origin: Option<Box<PlatformState>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -151,41 +159,80 @@ struct SyncSummary {
     failures: Vec<String>,
 }
 
+pub(crate) fn capture_enrollment(session_dir: &Path) -> Result<()> {
+    write_json_secure(
+        &session_dir.join("platform-audit-origin.json"),
+        &crate::platform_client::load_active_state()?,
+    )
+}
+
+pub(crate) fn capture_profile(session_dir: &Path, profile_ref: Option<&str>) -> Result<()> {
+    write_json_secure(&session_dir.join(PROFILE_FILENAME), &profile_ref)
+}
+
+fn session_profile(session_dir: &Path) -> Result<Option<String>> {
+    let path = session_dir.join(PROFILE_FILENAME);
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => return Err(NonoError::ConfigRead { path, source }),
+    };
+    serde_json::from_slice(&bytes)
+        .map_err(|_| NonoError::ConfigParse("invalid audit session profile reference".into()))
+}
+
+fn session_origin(session_dir: &Path) -> Result<Option<PlatformState>> {
+    let path = session_dir.join("platform-audit-origin.json");
+    if !path.exists() {
+        return Ok(None);
+    }
+    serde_json::from_slice(
+        &fs::read(&path).map_err(|source| NonoError::ConfigRead { path, source })?,
+    )
+    .map_err(|_| NonoError::ConfigParse("invalid audit enrollment origin".into()))
+}
+
 pub(crate) fn maybe_ship_session(session_dir: &Path, metadata: &SessionMetadata) -> Result<()> {
-    let Some(state) = load_state()? else {
+    let Some(state) = session_origin(session_dir)? else {
         return Ok(());
     };
-    let queued = build_queued_audit(session_dir, metadata, &state)?;
+    if let Some((path, queued)) = queue_session(session_dir, metadata, &state)? {
+        let origin = queued_origin(&queued, Some(&state))?;
+        deliver_queued(origin, &path, &queued, Duration::from_secs(15))?;
+    }
+    Ok(())
+}
+
+fn queue_session(
+    session_dir: &Path,
+    metadata: &SessionMetadata,
+    state: &PlatformState,
+) -> Result<Option<(PathBuf, QueuedAudit)>> {
+    let _lock = delivery::lock_queue(true)?;
+    if session_dir.join(RECEIPT_FILENAME).is_file() {
+        return Ok(None);
+    }
+    for path in queued_paths()? {
+        if queued_session_id(&path).as_deref() == Some(&metadata.session_id) {
+            return Ok(Some((path.clone(), load_queued(&path)?)));
+        }
+    }
+    let queued = build_queued_audit(session_dir, metadata, state)?;
     let path = outbox_path(queued.ingest_id())?;
     write_json_secure(&path, &queued)?;
-    deliver_queued(&state, &path, &queued)
+    Ok(Some((path, queued)))
 }
 
 pub(crate) fn run_sync(args: AuditSyncArgs) -> Result<()> {
-    let Some(state) = load_state()? else {
-        return Err(NonoError::ActionRequired(
-            "nono is not enrolled with a platform; run `nono platform enroll` first".to_string(),
-        ));
-    };
+    let state = load_state()?;
     let mut attempted = 0;
     let mut delivered = 0;
-    let mut failures = recover_missing_queue_items(&state)?;
+    let mut failures = recover_missing_queue_items()?;
     for path in queued_paths()? {
         attempted += 1;
-        let result = load_queued(&path).and_then(|queued| {
-            if queued.shipper_id() == state.subject_id {
-                deliver_queued(&state, &path, &queued)
-            } else {
-                // Queued under a previous enrollment: the platform refuses an
-                // envelope whose shipper is not the authenticated subject, so
-                // re-mint it from the local session evidence before delivery.
-                let (rebuilt_path, rebuilt) =
-                    requeue_under_current_enrollment(&state, &path, &queued)?;
-                deliver_queued(&state, &rebuilt_path, &rebuilt)
-            }
-        });
+        let result = deliver_path(&path, state.as_ref(), Duration::from_secs(15));
         match result {
-            Ok(()) => delivered += 1,
+            Ok(delivered_now) => delivered += usize::from(delivered_now),
             Err(error) => failures.push(format!("{}: {error}", path.display())),
         }
     }
@@ -202,26 +249,65 @@ pub(crate) fn run_sync(args: AuditSyncArgs) -> Result<()> {
             serde_json::to_string_pretty(&summary)
                 .map_err(|error| NonoError::ConfigParse(error.to_string()))?
         );
+    } else if summary.attempted == 0 && summary.failures.is_empty() {
+        println!("No pending audit uploads.");
     } else {
-        println!(
-            "Audit sync: {} delivered, {} remaining ({} attempted)",
-            summary.delivered, summary.remaining, summary.attempted
-        );
+        let kind = if summary.failures.is_empty() && summary.remaining == 0 {
+            SummaryKind::Success
+        } else {
+            SummaryKind::Attention
+        };
+        let mut text = summary_heading("Audit sync", kind);
+        text.push_str(&summary_row("Delivered", &summary.delivered.to_string()));
+        text.push_str(&summary_row(
+            "Pending uploads",
+            &summary.remaining.to_string(),
+        ));
+        text.push_str(&summary_row("Attempted", &summary.attempted.to_string()));
+        println!("{text}");
         for failure in &summary.failures {
             eprintln!("  {failure}");
         }
     }
-    if summary.failures.is_empty() {
+    if summary.failures.is_empty() && summary.remaining == 0 {
         Ok(())
     } else {
-        Err(NonoError::ActionRequired(
-            "some audit sessions could not be delivered; retry `nono audit sync`".to_string(),
-        ))
+        let message = if summary.failures.is_empty() {
+            "audit uploads remain queued; another delivery may be in progress. Retry `nono audit sync` after it finishes"
+        } else {
+            "some audit sessions remain queued; review the per-upload errors before retrying"
+        };
+        Err(NonoError::ActionRequired(message.into()))
     }
 }
 
+fn queued_origin<'a>(
+    queued: &'a QueuedAudit,
+    active: Option<&'a PlatformState>,
+) -> Result<&'a PlatformState> {
+    let embedded = match queued {
+        QueuedAudit::V2(item) => item.origin.as_deref(),
+        QueuedAudit::V1(_) => None,
+    };
+    let origin = embedded.or(active).ok_or_else(|| {
+        NonoError::ActionRequired("no matching enrollment for queued audit evidence".into())
+    })?;
+    let tenant = match queued {
+        QueuedAudit::V2(item) => &item.envelope.tenant_id,
+        QueuedAudit::V1(item) => &item.envelope.tenant_id,
+    };
+    if queued.shipper_id() != origin.subject_id || *tenant != origin.tenant_id {
+        return Err(NonoError::ActionRequired(
+            "audit identity differs from its original enrollment; refusing to reattribute evidence"
+                .into(),
+        ));
+    }
+    Ok(origin)
+}
+
 pub(crate) fn run_status(args: AuditStatusArgs) -> Result<()> {
-    let enrolled = load_state()?.is_some();
+    let revoked = crate::platform_client::enrollment_revoked()?;
+    let enrolled = load_state()?.is_some() && !revoked;
     let queued = queued_paths()?.len();
     if args.json {
         println!(
@@ -233,9 +319,44 @@ pub(crate) fn run_status(args: AuditStatusArgs) -> Result<()> {
             .map_err(|error| NonoError::ConfigParse(error.to_string()))?
         );
     } else {
-        println!("Audit delivery");
-        println!("  Enrolled: {}", if enrolled { "yes" } else { "no" });
-        println!("  Queued:   {queued}");
+        let t = theme::current();
+        print!("{}", summary_heading("Audit delivery", SummaryKind::Info));
+        print!(
+            "{}",
+            summary_row(
+                "Enrollment",
+                if revoked {
+                    "Revoked"
+                } else if enrolled {
+                    "Registered locally"
+                } else {
+                    "Not recorded"
+                }
+            )
+        );
+        if enrolled {
+            print!(
+                "{}",
+                summary_row(
+                    "Delivery",
+                    "On completion; pending uploads retry during sessions"
+                )
+            );
+        }
+        println!(
+            "{}",
+            summary_row(
+                "Pending uploads",
+                &format!(
+                    "{} {}",
+                    fg(
+                        &queued.to_string(),
+                        if queued > 0 { t.yellow } else { t.text }
+                    ),
+                    fg("(all local queues)", t.subtext)
+                )
+            )
+        );
     }
     Ok(())
 }
@@ -272,7 +393,7 @@ fn build_queued_audit(
             session_id: metadata.session_id.clone(),
             shipper_id: state.subject_id.clone(),
             principal_id: None,
-            profile_ref: None,
+            profile_ref: session_profile(session_dir)?,
             merkle_root: integrity.merkle_root.to_string(),
             hash_chain_head: Some(integrity.chain_head.to_string()),
             started_at: metadata.started.clone(),
@@ -282,43 +403,35 @@ fn build_queued_audit(
             events_ndjson,
         },
         session_dir: session_dir.to_path_buf(),
+        origin: Some(Box::new(state.clone())),
     }))
 }
 
-/// Re-mint a queue item that names a previous enrollment's identity.
-///
-/// The envelope is rebuilt from the session evidence still on disk — which
-/// re-verifies the hash chain — under the current subject, tenant, and a fresh
-/// ingest ID. The replacement is durably queued before the stale item is
-/// removed; a crash between the two steps double-queues the session, which is
-/// safe: the platform refuses the twin with its duplicate-session conflict, so
-/// nothing is silently dropped.
-fn requeue_under_current_enrollment(
-    state: &PlatformState,
-    stale_path: &Path,
-    stale: &QueuedAudit,
-) -> Result<(PathBuf, QueuedAudit)> {
-    let session_dir = stale.session_dir();
-    if !session_dir.is_dir() {
-        return Err(NonoError::Snapshot(format!(
-            "queued under a previous enrollment as {} and the session evidence at {} is no \
-             longer on disk; remove the outbox item to drop the session",
-            stale.shipper_id(),
-            session_dir.display()
-        )));
-    }
-    let metadata = SnapshotManager::load_session_metadata(session_dir)?;
-    let rebuilt = build_queued_audit(session_dir, &metadata, state)?;
-    let rebuilt_path = outbox_path(rebuilt.ingest_id())?;
-    write_json_secure(&rebuilt_path, &rebuilt)?;
-    fs::remove_file(stale_path).map_err(|source| NonoError::ConfigWrite {
-        path: stale_path.to_path_buf(),
-        source,
-    })?;
-    Ok((rebuilt_path, rebuilt))
+fn deliver_path(path: &Path, active: Option<&PlatformState>, timeout: Duration) -> Result<bool> {
+    let queued = match load_queued(path) {
+        Err(NonoError::ConfigRead { source, .. })
+            if source.kind() == std::io::ErrorKind::NotFound =>
+        {
+            return Ok(false);
+        }
+        result => result?,
+    };
+    let origin = queued_origin(&queued, active)?;
+    deliver_queued(origin, path, &queued, timeout)
 }
 
-fn deliver_queued(state: &PlatformState, path: &Path, queued: &QueuedAudit) -> Result<()> {
+fn deliver_queued(
+    state: &PlatformState,
+    path: &Path,
+    queued: &QueuedAudit,
+    timeout: Duration,
+) -> Result<bool> {
+    let Some(_lock) = delivery::lock_queue(false)? else {
+        return Ok(false);
+    };
+    if !path.exists() {
+        return Ok(false);
+    }
     let endpoint = endpoint_url(&state.platform_url, "/api/v1/audit/ingest")?;
     let request_path = url::Url::parse(&endpoint)
         .map_err(|error| NonoError::ConfigParse(format!("invalid ingest endpoint: {error}")))?
@@ -333,7 +446,7 @@ fn deliver_queued(state: &PlatformState, path: &Path, queued: &QueuedAudit) -> R
         body.as_bytes(),
     )?;
 
-    let mut response = http_agent(Duration::from_secs(15))
+    let mut response = http_agent(timeout)
         .post(&endpoint)
         .config()
         .http_status_as_error(false)
@@ -349,6 +462,15 @@ fn deliver_queued(state: &PlatformState, path: &Path, queued: &QueuedAudit) -> R
         .map_err(|error| NonoError::Snapshot(format!("audit ingest request failed: {error}")))?;
     if !response.status().is_success() {
         let status = response.status().as_u16();
+        if matches!(status, 401 | 403) {
+            let safe = crate::terminal_approval::sanitize_for_terminal;
+            return Err(NonoError::ActionRequired(format!(
+                "audit delivery blocked (HTTP {status}) at {} for tenant {}, enrollment {}: authentication or authorization was refused. Ask the platform administrator to check this original enrollment and key; it may be revoked or no longer authorized. Evidence remains queued under its original identity. Re-enrolling does not transfer these sessions to the replacement.",
+                safe(&state.platform_url),
+                safe(&state.tenant_id),
+                safe(&state.subject_id),
+            )));
+        }
         let message = response
             .body_mut()
             .with_config()
@@ -382,7 +504,7 @@ fn deliver_queued(state: &PlatformState, path: &Path, queued: &QueuedAudit) -> R
         path: path.to_path_buf(),
         source,
     })?;
-    Ok(())
+    Ok(true)
 }
 
 fn load_queued(path: &Path) -> Result<QueuedAudit> {
@@ -408,14 +530,7 @@ fn load_queued(path: &Path) -> Result<QueuedAudit> {
     Ok(queued)
 }
 
-fn recover_missing_queue_items(state: &PlatformState) -> Result<Vec<String>> {
-    let enrolled_at =
-        chrono::DateTime::parse_from_rfc3339(&state.enrolled_at).map_err(|error| {
-            NonoError::ConfigParse(format!(
-                "invalid platform enrollment timestamp {}: {error}",
-                state.enrolled_at
-            ))
-        })?;
+fn recover_missing_queue_items() -> Result<Vec<String>> {
     let mut queued_session_ids = HashSet::new();
     for path in queued_paths()? {
         if let Some(session_id) = queued_session_id(&path) {
@@ -434,25 +549,18 @@ fn recover_missing_queue_items(state: &PlatformState) -> Result<Vec<String>> {
         let Some(ended) = session.metadata.ended.as_deref() else {
             continue;
         };
-        let ended_at = match chrono::DateTime::parse_from_rfc3339(ended) {
-            Ok(ended_at) => ended_at,
-            Err(error) => {
-                failures.push(format!(
-                    "{}: invalid audit completion timestamp: {error}",
-                    session.dir.display()
-                ));
-                continue;
-            }
-        };
-        if ended_at < enrolled_at {
+        if chrono::DateTime::parse_from_rfc3339(ended).is_err() {
+            failures.push(format!(
+                "{}: invalid audit completion timestamp",
+                session.dir.display()
+            ));
             continue;
         }
-
-        match build_queued_audit(&session.dir, &session.metadata, state).and_then(|queued| {
-            let path = outbox_path(queued.ingest_id())?;
-            write_json_secure(&path, &queued)
-        }) {
-            Ok(()) => {
+        let Some(origin) = session_origin(&session.dir)? else {
+            continue;
+        };
+        match queue_session(&session.dir, &session.metadata, &origin) {
+            Ok(_) => {
                 queued_session_ids.insert(session.metadata.session_id);
             }
             Err(error) => failures.push(format!("{}: {error}", session.dir.display())),
@@ -520,6 +628,228 @@ mod tests {
     use nono::undo::{AuditIntegritySummary, ContentHash, ExecutableIdentity};
 
     #[test]
+    fn automatic_retry_preserves_the_envelope_and_waits_for_a_valid_receipt() {
+        use crate::trust_keystore::TrustKeyRef;
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::net::TcpListener;
+        use std::sync::mpsc;
+
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("config")).unwrap();
+        let _env = EnvVarGuard::set_all(&[
+            (
+                "XDG_STATE_HOME",
+                root.path().join("state").to_str().unwrap(),
+            ),
+            (
+                "XDG_CONFIG_HOME",
+                root.path().join("config").to_str().unwrap(),
+            ),
+        ]);
+        let dir = root.path().join("session");
+        fs::create_dir(&dir).unwrap();
+        let mut recorder = AuditRecorder::new(dir.clone()).unwrap();
+        recorder
+            .record_session_started("2026-07-01T10:00:00Z".into(), vec!["true".into()])
+            .unwrap();
+        recorder
+            .record_session_ended("2026-07-01T10:00:01Z".into(), 0)
+            .unwrap();
+        let metadata = metadata("retry-session", recorder.finalize().unwrap());
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut state = state();
+        state.platform_url = format!("http://{}", listener.local_addr().unwrap());
+        state.key_ref = format!("file://{}", root.path().join("device-key").display());
+        crate::platform_client::load_or_create_signing_key_for_ref(
+            &TrustKeyRef::parse(&state.key_ref).unwrap(),
+        )
+        .unwrap();
+        let ((path, queued), duplicate) = std::thread::scope(|scope| {
+            let first = scope.spawn(|| queue_session(&dir, &metadata, &state).unwrap().unwrap());
+            let second = scope.spawn(|| queue_session(&dir, &metadata, &state).unwrap().unwrap());
+            (first.join().unwrap(), second.join().unwrap())
+        });
+        let original = fs::read(&path).unwrap();
+        assert_eq!(duplicate.0, path);
+        assert_eq!(queued_paths().unwrap().len(), 1);
+        let lock = delivery::lock_queue(false).unwrap().unwrap();
+        let busy = run_sync(AuditSyncArgs {
+            json: true,
+            help: None,
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(
+            busy.contains("another delivery may be in progress"),
+            "{busy}"
+        );
+        assert!(!busy.contains("per-upload errors"), "{busy}");
+        assert_eq!(fs::read(&path).unwrap(), original);
+        drop(lock);
+        let expected = queued.wire_body().unwrap();
+        let ingest_id = queued.ingest_id();
+        let server = std::thread::spawn(move || {
+            for attempt in 0..5 {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = BufReader::new(&mut stream);
+                let mut line = String::new();
+                let mut length = 0;
+                loop {
+                    line.clear();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':')
+                        && name.eq_ignore_ascii_case("content-length")
+                    {
+                        length = value.trim().parse::<usize>().unwrap();
+                    }
+                }
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).unwrap();
+                assert_eq!(body, expected.as_bytes());
+                let (status, response) =
+                    if attempt == 0 {
+                        ("503 Service Unavailable", "unavailable".to_string())
+                    } else if attempt == 1 {
+                        (
+                            "401 Unauthorized",
+                            "SENSITIVE_SERVER_BODY_MUST_NOT_APPEAR".into(),
+                        )
+                    } else if attempt == 2 {
+                        (
+                            "403 Forbidden",
+                            "SENSITIVE_SERVER_BODY_MUST_NOT_APPEAR".into(),
+                        )
+                    } else {
+                        ("200 OK", serde_json::json!({
+                        "ingest_id": if attempt == 3 { Uuid::nil() } else { ingest_id },
+                        "session_id": "retry-session", "accepted_at": "2026-07-01T10:00:02Z",
+                        "platform_attestation": "pending", "event_count": 2,
+                        "verification_status": "pending", "object_path": "evidence",
+                    }).to_string())
+                    };
+                write!(stream, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).unwrap();
+            }
+        });
+        let (_stop, receiver) = mpsc::channel();
+        let mut cursor = None;
+        for attempt in 0..4 {
+            if matches!(attempt, 1 | 2) {
+                let error = deliver_path(&path, None, Duration::from_secs(5))
+                    .unwrap_err()
+                    .to_string();
+                for detail in [
+                    &state.platform_url,
+                    &state.tenant_id,
+                    &state.subject_id,
+                    "administrator",
+                    "Evidence remains queued",
+                    "Re-enrolling does not transfer",
+                ] {
+                    assert!(error.contains(detail), "{error}");
+                }
+                assert!(
+                    error.contains(if attempt == 1 { "HTTP 401" } else { "HTTP 403" }),
+                    "{error}"
+                );
+                assert!(
+                    !error.contains("SENSITIVE_SERVER_BODY_MUST_NOT_APPEAR"),
+                    "{error}"
+                );
+                assert!(!error.contains(&state.key_ref), "{error}");
+            } else {
+                assert_eq!(
+                    delivery::retry_batch(&receiver, &mut cursor).unwrap(),
+                    Some(true)
+                );
+            }
+            assert_eq!(fs::read(&path).unwrap(), original);
+            assert!(!dir.join(RECEIPT_FILENAME).exists());
+        }
+        assert_eq!(
+            delivery::retry_batch(&receiver, &mut cursor).unwrap(),
+            Some(false)
+        );
+        server.join().unwrap();
+        assert!(!path.exists());
+        assert!(!deliver_path(&path, None, Duration::from_secs(1)).unwrap());
+        let receipt: AuditIngestReceipt =
+            serde_json::from_slice(&fs::read(dir.join(RECEIPT_FILENAME)).unwrap()).unwrap();
+        assert_eq!(receipt.verification_status, "pending");
+        assert!(queue_session(&dir, &metadata, &state).unwrap().is_none());
+    }
+
+    #[test]
+    fn automatic_batches_are_bounded_fair_and_cancellable() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("config")).unwrap();
+        let _env = EnvVarGuard::set_all(&[
+            ("XDG_STATE_HOME", root.path().to_str().unwrap()),
+            (
+                "XDG_CONFIG_HOME",
+                root.path().join("config").to_str().unwrap(),
+            ),
+        ]);
+        let dir = outbox_dir().unwrap();
+        fs::create_dir_all(&dir).unwrap();
+        for index in 0..10 {
+            fs::write(dir.join(format!("{index:02}.json")), "invalid queue item").unwrap();
+        }
+        let (stop, receiver) = std::sync::mpsc::channel();
+        let mut cursor = None;
+        assert_eq!(
+            delivery::retry_batch(&receiver, &mut cursor).unwrap(),
+            Some(true)
+        );
+        assert_eq!(cursor, Some(dir.join("07.json")));
+        assert_eq!(
+            delivery::retry_batch(&receiver, &mut cursor).unwrap(),
+            Some(true)
+        );
+        assert_eq!(cursor, Some(dir.join("05.json")));
+        stop.send(()).unwrap();
+        assert_eq!(delivery::retry_batch(&receiver, &mut cursor).unwrap(), None);
+        assert_eq!(queued_count().unwrap(), 10);
+    }
+
+    #[test]
+    fn delivery_lock_excludes_other_workers_and_shutdown_interrupts_waits() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("config")).unwrap();
+        let _env = EnvVarGuard::set_all(&[
+            ("XDG_STATE_HOME", root.path().to_str().unwrap()),
+            (
+                "XDG_CONFIG_HOME",
+                root.path().join("config").to_str().unwrap(),
+            ),
+        ]);
+        let lock = delivery::lock_queue(false).unwrap().unwrap();
+        assert!(delivery::lock_queue(false).unwrap().is_none());
+        drop(lock);
+        assert!(delivery::lock_queue(false).unwrap().is_some());
+        assert!(DeliveryWorker::start().unwrap().is_none());
+        fs::create_dir_all(outbox_dir().unwrap()).unwrap();
+        fs::write(
+            outbox_dir().unwrap().join("pending.json"),
+            "invalid queue item",
+        )
+        .unwrap();
+        let start = std::time::Instant::now();
+        let worker = DeliveryWorker::start().unwrap().unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        drop(worker);
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
     fn queued_audit_verifies_local_evidence_and_preserves_identity() {
         let dir = tempfile::tempdir().unwrap();
         let mut recorder = AuditRecorder::new(dir.path().to_path_buf()).unwrap();
@@ -534,10 +864,26 @@ mod tests {
         let state = state();
 
         let queued = build_queued_audit(dir.path(), &metadata, &state).unwrap();
+        let other = PlatformState {
+            tenant_id: "other".into(),
+            subject_id: "other-device".into(),
+            ..state.clone()
+        };
+        assert_eq!(
+            queued_origin(&queued, Some(&other)).unwrap().subject_id,
+            state.subject_id
+        );
+        let mut legacy = serde_json::to_value(&queued).unwrap();
+        legacy.as_object_mut().unwrap().remove("origin");
+        let legacy: QueuedAudit = serde_json::from_value(legacy).unwrap();
+        assert!(queued_origin(&legacy, Some(&other)).is_err());
+        assert!(queued_origin(&legacy, None).is_err());
+        assert!(queued_origin(&legacy, Some(&state)).is_ok());
         let envelope = queued.current_envelope().unwrap();
         assert_eq!(envelope.tenant_id, "acme");
         assert_eq!(envelope.shipper_id, "subject-1");
         assert_eq!(envelope.session_id, "session-1");
+        assert_eq!(envelope.profile_ref, None);
         assert!(envelope.events_ndjson.contains("session_started"));
         assert!(envelope.events_ndjson.contains("session_ended"));
         assert_eq!(
@@ -549,6 +895,48 @@ mod tests {
         assert_eq!(shipped_metadata["session_id"], "session-1");
         assert_eq!(shipped_metadata["command"], serde_json::json!(["true"]));
         assert_eq!(shipped_metadata["exit_code"], 0);
+    }
+
+    #[test]
+    fn captured_profile_survives_queue_reload_without_changing_session_digest() {
+        for profile in [Some("customer-project"), Some("nolabs-ai/claude"), None] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut recorder = AuditRecorder::new(dir.path().to_path_buf()).unwrap();
+            recorder
+                .record_session_started("2026-07-01T10:00:00Z".into(), vec!["true".into()])
+                .unwrap();
+            recorder
+                .record_session_ended("2026-07-01T10:00:01Z".into(), 0)
+                .unwrap();
+            let metadata = metadata("profile-session", recorder.finalize().unwrap());
+            let original_digest = compute_session_digest(&metadata).unwrap();
+            capture_profile(dir.path(), profile).unwrap();
+            let queued = build_queued_audit(dir.path(), &metadata, &state()).unwrap();
+            assert_eq!(
+                queued.current_envelope().unwrap().profile_ref.as_deref(),
+                profile
+            );
+            assert_eq!(
+                queued.current_envelope().unwrap().session_digest,
+                original_digest.to_string()
+            );
+            let path = dir.path().join("queued.json");
+            write_json_secure(&path, &queued).unwrap();
+            capture_profile(dir.path(), Some("changed-after-queueing")).unwrap();
+            let reloaded = load_queued(&path).unwrap();
+            assert_eq!(reloaded.wire_body().unwrap(), queued.wire_body().unwrap());
+        }
+    }
+
+    #[test]
+    fn captured_profile_rejects_malformed_state() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join(PROFILE_FILENAME),
+            br#"{"profile":"wrong-shape"}"#,
+        )
+        .unwrap();
+        assert!(session_profile(dir.path()).is_err());
     }
 
     #[test]
@@ -638,6 +1026,12 @@ mod tests {
             .record_session_ended("2026-07-01T10:00:01Z".to_string(), 0)
             .unwrap();
         let recovered_metadata = metadata("session-recover", recorder.finalize().unwrap());
+        capture_profile(&session_dir, Some("nolabs-ai/codex@1.2.3")).unwrap();
+        write_json_secure(
+            &session_dir.join("platform-audit-origin.json"),
+            &Some(state()),
+        )
+        .unwrap();
         nono::undo::SnapshotManager::write_session_metadata(&session_dir, &recovered_metadata)
             .unwrap();
 
@@ -661,86 +1055,38 @@ mod tests {
         nono::undo::SnapshotManager::write_session_metadata(&old_session_dir, &old_metadata)
             .unwrap();
 
-        assert!(recover_missing_queue_items(&state()).unwrap().is_empty());
+        assert!(recover_missing_queue_items().unwrap().is_empty());
         assert_eq!(queued_paths().unwrap().len(), 1);
         let queued = load_queued(&queued_paths().unwrap()[0]).unwrap();
         assert!(matches!(queued, QueuedAudit::V2(_)));
         assert_eq!(queued.session_id(), "session-recover");
+        assert_eq!(
+            queued.current_envelope().unwrap().profile_ref.as_deref(),
+            Some("nolabs-ai/codex@1.2.3")
+        );
 
-        assert!(recover_missing_queue_items(&state()).unwrap().is_empty());
+        assert!(recover_missing_queue_items().unwrap().is_empty());
         assert_eq!(queued_paths().unwrap().len(), 1);
     }
 
     #[test]
-    fn sync_requeues_stale_enrollment_items_under_the_current_identity() {
-        let _env_lock = ENV_LOCK.lock().unwrap();
-        let root = tempfile::tempdir().unwrap();
-        let home = root.path().join("home");
-        let state_home = root.path().join("state");
-        fs::create_dir_all(&home).unwrap();
-        let home = home.to_string_lossy().to_string();
-        let state_home = state_home.to_string_lossy().to_string();
-        let _env = EnvVarGuard::set_all(&[
-            ("HOME", home.as_str()),
-            ("XDG_STATE_HOME", state_home.as_str()),
-        ]);
-
-        let session_dir = crate::audit_session::audit_root()
-            .unwrap()
-            .join("session-stale");
-        fs::create_dir_all(&session_dir).unwrap();
-        let mut recorder = AuditRecorder::new(session_dir.clone()).unwrap();
-        recorder
-            .record_session_started("2026-07-01T10:00:00Z".to_string(), vec!["true".to_string()])
-            .unwrap();
-        recorder
-            .record_session_ended("2026-07-01T10:00:01Z".to_string(), 0)
-            .unwrap();
-        let session_metadata = metadata("session-stale", recorder.finalize().unwrap());
-        nono::undo::SnapshotManager::write_session_metadata(&session_dir, &session_metadata)
-            .unwrap();
-
-        let mut old_state = state();
-        old_state.subject_id = "subject-retired".to_string();
-        old_state.tenant_id = "oldco".to_string();
-        let stale = build_queued_audit(&session_dir, &session_metadata, &old_state).unwrap();
-        let stale_path = outbox_path(stale.ingest_id()).unwrap();
-        write_json_secure(&stale_path, &stale).unwrap();
-
-        let current_state = state();
-        let loaded = load_queued(&stale_path).unwrap();
-        assert_ne!(loaded.shipper_id(), current_state.subject_id);
-
-        let (rebuilt_path, rebuilt) =
-            requeue_under_current_enrollment(&current_state, &stale_path, &loaded).unwrap();
-        assert!(!stale_path.exists());
-        assert!(rebuilt_path.exists());
-        let envelope = rebuilt.current_envelope().unwrap();
-        assert_eq!(envelope.shipper_id, "subject-1");
-        assert_eq!(envelope.tenant_id, "acme");
-        assert_eq!(envelope.session_id, "session-stale");
-        assert_ne!(envelope.ingest_id, stale.ingest_id());
-        assert_eq!(
-            envelope.session_digest,
-            compute_session_digest(&session_metadata)
-                .unwrap()
-                .to_string()
-        );
-
-        // Without the local session evidence a stale item cannot be re-minted:
-        // it must fail loudly and stay queued rather than vanish.
-        let second_stale = build_queued_audit(&session_dir, &session_metadata, &old_state).unwrap();
-        let second_path = outbox_path(second_stale.ingest_id()).unwrap();
-        write_json_secure(&second_path, &second_stale).unwrap();
-        fs::remove_dir_all(&session_dir).unwrap();
-        let error = requeue_under_current_enrollment(
-            &current_state,
-            &second_path,
-            &load_queued(&second_path).unwrap(),
+    fn queued_origin_survives_tenant_switches() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = state();
+        write_json_secure(
+            &dir.path().join("platform-audit-origin.json"),
+            &Some(&original),
         )
-        .unwrap_err();
-        assert!(error.to_string().contains("previous enrollment"));
-        assert!(second_path.exists());
+        .unwrap();
+        let captured = session_origin(dir.path()).unwrap().unwrap();
+        assert_eq!(captured.tenant_id, original.tenant_id);
+        assert_eq!(captured.subject_id, original.subject_id);
+        write_json_secure(
+            &dir.path().join("platform-audit-origin.json"),
+            &Option::<PlatformState>::None,
+        )
+        .unwrap();
+        assert!(session_origin(dir.path()).unwrap().is_none());
     }
 
     #[test]

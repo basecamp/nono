@@ -216,8 +216,64 @@ fn enabled_control_char(termios: &Termios, index: SpecialCharacterIndices) -> Op
     (byte != libc::_POSIX_VDISABLE).then_some(byte)
 }
 
+/// Collects terminal notifications the screen model sees (NEP-0010 §2.1).
+#[derive(Default)]
+struct NotificationCallbacks {
+    pending: Vec<crate::terminal_capture::events::NotificationKind>,
+}
+
+impl vt100::Callbacks for NotificationCallbacks {
+    fn audible_bell(&mut self, _: &mut vt100::Screen) {
+        self.pending
+            .push(crate::terminal_capture::events::NotificationKind::Bell);
+    }
+
+    fn unhandled_osc(&mut self, _: &mut vt100::Screen, params: &[&[u8]]) {
+        use crate::terminal_capture::events::NotificationKind;
+        match params {
+            // OSC 9;4 is a progress report, not a notification.
+            [b"9", second, ..] if *second != b"4" => self.pending.push(NotificationKind::Osc9),
+            [b"9"] => self.pending.push(NotificationKind::Osc9),
+            [b"777", b"notify", ..] => self.pending.push(NotificationKind::Osc777),
+            _ => {}
+        }
+    }
+}
+
 struct ScreenState {
-    parser: vt100::Parser,
+    modes: crate::terminal_modes::TerminalModes,
+    parser: vt100::Parser<NotificationCallbacks>,
+}
+
+/// Executable of a process group's leader, or `None` when it cannot be
+/// resolved. Never guessed (NEP-0010 §2.2).
+fn foreground_executable(pgid: i32) -> Option<String> {
+    if pgid <= 0 {
+        return None;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_link(format!("/proc/{pgid}/exe"))
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut buf = vec![0u8; 4096];
+        // SAFETY: `buf` is a valid writable buffer of the length passed, and
+        // `proc_pidpath` writes at most that many bytes.
+        let len =
+            unsafe { libc::proc_pidpath(pgid, buf.as_mut_ptr().cast::<libc::c_void>(), 4096) };
+        if len <= 0 {
+            return None;
+        }
+        buf.truncate(usize::try_from(len).ok()?);
+        Some(String::from_utf8_lossy(&buf).into_owned())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        None
+    }
 }
 
 fn nonzero_screen_dimension(value: usize) -> NonZeroU16 {
@@ -225,18 +281,46 @@ fn nonzero_screen_dimension(value: usize) -> NonZeroU16 {
     NonZeroU16::new(bounded).unwrap_or(NonZeroU16::MIN)
 }
 
+fn approval_frame(text: &str, (rows, cols): (u16, u16)) -> Vec<u8> {
+    let mut frame = b"\x1b[?2026l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?2004l\x1b[0m\x1b[r\x1b[?6l\x1b[2J\x1b[H\x1b[?25l".to_vec();
+    // Clip styled rows through the existing VT parser, including wide Unicode,
+    // so long paths cannot wrap over the status or scroll the heading away.
+    let mut lines: Vec<_> = text.lines().collect();
+    if lines.len() > usize::from(rows) {
+        lines.retain(|line| !line.trim().is_empty());
+        if lines.len() > usize::from(rows) && rows > 1 {
+            let footer = lines.last().copied();
+            lines.truncate(usize::from(rows) - 1);
+            lines.extend(footer);
+        }
+    }
+    for (index, line) in lines.into_iter().take(usize::from(rows)).enumerate() {
+        let width = line.chars().count().saturating_mul(2).saturating_add(1);
+        let mut row = ScreenState::new(1, width);
+        row.apply_bytes(line.as_bytes());
+        frame.extend_from_slice(format!("\x1b[{};1H", index + 1).as_bytes());
+        if let Some(line) = row.parser.screen().rows_formatted(0, cols).next() {
+            frame.extend_from_slice(line.as_bytes());
+        }
+    }
+    frame
+}
+
 impl ScreenState {
     fn new(rows: usize, cols: usize) -> Self {
         Self {
-            parser: vt100::Parser::new(
+            modes: crate::terminal_modes::TerminalModes::new(nonzero_screen_dimension(rows).get()),
+            parser: vt100::Parser::new_with_callbacks(
                 nonzero_screen_dimension(rows),
                 nonzero_screen_dimension(cols),
                 VT_SCROLLBACK_ROWS,
+                NotificationCallbacks::default(),
             ),
         }
     }
 
     fn resize(&mut self, rows: usize, cols: usize) {
+        self.modes.resize(nonzero_screen_dimension(rows).get());
         self.parser.screen_mut().set_size(
             nonzero_screen_dimension(rows),
             nonzero_screen_dimension(cols),
@@ -244,11 +328,16 @@ impl ScreenState {
     }
 
     fn apply_bytes(&mut self, bytes: &[u8]) {
+        self.modes.observe(bytes);
         self.parser.process(bytes);
     }
 
     fn render(&self) -> Vec<u8> {
         self.parser.screen().state_formatted().into_bytes()
+    }
+
+    fn take_notifications(&mut self) -> Vec<crate::terminal_capture::events::NotificationKind> {
+        std::mem::take(&mut self.parser.callbacks_mut().pending)
     }
 
     fn render_plaintext(&self) -> String {
@@ -289,6 +378,7 @@ pub struct PtyProxy {
     scrollback: VecDeque<u8>,
     /// Last visible screen state for attach restoration.
     screen: ScreenState,
+    approval_view: crate::approval_status::ApprovalView,
     /// Configured in-band detach byte sequence.
     detach_sequence: Vec<u8>,
     /// Number of bytes currently matched against `detach_sequence`.
@@ -305,6 +395,14 @@ pub struct PtyProxy {
     /// A quit byte, recorded and forwarded on exactly the same terms as
     /// `interrupt_requested`.
     quit_requested: Option<Pid>,
+    /// Session terminal capture (NEP-0010), when recording is on.
+    capture: Option<crate::terminal_capture::TerminalCapture>,
+    /// Label for input from the current client: `local` or `attach:<n>`.
+    client_label: String,
+    /// Number of socket clients accepted, for `attach:<n>` labels.
+    attach_count: u64,
+    /// Set once a required recording failure has asked to stop the session.
+    capture_stop_requested: bool,
 }
 
 /// Open a PTY pair, inheriting the current terminal's window size.
@@ -371,7 +469,7 @@ pub unsafe fn setup_child_pty(slave_fd: RawFd) {
 }
 
 /// Get the current terminal window size, if available.
-fn get_terminal_winsize() -> Option<Winsize> {
+pub(crate) fn get_terminal_winsize() -> Option<Winsize> {
     let mut ws: Winsize = unsafe { std::mem::zeroed() };
     // SAFETY: ioctl with TIOCGWINSZ reads window size into ws
     let ret = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) };
@@ -427,6 +525,7 @@ impl PtyProxy {
             saved_termios,
             scrollback: VecDeque::with_capacity(SCROLLBACK_LIMIT_BYTES.min(64 * 1024)),
             screen: ScreenState::new(winsize.ws_row as usize, winsize.ws_col as usize),
+            approval_view: crate::approval_status::ApprovalView::default(),
             detach_sequence: detach_sequence
                 .filter(|sequence| !sequence.is_empty())
                 .map_or_else(|| DEFAULT_DETACH_SEQUENCE.to_vec(), ToOwned::to_owned),
@@ -436,6 +535,10 @@ impl PtyProxy {
             suspension_requested: false,
             interrupt_requested: None,
             quit_requested: None,
+            capture: None,
+            client_label: "local".to_string(),
+            attach_count: 0,
+            capture_stop_requested: false,
         })
     }
 
@@ -443,6 +546,8 @@ impl PtyProxy {
     ///
     /// Restores terminal settings and drops the client connection.
     pub fn detach(&mut self) -> bool {
+        self.hide_approval_view();
+        self.approval_view = crate::approval_status::ApprovalView::default();
         let mut detached_terminal = false;
         let mut detached_client_kind = None;
         if let Some(client) = self.client.take() {
@@ -451,6 +556,11 @@ impl PtyProxy {
             } else {
                 "socket"
             });
+            if let Some(capture) = self.capture.as_mut() {
+                capture.lifecycle(crate::terminal_capture::events::Lifecycle::ClientDetached {
+                    client: self.client_label.clone(),
+                });
+            }
             if client.is_terminal() {
                 detached_terminal = true;
                 self.restore_terminal();
@@ -478,6 +588,7 @@ impl PtyProxy {
     /// This leaves the attach screen, restores cooked terminal mode, and
     /// drops the terminal client so later teardown does not redraw or clear it.
     pub fn release_terminal_for_prompt(&mut self) -> bool {
+        self.hide_approval_view();
         let had_terminal_client = self
             .client
             .as_ref()
@@ -526,7 +637,8 @@ impl PtyProxy {
     /// without the clear, the cursor lands at a stale position in the normal
     /// buffer and the shell prompt mixes with leftover lines, drift that
     /// accumulates across repeated Ctrl-Z/fg cycles.
-    pub(crate) fn leave_screen_for_suspension(&self) {
+    pub(crate) fn leave_screen_for_suspension(&mut self) {
+        self.hide_approval_view();
         if self.screen.alternate_screen_active() {
             let _ = write_all_fd(libc::STDOUT_FILENO, terminal_restore_escape(true));
             drain_terminal_output(libc::STDOUT_FILENO);
@@ -696,6 +808,13 @@ impl PtyProxy {
                 let socket = unsafe { OwnedFd::from_raw_fd(socket_fd) };
                 self.client = Some(AttachedClient::socket(socket));
                 self.resize_notifier = Some(supervisor_resize);
+                self.attach_count = self.attach_count.saturating_add(1);
+                self.client_label = format!("attach:{}", self.attach_count);
+                if let Some(capture) = self.capture.as_mut() {
+                    capture.lifecycle(crate::terminal_capture::events::Lifecycle::ClientAttached {
+                        client: self.client_label.clone(),
+                    });
+                }
                 self.persist_attachment_state(crate::session::SessionAttachment::Attached);
                 info!(
                     "PTY proxy attached socket client for session {}",
@@ -761,7 +880,8 @@ impl PtyProxy {
 
         self.record_output(&buf[..n]);
 
-        if let Some((write_fd, is_terminal)) = client
+        if self.approval_view.frame.is_none()
+            && let Some((write_fd, is_terminal)) = client
             && let Err(err) = write_all_fd(write_fd, &buf[..n])
         {
             if is_terminal {
@@ -907,7 +1027,26 @@ impl PtyProxy {
             }
         };
 
+        if self.approval_view.frame.is_some() {
+            if buf[..n] == [0x1b] {
+                self.approval_view.dismiss();
+                self.hide_approval_view();
+            } else {
+                // Keep detach and signal controls available; other keystrokes
+                // belong to this view and must never answer an agent prompt.
+                let controls: Vec<u8> = self
+                    .filter_client_input(&buf[..n])
+                    .into_iter()
+                    .filter(|byte| matches!(*byte, 3 | 28))
+                    .collect();
+                if !controls.is_empty() {
+                    let _ = write_all_fd(self.master.as_raw_fd(), &controls);
+                }
+            }
+            return true;
+        }
         let forwarded = self.filter_client_input(&buf[..n]);
+        self.capture_input(&forwarded);
         if !forwarded.is_empty()
             && let Err(err) = write_all_fd(self.master.as_raw_fd(), &forwarded)
         {
@@ -949,6 +1088,7 @@ impl PtyProxy {
     /// Returns true when a terminal-backed client was paused and must later
     /// be resumed with [`Self::resume_terminal_after_prompt`].
     pub fn pause_terminal_for_prompt(&mut self) -> bool {
+        self.hide_approval_view();
         if !self
             .client
             .as_ref()
@@ -996,6 +1136,67 @@ impl PtyProxy {
             self.resume_terminal_after_prompt();
         }
         result
+    }
+
+    /// Own the display while remote approval is pending, without stopping PTY
+    /// reads or adding presentation bytes to the agent's captured output.
+    pub(crate) fn service_approval_view(&mut self) {
+        self.update_approval_view(&crate::approval_status::snapshot(), Instant::now());
+    }
+
+    fn update_approval_view(
+        &mut self,
+        pending: &std::collections::BTreeMap<uuid::Uuid, crate::approval_status::PendingApproval>,
+        now: Instant,
+    ) {
+        if self.client.is_none() {
+            return;
+        }
+        let Some(frame) = self.approval_view.render(pending, now) else {
+            self.hide_approval_view();
+            return;
+        };
+        if let Some(size) = current_winsize(self.master.as_raw_fd()) {
+            let _ = self.apply_winsize(&size);
+        }
+        let size = self.screen.size();
+        if self.approval_view.frame.as_ref() == Some(&frame) && self.approval_view.size == size {
+            return;
+        }
+        let Some(client) = self.client.as_ref() else {
+            return;
+        };
+        let fd = client.write_fd();
+        if self.approval_view.frame.is_none() {
+            // Cancel any incomplete agent escape, then save keyboard reporting
+            // and give this view ordinary Esc/Ctrl keys.
+            let _ = write_all_fd(fd, b"\x18\x1b[>0u");
+            if !self.screen.alternate_screen_active() {
+                let _ = write_all_fd(fd, ENTER_ALT_SCREEN.as_bytes());
+            }
+        }
+        let _ = write_all_fd(fd, &approval_frame(&frame, size));
+        self.approval_view.frame = Some(frame);
+        self.approval_view.size = size;
+    }
+
+    fn hide_approval_view(&mut self) {
+        if self.approval_view.frame.take().is_none() {
+            return;
+        }
+        if let Some(client) = self.client.as_ref() {
+            let fd = client.write_fd();
+            let _ = write_all_fd(fd, b"\x18\x1b[<u\x1b[0m\x1b[?25h");
+            if !self.screen.alternate_screen_active() {
+                let _ = write_all_fd(fd, EXIT_ALT_SCREEN.as_bytes());
+            }
+            let _ = write_all_fd(fd, b"\x1b[r\x1b[?6l\x1b[?7h\x1b[2J\x1b[H");
+            let _ = write_all_fd(fd, &self.scrollback_snapshot());
+            let _ = write_all_fd(
+                fd,
+                &self.screen.modes.restore(self.screen.cursor_position()),
+            );
+        }
     }
 
     /// Re-enter relay terminal mode after a supervisor-owned prompt.
@@ -1089,7 +1290,87 @@ impl PtyProxy {
         }
         self.screen
             .resize(target_rows as usize, target_cols as usize);
+        if let Some(capture) = self.capture.as_mut() {
+            capture.resize(target_cols, target_rows);
+        }
         true
+    }
+
+    /// Install session terminal capture. Records the initial client.
+    pub(crate) fn set_capture(&mut self, mut capture: crate::terminal_capture::TerminalCapture) {
+        if self.client.is_some() {
+            capture.lifecycle(crate::terminal_capture::events::Lifecycle::ClientAttached {
+                client: self.client_label.clone(),
+            });
+        }
+        self.capture = Some(capture);
+        self.sample_foreground();
+    }
+
+    /// Record a supervisor lifecycle event, when capture is on.
+    pub(crate) fn capture_lifecycle(&mut self, event: crate::terminal_capture::events::Lifecycle) {
+        if let Some(capture) = self.capture.as_mut() {
+            capture.lifecycle(event);
+        }
+    }
+
+    /// Periodic capture housekeeping from the supervisor loop.
+    ///
+    /// Returns the reason the first time a required recording destination
+    /// fails, so the caller can stop the session.
+    pub(crate) fn service_capture(&mut self) -> Option<String> {
+        let capture = self.capture.as_mut()?;
+        if capture.wants_foreground_sample() {
+            self.sample_foreground();
+        }
+        let reason = self.capture.as_mut()?.tick()?;
+        if self.capture_stop_requested {
+            return None;
+        }
+        self.capture_stop_requested = true;
+        Some(reason)
+    }
+
+    /// Finish capture: record the exit and close the last chunk.
+    pub(crate) fn finish_capture(
+        &mut self,
+        status: String,
+    ) -> Option<crate::terminal_capture::CaptureSummary> {
+        self.capture.take().map(|capture| capture.finish(status))
+    }
+
+    fn capture_input(&mut self, bytes: &[u8]) {
+        if self.capture.is_none() || bytes.is_empty() {
+            return;
+        }
+        // Read the slave's mode before recording the batch, so password-mode
+        // input (ICANON on, ECHO off) is never captured (NEP-0010 §3.2).
+        // If the mode cannot be read, assume password mode: fail closed.
+        let mode = nix::sys::termios::tcgetattr(&self.master).ok().map(|t| {
+            (
+                t.local_flags
+                    .contains(nix::sys::termios::LocalFlags::ICANON),
+                t.local_flags.contains(nix::sys::termios::LocalFlags::ECHO),
+            )
+        });
+        let label = self.client_label.clone();
+        if let Some(capture) = self.capture.as_mut() {
+            let (icanon, echo) = mode.unwrap_or((true, false));
+            capture.observe_mode(icanon, echo);
+            capture.input(&label, bytes);
+        }
+        self.sample_foreground();
+    }
+
+    fn sample_foreground(&mut self) {
+        let Some(capture) = self.capture.as_mut() else {
+            return;
+        };
+        let Ok(pgid) = nix::unistd::tcgetpgrp(&self.master) else {
+            return;
+        };
+        let raw = pgid.as_raw();
+        capture.foreground(raw, foreground_executable(raw));
     }
 
     fn persist_attachment_state(&self, attachment: crate::session::SessionAttachment) {
@@ -1107,7 +1388,28 @@ impl PtyProxy {
         }
 
         let first_output = self.scrollback.is_empty();
+        if let Some(size) = current_winsize(self.master.as_raw_fd()) {
+            let _ = self.apply_winsize(&size);
+        }
+        if self.capture.is_some() {
+            // Local SIGWINCH resizes the master directly from a signal
+            // handler; pick the new size up here so it precedes the output
+            // drawn at that size.
+            let size = current_winsize(self.master.as_raw_fd());
+            if let Some(capture) = self.capture.as_mut() {
+                if let Some(size) = size {
+                    capture.resize(size.ws_col, size.ws_row);
+                }
+                capture.output(crate::terminal_capture::events::OutputStream::Pty, bytes);
+            }
+        }
         self.screen.apply_bytes(bytes);
+        let notifications = self.screen.take_notifications();
+        if let Some(capture) = self.capture.as_mut() {
+            for kind in notifications {
+                capture.notification(kind);
+            }
+        }
 
         if bytes.len() >= SCROLLBACK_LIMIT_BYTES {
             self.scrollback.clear();
@@ -1729,6 +2031,13 @@ fn select_attach_replay_bytes(
     }
 }
 
+/// Window size of a freshly opened PTY, as `(cols, rows)`.
+pub(crate) fn pty_pair_size(pair: &PtyPair) -> Option<(u16, u16)> {
+    current_winsize(pair.master.as_raw_fd())
+        .filter(|w| w.ws_col > 0 && w.ws_row > 0)
+        .map(|w| (w.ws_col, w.ws_row))
+}
+
 fn current_winsize(fd: RawFd) -> Option<Winsize> {
     let mut ws: Winsize = unsafe { std::mem::zeroed() };
     let ret = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) };
@@ -1814,6 +2123,7 @@ fn authenticate_attach_peer(sock_fd: RawFd) -> Result<()> {
 
 impl Drop for PtyProxy {
     fn drop(&mut self) {
+        self.hide_approval_view();
         if self
             .client
             .as_ref()
@@ -2864,13 +3174,33 @@ fn run_attach_loop(
 #[cfg(test)]
 mod tests {
     use super::remote_terminal_restore_escape;
+
+    #[test]
+    fn screen_model_reports_terminal_notifications() {
+        use crate::terminal_capture::events::NotificationKind;
+        let mut screen = ScreenState::new(24, 80);
+        screen.apply_bytes(b"done\x07");
+        screen.apply_bytes(b"\x1b]9;build finished\x07");
+        screen.apply_bytes(b"\x1b]9;4;1;50\x07");
+        screen.apply_bytes(b"\x1b]777;notify;title;body\x1b\\");
+        screen.apply_bytes(b"\x1b]0;window title\x07");
+        assert_eq!(
+            screen.take_notifications(),
+            vec![
+                NotificationKind::Bell,
+                NotificationKind::Osc9,
+                NotificationKind::Osc777
+            ]
+        );
+        assert!(screen.take_notifications().is_empty());
+    }
     use super::{
         ATTACH_HANDSHAKE_MAGIC, ATTACH_REQUEST_ATTACH, ATTACH_SCREEN_ENTER_ESCAPE,
         AltScreenTracker, AttachedClient, CprReplyParse, DEFAULT_DETACH_SEQUENCE,
         ERASE_NATIVE_SCROLLBACK, PtyProxy, ReadFdOutcome, ScreenState, TERMINAL_RESTORE_NORMAL,
-        decode_attach_handshake, discard_late_terminal_input, encode_attach_request_frame,
-        nonzero_screen_dimension, read_fd_once, select_attach_replay_bytes,
-        terminal_restore_escape, write_all_fd,
+        approval_frame, decode_attach_handshake, discard_late_terminal_input,
+        encode_attach_request_frame, nonzero_screen_dimension, read_fd_once,
+        select_attach_replay_bytes, terminal_restore_escape, write_all_fd,
     };
     use nix::libc;
     use nix::pty::{OpenptyResult, Winsize, openpty};
@@ -2882,7 +3212,7 @@ mod tests {
     use std::os::unix::net::UnixListener;
     use std::os::unix::net::UnixStream;
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn discard_late_terminal_input_drains_pending_query_reply() {
@@ -3028,6 +3358,11 @@ mod tests {
             saved_termios: None,
             scrollback: VecDeque::new(),
             screen: ScreenState::new(24, 80),
+            approval_view: crate::approval_status::ApprovalView::default(),
+            capture: None,
+            client_label: "local".to_string(),
+            attach_count: 0,
+            capture_stop_requested: false,
             detach_sequence: sequence.to_vec(),
             pending_detach_match_len: 0,
             pending_detach_escape: Vec::new(),
@@ -3075,6 +3410,178 @@ mod tests {
         proxy.client = Some(AttachedClient::socket(OwnedFd::from(client)));
     }
 
+    fn approval_pending()
+    -> std::collections::BTreeMap<uuid::Uuid, crate::approval_status::PendingApproval> {
+        let request = nono::ApprovalRequest::Network {
+            request_id: "approval-view-test".into(),
+            host: "api.example.com".into(),
+            port: 443,
+            protocol: "tcp".into(),
+            resolved_ips: vec![],
+            reason: None,
+            child_pid: 42,
+            session_id: "test-session".into(),
+        };
+        std::collections::BTreeMap::from([(
+            uuid::Uuid::new_v4(),
+            crate::approval_status::PendingApproval::new(
+                "platform",
+                &request,
+                Duration::from_secs(60),
+                true,
+            ),
+        )])
+    }
+
+    fn client_output(client: &mut UnixStream) -> Vec<u8> {
+        client.set_nonblocking(true).expect("nonblocking client");
+        let mut bytes = Vec::new();
+        let result = client.read_to_end(&mut bytes);
+        assert!(
+            result.is_ok() || result.is_err_and(|err| err.kind() == std::io::ErrorKind::WouldBlock)
+        );
+        bytes
+    }
+
+    #[test]
+    fn approval_view_collects_output_and_restores_both_agent_screen_modes() {
+        for alternate in [false, true] {
+            let (master, mut agent) = UnixStream::pair().expect("agent stream");
+            let mut proxy =
+                build_test_proxy_with_master(master.into(), DEFAULT_DETACH_SEQUENCE.as_slice());
+            let (client, mut user) = UnixStream::pair().expect("client stream");
+            proxy.client = Some(AttachedClient::socket(client.into()));
+            let mut terminal = ScreenState::new(24, 80);
+            let initial: &[u8] = if alternate {
+                b"\x1b[?1049h\x1b[3;18r\x1b[?6h\x1b[2;4Hagent before"
+            } else {
+                b"\x1b[3;18r\x1b[?6h\x1b[2;4Hagent before"
+            };
+            agent.write_all(initial).expect("agent output");
+            assert!(proxy.proxy_master_to_client());
+            terminal.apply_bytes(&client_output(&mut user));
+
+            let pending = approval_pending();
+            let later = Instant::now() + Duration::from_secs(1);
+            proxy.update_approval_view(&pending, later);
+            terminal.apply_bytes(&client_output(&mut user));
+            assert!(
+                terminal
+                    .render_plaintext()
+                    .contains("Waiting for platform approval")
+            );
+
+            agent
+                .write_all(b"\x1b[4;20r\x1b[?6h\x1b[2J\x1b[5;6Hagent after")
+                .expect("agent update");
+            assert!(proxy.proxy_master_to_client());
+            assert!(
+                client_output(&mut user).is_empty(),
+                "agent cannot overwrite approval"
+            );
+            assert!(proxy.screen.render_plaintext().contains("agent after"));
+            assert!(!proxy.screen.render_plaintext().contains("Approval"));
+
+            proxy.update_approval_view(&std::collections::BTreeMap::new(), later);
+            terminal.apply_bytes(&client_output(&mut user));
+            assert_eq!(terminal.render_plaintext(), proxy.screen.render_plaintext());
+            assert_eq!(terminal.alternate_screen_active(), alternate);
+            let next = b"\x1b[Hnext agent frame\r\ncontinued";
+            terminal.apply_bytes(next);
+            proxy.screen.apply_bytes(next);
+            assert_eq!(
+                terminal.render_plaintext(),
+                proxy.screen.render_plaintext(),
+                "agent drawing keeps its scroll region and origin mode"
+            );
+        }
+    }
+
+    #[test]
+    fn approval_view_consumes_input_and_escape_restores_agent_without_deciding() {
+        let (master, mut agent) = UnixStream::pair().expect("agent stream");
+        let mut proxy =
+            build_test_proxy_with_master(master.into(), DEFAULT_DETACH_SEQUENCE.as_slice());
+        let (client, mut user) = UnixStream::pair().expect("client stream");
+        proxy.client = Some(AttachedClient::socket(client.into()));
+        let pending = approval_pending();
+        let later = Instant::now() + Duration::from_secs(1);
+        proxy.update_approval_view(&pending, later);
+        let _ = client_output(&mut user);
+        user.write_all(b"yes\r").expect("view input");
+        assert!(proxy.proxy_client_to_master());
+        agent.set_nonblocking(true).expect("nonblocking agent");
+        let mut buf = [0; 32];
+        assert_eq!(
+            agent
+                .read(&mut buf)
+                .expect_err("input must not reach agent")
+                .kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        user.write_all(b"\x1b").expect("dismiss");
+        assert!(proxy.proxy_client_to_master());
+        assert!(proxy.approval_view.frame.is_none());
+        proxy.update_approval_view(&pending, later);
+        assert!(proxy.approval_view.frame.is_none());
+        user.write_all(b"hello").expect("agent input");
+        assert!(proxy.proxy_client_to_master());
+        assert_eq!(agent.read(&mut buf).expect("agent receives input"), 5);
+        assert_eq!(&buf[..5], b"hello");
+    }
+
+    #[test]
+    fn approval_frame_clips_styled_wide_text_and_tiny_terminals() {
+        for size in [(24, 80), (8, 30), (1, 1)] {
+            let mut terminal = ScreenState::new(size.0 as usize, size.1 as usize);
+            let text = format!("Approval\n\x1b[31m{}\x1b[0m\nEsc: return", "界".repeat(200));
+            terminal.apply_bytes(&approval_frame(&text, size));
+            assert!(terminal.render_plaintext().starts_with(if size.1 == 1 {
+                "A"
+            } else {
+                "Approval"
+            }));
+        }
+    }
+
+    #[test]
+    fn approval_view_resizes_without_agent_output_and_shows_again_on_reattach() {
+        let (mut proxy, _slave) = build_test_proxy_over_pty(&DEFAULT_DETACH_SEQUENCE);
+        let (client, mut user) = UnixStream::pair().expect("client stream");
+        proxy.client = Some(AttachedClient::socket(client.into()));
+        let pending = approval_pending();
+        let later = Instant::now() + Duration::from_secs(1);
+        proxy.update_approval_view(&pending, later);
+        let _ = client_output(&mut user);
+        let size = Winsize {
+            ws_row: 8,
+            ws_col: 30,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        // SAFETY: master is a live PTY descriptor and size is a valid winsize.
+        assert_eq!(
+            unsafe { libc::ioctl(proxy.master.as_raw_fd(), libc::TIOCSWINSZ, &size) },
+            0
+        );
+        proxy.update_approval_view(&pending, later);
+        assert_eq!(proxy.approval_view.size, (8, 30));
+        let mut terminal = ScreenState::new(8, 30);
+        terminal.apply_bytes(&client_output(&mut user));
+        assert!(terminal.render_plaintext().contains("Esc: return"));
+        proxy.approval_view.dismiss();
+        proxy.update_approval_view(&pending, later);
+        assert!(proxy.approval_view.frame.is_none());
+        let _ = proxy.detach();
+        let (client, mut reattached) = UnixStream::pair().expect("reattached stream");
+        proxy.client = Some(AttachedClient::socket(client.into()));
+        proxy.update_approval_view(&pending, later);
+        assert!(proxy.approval_view.frame.is_some());
+        let mut terminal = ScreenState::new(8, 30);
+        terminal.apply_bytes(&client_output(&mut reattached));
+        assert!(terminal.render_plaintext().contains("Approval"));
+    }
+
     fn edit_slave_termios(slave: &OwnedFd, edit: impl FnOnce(&mut Termios)) {
         let mut attrs = tcgetattr(slave).expect("tcgetattr slave");
         edit(&mut attrs);
@@ -3108,7 +3615,7 @@ mod tests {
             nonzero_screen_dimension(30),
             30,
         );
-        parser.process(b"$ nono connect\r\nconnected\r\ndetach keys\r\n");
+        parser.process(b"$ nono remote connect\r\nconnected\r\ndetach keys\r\n");
         // Reproduce a saved cursor above the connection banner. Restoring only
         // the alternate buffer would put the next prompt over that banner.
         parser.process(b"\x1b[H");
@@ -3120,7 +3627,7 @@ mod tests {
         parser.process(b"Detached\r\n$ ");
         assert_eq!(parser.screen().contents(), "Detached\n$ ");
         parser.screen_mut().set_scrollback(6);
-        assert!(parser.screen().contents().contains("$ nono connect"));
+        assert!(parser.screen().contents().contains("$ nono remote connect"));
         assert!(parser.screen().contents().contains("connected"));
         assert!(parser.screen().contents().contains("detach keys"));
     }

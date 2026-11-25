@@ -31,11 +31,15 @@ _Approved; implementation may proceed._
   Before nono reaches 1.0.0, we should remove the deprecations, dead code, backward-compat aliases, and library/CLI boundary drift that have built up since the project started.
 - **[NEP-0004: Opt-in Linux namespace isolation](neps/0004-opt-in-linux-namespace-isolation.md)** — _Non-breaking_
   Add an opt-in, permanently default-off Linux isolation layer that runs the sandboxed workload inside a set of unprivileged namespaces (user + network, later a minimal mount-mask), layered on top of the existing Landlock and seccomp enforcement.
+- **[NEP-0010: Session terminal capture](neps/0010-session-terminal-capture.md)** — _Non-breaking_
+  Let the nono supervisor capture what a session showed and was told: its terminal output, the input sent to it, and the terminal facts around them. nono keeps this as a tamper-evident recording linked into the audit log, and can deliver it, durably and live, to an external receiver over open protocols. nono captures, protects and delivers.
 
 ## Draft
 
 _Under active authoring; not yet ready for a decision._
 
+- **[NEP-0009: Account sign-in from the CLI (`nono platform login`)](neps/0009-cli-login.md)** — _Breaking_
+  Add `nono platform login`, which signs a person in to a nono platform from the terminal.
 - **[NEP-0007: Supervisor decisions, audit and credentials outside a microVM guest](neps/0007-remote-supervisor-decisions-over-vsock.md)** — _Breaking: not yet assessed_
   Let nono split its supervisor across a virtual-machine boundary.
 - **[NEP-0008: Session flight recorder](neps/0008-session-flight-recorder.md)** — _Breaking: not yet assessed_
@@ -44,5 +48,5 @@ _Under active authoring; not yet ready for a decision._
   Extend the Tool Sandbox policy model so that a sandboxed command can request a narrowly scoped filesystem capability for one invocation without escaping the filesystem policy selected for that invocation.
 - **[NEP-0005: Windows enforcement backend](neps/0005-windows-enforcement-backend.md)** — _Non-breaking_
   Add a third OS enforcement backend to nono for Windows, alongside Linux (Landlock) and macOS (Seatbelt).
-- **[NEP-0009: Account sign-in from the CLI (`nono login`)](neps/0009-cli-login.md)** — _Non-breaking_
-  Add `nono login`, which signs a person in to a nono platform from the terminal.
+- **[NEP-0011: macOS Endpoint Security layer for runtime approvals and kernel-enforced policy](neps/0011-macos-endpoint-security-gate.md)** — _Non-breaking_
+  Give macOS the runtime approvals and kernel-enforced policy it lacks today.

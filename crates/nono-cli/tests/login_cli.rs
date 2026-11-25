@@ -1,4 +1,4 @@
-//! CLI-level coverage for `nono login` and `nono logout` (NEP-0009)
+//! CLI-level coverage for `nono platform login` and `nono platform logout` (NEP-0009)
 //! failure paths. Each test runs the binary with HOME and XDG
 //! directories pointed at a fresh temporary directory, so nothing touches the
 //! developer's real session, and checks that a failed login leaves nothing
@@ -7,11 +7,13 @@
 use std::path::Path;
 use std::process::{Command, Output};
 
-fn nono(home: &Path, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
+fn nono_command(home: &Path, args: &[&str], extra_env: &[(&str, &str)]) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_nono"));
     command
         .args(args)
         .env_remove("NONO_CAP_FILE")
+        .env_remove("NONO_NO_ENROLL")
+        .env_remove("NONO_TENANT")
         .env_remove("NONO_PLATFORM_URL")
         .env("HOME", home)
         .env("XDG_CONFIG_HOME", home.join("config"))
@@ -20,7 +22,13 @@ fn nono(home: &Path, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
     for (name, value) in extra_env {
         command.env(name, value);
     }
-    command.output().expect("run nono")
+    command
+}
+
+fn nono(home: &Path, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
+    nono_command(home, args, extra_env)
+        .output()
+        .expect("run nono")
 }
 
 fn stderr(output: &Output) -> String {
@@ -58,11 +66,60 @@ fn walk(dir: &Path) -> Vec<std::path::PathBuf> {
 }
 
 #[test]
+fn login_rejects_empty_names_and_names_without_enrollment() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let output = nono(home.path(), &["platform", "login", "--name", " \n\t "], &[]);
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("device name must contain visible characters"));
+    assert_not_enrolled(home.path());
+    let output = nono(
+        home.path(),
+        &["platform", "login", "--name", "Laptop", "--no-enroll"],
+        &[],
+    );
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("cannot be used with"));
+    assert_not_enrolled(home.path());
+}
+
+#[test]
+fn login_name_conflicts_only_with_an_enabled_enrollment_opt_out() {
+    let home = tempfile::tempdir().expect("tempdir");
+    for value in ["true", "1", "yes", "false", "0", "no"] {
+        let output = nono(
+            home.path(),
+            &[
+                "platform",
+                "login",
+                "--name",
+                "Pilot laptop",
+                "--url",
+                "http://nono.example.com",
+            ],
+            &[("NONO_NO_ENROLL", value)],
+        );
+        assert!(!output.status.success());
+        let expected = if ["true", "1", "yes"].contains(&value) {
+            "--name cannot be used with"
+        } else {
+            "HTTPS"
+        };
+        assert!(
+            stderr(&output).contains(expected),
+            "{value}: {}",
+            stderr(&output)
+        );
+        assert_not_enrolled(home.path());
+    }
+}
+
+#[test]
 fn login_inside_a_sandbox_fails_closed() {
     let home = tempfile::tempdir().expect("tempdir");
     let output = nono(
         home.path(),
         &[
+            "platform",
             "login",
             "--url",
             "https://nono.example.com",
@@ -84,7 +141,7 @@ fn logout_inside_a_sandbox_fails_closed() {
     let home = tempfile::tempdir().expect("tempdir");
     let output = nono(
         home.path(),
-        &["logout"],
+        &["platform", "logout"],
         &[("NONO_CAP_FILE", "/nonexistent/cap-file")],
     );
     assert!(!output.status.success());
@@ -96,11 +153,48 @@ fn login_rejects_plain_http_to_a_remote_host() {
     let home = tempfile::tempdir().expect("tempdir");
     let output = nono(
         home.path(),
-        &["login", "--url", "http://nono.example.com"],
+        &["platform", "login", "--url", "http://nono.example.com"],
         &[],
     );
     assert!(!output.status.success());
     assert!(stderr(&output).contains("HTTPS"), "{}", stderr(&output));
+    assert_not_enrolled(home.path());
+}
+
+#[test]
+fn reenrollment_without_local_registration_directs_to_normal_login() {
+    let home = tempfile::tempdir().expect("home");
+    let output = nono(
+        home.path(),
+        &[
+            "platform",
+            "re-enroll",
+            "--url",
+            "http://127.0.0.1:9",
+            "--no-open",
+        ],
+        &[],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = String::from_utf8(output.stdout).expect("text");
+    assert!(text.contains("No enrollment to replace"), "{text}");
+    assert!(
+        text.contains("re-enroll is only for revoked device enrollments"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Use normal login: nono platform login --url http://127.0.0.1:9"),
+        "{text}"
+    );
+    assert_not_enrolled(home.path());
+}
+
+#[test]
+fn reenrollment_cannot_be_combined_with_enrollment_opt_out() {
+    let home = tempfile::tempdir().expect("home");
+    let output = nono(home.path(), &["platform", "re-enroll", "--no-enroll"], &[]);
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("cannot be used"));
     assert_not_enrolled(home.path());
 }
 
@@ -113,7 +207,11 @@ fn failed_discovery_leaves_no_session_or_key() {
         .expect("port")
         .port();
     let url = format!("http://127.0.0.1:{port}");
-    let output = nono(home.path(), &["login", "--url", &url, "--device-code"], &[]);
+    let output = nono(
+        home.path(),
+        &["platform", "login", "--url", &url, "--device-code"],
+        &[],
+    );
     assert!(!output.status.success());
     assert!(stderr(&output).contains("discovery"), "{}", stderr(&output));
     // No record, refresh token or session key was written.
@@ -140,32 +238,29 @@ fn workload_enrollment_without_a_token_is_rejected() {
 }
 
 #[test]
-fn organizations_are_chosen_through_login_and_nono_org_only() {
+fn tenant_overrides_require_sign_in_and_local_ps_rejects_them() {
     let home = tempfile::tempdir().expect("tempdir");
-    // There is no `nono org` command and no per-command `--org` flag.
-    for args in [
-        &["org", "list"][..],
-        &["ps", "--remote", "--org", "acme"][..],
-        &["connect", "--org", "acme"][..],
+    for args in [&["org", "list"][..], &["ps", "--tenant", "acme"][..]] {
+        assert!(!nono(home.path(), args, &[]).status.success());
+    }
+    for (args, env) in [
+        (vec!["remote", "list", "--tenant", "acme"], vec![]),
+        (vec!["remote", "list"], vec![("NONO_TENANT", "acme")]),
     ] {
-        let output = nono(home.path(), args, &[]);
-        assert!(!output.status.success(), "{args:?} was accepted");
+        let output = nono(home.path(), &args, &env);
+        assert!(!output.status.success());
+        assert!(
+            stderr(&output).contains("requires a platform sign-in"),
+            "{}",
+            stderr(&output)
+        );
     }
 
-    // NONO_ORG picks the organization for one command, and needs a sign-in.
-    let output = nono(home.path(), &["ps", "--remote"], &[("NONO_ORG", "acme")]);
-    assert!(!output.status.success());
-    assert!(
-        stderr(&output).contains("NONO_ORG needs a platform sign-in"),
-        "{}",
-        stderr(&output)
-    );
-
     // Switching organization is a sign-in operation, so it is refused inside
-    // a sandbox like the rest of `nono login`.
+    // a sandbox like the rest of `nono platform login`.
     let output = nono(
         home.path(),
-        &["login", "--org", "acme"],
+        &["platform", "login", "--tenant", "acme"],
         &[("NONO_CAP_FILE", "/nonexistent/cap-file")],
     );
     assert!(!output.status.success());
@@ -176,7 +271,7 @@ fn organizations_are_chosen_through_login_and_nono_org_only() {
 #[test]
 fn logout_without_a_session_is_a_no_op() {
     let home = tempfile::tempdir().expect("tempdir");
-    let output = nono(home.path(), &["logout"], &[]);
+    let output = nono(home.path(), &["platform", "logout"], &[]);
     assert!(output.status.success(), "{}", stderr(&output));
     assert!(String::from_utf8_lossy(&output.stdout).contains("Not signed in"));
 }
@@ -221,7 +316,7 @@ fn logout_reports_when_unreadable_credentials_prevent_revocation() {
             ("platform-login-key", "not-a-key", 0o600),
         ],
     );
-    let output = nono(home.path(), &["logout"], &[]);
+    let output = nono(home.path(), &["platform", "logout"], &[]);
     assert!(!output.status.success(), "logout must not report success");
     let message = stderr(&output);
     assert!(message.contains("not revoked"), "{message}");
@@ -239,7 +334,7 @@ fn logout_reports_when_unreadable_credentials_prevent_revocation() {
 fn logout_reports_missing_credentials_as_not_revoked() {
     let home = tempfile::tempdir().expect("tempdir");
     let dir = write_session(home.path(), &[]);
-    let output = nono(home.path(), &["logout"], &[]);
+    let output = nono(home.path(), &["platform", "logout"], &[]);
     assert!(!output.status.success());
     assert!(
         stderr(&output).contains("not revoked"),
@@ -257,7 +352,7 @@ fn logout_reports_leftover_credentials_without_a_record() {
         &[("platform-login-refresh-token", "orphan-refresh", 0o600)],
     );
     std::fs::remove_file(dir.join("platform-login.json")).expect("remove record");
-    let output = nono(home.path(), &["logout"], &[]);
+    let output = nono(home.path(), &["platform", "logout"], &[]);
     assert!(!output.status.success());
     assert!(
         stderr(&output).contains("not revoked"),
@@ -265,4 +360,381 @@ fn logout_reports_leftover_credentials_without_a_record() {
         stderr(&output)
     );
     assert!(!dir.join("platform-login-refresh-token").exists());
+}
+
+#[test]
+fn obsolete_tenant_selectors_are_rejected_instead_of_ignored() {
+    let home = tempfile::tempdir().expect("home");
+    let old_flag = nono(home.path(), &["platform", "login", "--org", "acme"], &[]);
+    assert!(!old_flag.status.success());
+    let old_env = nono(home.path(), &["remote", "list"], &[("NONO_ORG", "acme")]);
+    assert!(!old_env.status.success());
+    assert!(stderr(&old_env).contains("replaced by NONO_TENANT"));
+}
+
+fn write_pending_tenants(home: &Path) -> std::path::PathBuf {
+    std::fs::create_dir_all(home.join("config")).expect("config dir");
+    let dir = write_session(home, &[]);
+    let path = dir.join("platform-login.json");
+    let mut record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).expect("record")).expect("JSON");
+    record["tenant_selection_pending"] = true.into();
+    record["organizations"] = serde_json::json!([
+        {"tenant_id": "t-1", "slug": "alice", "display_name": "Alice", "kind": "personal"},
+        {"tenant_id": "t-2", "slug": "acme", "display_name": "Acme", "kind": "organization"}
+    ]);
+    std::fs::write(&path, record.to_string()).expect("pending session");
+    path
+}
+
+#[test]
+fn tenant_picker_requires_an_explicit_tenant_without_a_terminal() {
+    let home = tempfile::tempdir().expect("home");
+    let path = write_pending_tenants(home.path());
+    let output = nono(home.path(), &["platform", "login", "--no-enroll"], &[]);
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("--tenant"));
+    assert!(!output.stdout.contains(&0x1b));
+    let record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(path).expect("record")).expect("JSON");
+    assert_eq!(record["tenant_selection_pending"], true);
+}
+
+#[test]
+fn tenant_picker_uses_connect_controls_and_restores_the_terminal_on_cancel() {
+    use nix::pty::openpty;
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    use std::time::{Duration, Instant};
+
+    struct Running(std::process::Child);
+    impl Drop for Running {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let home = tempfile::tempdir().expect("home");
+    let path = write_pending_tenants(home.path());
+    let original_record = std::fs::read(&path).expect("record");
+    let pty = openpty(None, None).expect("PTY");
+    let original = nix::sys::termios::tcgetattr(&pty.slave).expect("terminal mode");
+    let mut command = nono_command(home.path(), &["platform", "login", "--no-enroll"], &[]);
+    command
+        .stdin(nix::unistd::dup(&pty.slave).expect("stdin"))
+        .stdout(nix::unistd::dup(&pty.slave).expect("stdout"))
+        .stderr(nix::unistd::dup(&pty.slave).expect("stderr"));
+    let mut child = Running(command.spawn().expect("nono"));
+    let mut master = std::fs::File::from(pty.master);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut output = Vec::new();
+    let mut sent = false;
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "picker timed out: {}",
+            String::from_utf8_lossy(&output)
+        );
+        let mut descriptor = nix::libc::pollfd {
+            fd: master.as_raw_fd(),
+            events: nix::libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: descriptor is initialized and remains alive throughout poll.
+        let ready = unsafe { nix::libc::poll(&mut descriptor, 1, 100) };
+        assert!(ready >= 0, "poll failed");
+        if descriptor.revents & nix::libc::POLLIN != 0 {
+            let mut buffer = [0; 8192];
+            let read = master.read(&mut buffer).expect("terminal output");
+            output.extend_from_slice(&buffer[..read]);
+        } else if child.0.try_wait().expect("status").is_some() {
+            break;
+        }
+        if !sent && output.windows(4).any(|bytes| bytes == b"Acme") {
+            nix::unistd::write(&master, b"\x1b[Bq").expect("arrow and cancel");
+            sent = true;
+        }
+    }
+    assert!(sent, "picker was displayed");
+    assert!(!child.0.wait().expect("exit").success());
+    let restored = nix::sys::termios::tcgetattr(&pty.slave).expect("restored terminal");
+    assert_eq!(restored.input_flags, original.input_flags);
+    assert_eq!(restored.output_flags, original.output_flags);
+    assert_eq!(restored.control_flags, original.control_flags);
+    assert_eq!(restored.control_chars, original.control_chars);
+    // PTY input can leave the kernel's PENDIN bookkeeping bit set.
+    let modes = !nix::sys::termios::LocalFlags::PENDIN;
+    assert_eq!(restored.local_flags & modes, original.local_flags & modes);
+    let output = String::from_utf8_lossy(&output);
+    assert!(output.contains("NONO TENANT"));
+    assert!(output.contains("personal"));
+    assert!(output.contains("organization"));
+    assert!(output.contains("enter select"));
+    assert!(
+        output
+            .lines()
+            .any(|line| line.contains('❯') && line.contains("Acme")),
+        "arrow highlights Acme: {output}"
+    );
+    assert!(output.contains("\x1b[?1049h\x1b[?25l"));
+    assert!(output.contains("\x1b[?25h\x1b[?1049l"));
+    assert!(output.contains("tenant selection cancelled"));
+    assert_eq!(
+        std::fs::read(path).expect("retained session"),
+        original_record
+    );
+    assert!(!home.path().join("config/nono/platform.json").exists());
+}
+
+#[test]
+fn enrollment_status_uses_labels_and_keeps_ids_in_json_only() {
+    let home = tempfile::tempdir().expect("home");
+    let dir = home.path().join("config/nono");
+    std::fs::create_dir_all(&dir).expect("config");
+    let path = dir.join("platform.json");
+    let mut record = serde_json::json!({
+        "protocol_version": "1", "platform_url": "https://nono.example.com",
+        "tenant_id": "tenant-private-uuid", "subject_id": "device-private-uuid",
+        "subject_kind": "device", "management_mode": "audit_only",
+        "key_algorithm": "ecdsa_p256_sha256_fixed", "key_ref": "file:///private/key/location",
+        "enrolled_at": "2026-11-11T11:28:00Z", "display_name": "Alice laptop",
+        "tenant": {"tenant_id":"tenant-private-uuid", "slug":"acme", "display_name":"Acme", "kind":"organization"}
+    });
+    std::fs::write(&path, record.to_string()).expect("state");
+    let output = nono(home.path(), &["platform", "status"], &[]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = String::from_utf8(output.stdout).expect("text");
+    for label in [
+        "Acme (acme)",
+        "Alice laptop",
+        "Tenant           Acme (acme)",
+        "Alice laptop · enrolled",
+        "Not checked · use --refresh",
+    ] {
+        assert!(text.contains(label), "{text}");
+    }
+    for internal in [
+        "tenant-private-uuid",
+        "device-private-uuid",
+        "private/key/location",
+        "audit_only",
+        "ecdsa_p256",
+    ] {
+        assert!(!text.contains(internal), "{text}");
+    }
+    let output = nono(home.path(), &["platform", "status", "--json"], &[]);
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON");
+    assert_eq!(json["tenant_id"], "tenant-private-uuid");
+    assert_eq!(json["subject_id"], "device-private-uuid");
+    assert!(json["management_mode"].is_null());
+    assert!(json["last_verified_management_mode"].is_null());
+    assert!(json["policy_assignment"].is_null());
+    assert_eq!(json["policy_refreshed"], false);
+    assert!(json.get("key_ref").is_none());
+    assert!(json.get("key_algorithm").is_none());
+    record.as_object_mut().expect("object").remove("tenant");
+    record
+        .as_object_mut()
+        .expect("object")
+        .remove("display_name");
+    std::fs::write(path, record.to_string()).expect("legacy state");
+    let output = nono(home.path(), &["platform", "status"], &[]);
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).expect("legacy text");
+    assert!(text.contains("Name not recorded"));
+    assert!(!text.contains("device-private-uuid"));
+}
+
+#[test]
+fn enrollment_environment_boolean_is_validated_and_conflicts_with_recovery() {
+    let home = tempfile::tempdir().expect("home");
+    for value in ["true", "1"] {
+        let output = nono(
+            home.path(),
+            &["platform", "re-enroll"],
+            &[("NONO_NO_ENROLL", value)],
+        );
+        assert!(!output.status.success());
+        assert!(
+            stderr(&output).contains("cannot be used"),
+            "{}",
+            stderr(&output)
+        );
+    }
+    for value in ["false", "0"] {
+        let output = nono(
+            home.path(),
+            &["platform", "re-enroll"],
+            &[("NONO_NO_ENROLL", value)],
+        );
+        assert!(output.status.success(), "{}", stderr(&output));
+    }
+    let invalid = nono(
+        home.path(),
+        &["platform", "login"],
+        &[("NONO_NO_ENROLL", "maybe")],
+    );
+    assert!(!invalid.status.success());
+    assert!(stderr(&invalid).contains("invalid value"));
+    assert_not_enrolled(home.path());
+}
+
+#[test]
+fn status_without_a_policy_cache_reports_only_verified_mode_history() {
+    for mode in [None, Some("audit_only"), Some("advisory"), Some("enforced")] {
+        for revoked in [false, true] {
+            let home = tempfile::tempdir().expect("home");
+            let dir = home.path().join("config/nono");
+            std::fs::create_dir_all(&dir).expect("config");
+            let record = serde_json::json!({
+                "protocol_version": "1", "platform_url": "https://nono.example.com",
+                "tenant_id": "tenant-private", "subject_id": "device-private",
+                "subject_kind": "device", "management_mode": "audit_only",
+                "key_algorithm": "ecdsa_p256_sha256_fixed", "key_ref": "file:///private/key",
+                "enrolled_at": "2026-11-11T11:28:00Z", "last_policy_mode": mode,
+                "revoked": revoked,
+            });
+            let path = dir.join("platform.json");
+            let original = record.to_string();
+            std::fs::write(&path, &original).expect("registration");
+            let output = nono(home.path(), &["platform", "status", "--json"], &[]);
+            assert!(output.status.success(), "{}", stderr(&output));
+            let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON");
+            assert_eq!(json["management_mode"], serde_json::json!(mode));
+            assert_eq!(
+                json["last_verified_management_mode"],
+                serde_json::json!(mode)
+            );
+            assert!(json["policy_assignment"].is_null());
+            assert_eq!(json["policy_refreshed"], false);
+            assert_eq!(json["enrolled"], !revoked);
+            assert!(!String::from_utf8_lossy(&output.stdout).contains("private/key"));
+            let output = nono(home.path(), &["platform", "status"], &[]);
+            assert!(output.status.success(), "{}", stderr(&output));
+            let text = String::from_utf8(output.stdout).expect("text");
+            if mode.is_some() {
+                assert!(text.contains("last verified"), "{text}");
+                assert!(text.contains("Cached assignment unavailable"), "{text}");
+            } else {
+                assert!(text.contains("Not checked"), "{text}");
+                assert!(!text.contains("last verified"), "{text}");
+            }
+            assert_eq!(
+                std::fs::read_to_string(path).expect("retained registration"),
+                original
+            );
+        }
+    }
+}
+
+#[test]
+fn remote_only_status_reports_context_without_claiming_device_enrollment() {
+    let home = tempfile::tempdir().expect("home");
+    let dir = write_session(home.path(), &[]);
+    let path = dir.join("platform-login.json");
+    let mut record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).expect("record")).expect("JSON");
+    record["organizations"] = serde_json::json!([
+        {"tenant_id":"t-1", "slug":"alice", "display_name":"Alice", "kind":"personal"}
+    ]);
+    std::fs::write(path, record.to_string()).expect("record");
+    let status = nono(home.path(), &["platform", "status"], &[]);
+    assert!(status.status.success(), "{}", stderr(&status));
+    let text = String::from_utf8(status.stdout).expect("text");
+    for label in [
+        "User             Alice",
+        "Tenant           Personal",
+        "Device           Not enrolled",
+    ] {
+        assert!(text.contains(label), "{text}");
+    }
+    let status = nono(home.path(), &["platform", "status", "--json"], &[]);
+    let json: serde_json::Value = serde_json::from_slice(&status.stdout).expect("JSON");
+    assert_eq!(json["enrolled"], false);
+    assert_eq!(json["context"]["tenant_id"], "t-1");
+    assert_eq!(json["context"]["user_display"], "Alice");
+    assert!(json["context"].get("key_thumbprint").is_none());
+    assert!(json["context"].get("console_url").is_none());
+}
+
+#[test]
+fn remote_commands_share_the_noninteractive_tenant_selection_error() {
+    let home = tempfile::tempdir().expect("home");
+    write_pending_tenants(home.path());
+    for args in [
+        vec!["remote", "list", "--json"],
+        vec![
+            "remote",
+            "run",
+            "--agent",
+            "claude",
+            "--workspace",
+            "project",
+            "--detach",
+        ],
+    ] {
+        let output = nono(home.path(), &args, &[]);
+        assert!(!output.status.success());
+        assert!(
+            stderr(&output).contains("multiple tenants are available"),
+            "{}",
+            stderr(&output)
+        );
+        assert!(output.stdout.is_empty());
+        assert!(!home.path().join("config/nono/platform.json").exists());
+    }
+}
+
+#[test]
+fn explicit_tokens_cannot_be_silently_rebound_to_a_tenant() {
+    let home = tempfile::tempdir().expect("home");
+    for (args, env) in [
+        (
+            vec!["remote", "list", "--tenant", "acme"],
+            vec![("NONO_CONNECT_TOKEN", "explicit")],
+        ),
+        (
+            vec![
+                "remote",
+                "run",
+                "--agent",
+                "claude",
+                "--workspace",
+                "project",
+                "--detach",
+                "--tenant",
+                "acme",
+            ],
+            vec![("NONO_RUN_TOKEN", "explicit")],
+        ),
+    ] {
+        let output = nono(home.path(), &args, &env);
+        assert!(!output.status.success());
+        assert!(
+            stderr(&output).contains("already have their own scope"),
+            "{}",
+            stderr(&output)
+        );
+        assert_not_enrolled(home.path());
+    }
+}
+
+#[test]
+fn tenant_switch_and_listing_require_an_existing_human_sign_in() {
+    let home = tempfile::tempdir().expect("home");
+    for args in [
+        vec!["platform", "tenant", "use", "acme", "--no-enroll"],
+        vec!["platform", "tenant", "list", "--json"],
+    ] {
+        let output = nono(home.path(), &args, &[]);
+        assert!(!output.status.success());
+        assert!(
+            stderr(&output).contains("nono platform login"),
+            "{}",
+            stderr(&output)
+        );
+        assert!(!stderr(&output).contains("Session key fingerprint"));
+        assert_not_enrolled(home.path());
+    }
 }

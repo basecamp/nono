@@ -150,14 +150,30 @@ fn rewrite_absolute_to_origin_form(line: &str) -> Result<String> {
     ))
 }
 
-/// Strip hop-by-hop proxy headers (`Proxy-Connection`, `Proxy-Authorization`)
-/// from a raw header block before forwarding upstream.
+/// Header fields the forward path never passes upstream: proxy hop-by-hop
+/// fields, connection management (re-added as `Connection: close`), and body
+/// framing (re-added as `Content-Length` after the body is read).
+fn is_forward_stripped_header(name: &str) -> bool {
+    [
+        "proxy-connection",
+        "proxy-authorization",
+        "connection",
+        "keep-alive",
+        "content-length",
+        "transfer-encoding",
+    ]
+    .iter()
+    .any(|stripped| name.eq_ignore_ascii_case(stripped))
+}
+
+/// Strip hop-by-hop headers from a raw header block before forwarding upstream.
 ///
 /// These headers are meaningful only on the client<->proxy hop and must never
-/// be forwarded: `Proxy-Authorization` carries the session token, and
-/// `Proxy-Connection` is a non-standard hop-by-hop hint. Other headers
-/// (including `Host`) are preserved verbatim so the forwarded request matches
-/// what the client sent.
+/// be forwarded: `Proxy-Authorization` carries the session token,
+/// `Proxy-Connection` is a non-standard hop-by-hop hint, and the client's
+/// `Connection`/`Keep-Alive` would keep the upstream connection open after a
+/// response the proxy relays until EOF. Other headers (including `Host`) are
+/// preserved verbatim so the forwarded request matches what the client sent.
 fn strip_proxy_headers(header_bytes: &[u8]) -> Vec<u8> {
     let header_str = match std::str::from_utf8(header_bytes) {
         Ok(s) => s,
@@ -168,11 +184,7 @@ fn strip_proxy_headers(header_bytes: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(header_bytes.len());
     for line in header_str.split_inclusive("\r\n") {
         let name = line.split(':').next().unwrap_or("").trim();
-        if name.eq_ignore_ascii_case("proxy-connection")
-            || name.eq_ignore_ascii_case("proxy-authorization")
-            || name.eq_ignore_ascii_case("content-length")
-            || name.eq_ignore_ascii_case("transfer-encoding")
-        {
+        if is_forward_stripped_header(name) {
             continue;
         }
         out.extend_from_slice(line.as_bytes());
@@ -229,12 +241,7 @@ fn strip_and_redeem_proxy_headers(
             out.extend_from_slice(line.as_bytes());
             continue;
         };
-        let trimmed_name = name.trim();
-        if trimmed_name.eq_ignore_ascii_case("proxy-connection")
-            || trimmed_name.eq_ignore_ascii_case("proxy-authorization")
-            || trimmed_name.eq_ignore_ascii_case("content-length")
-            || trimmed_name.eq_ignore_ascii_case("transfer-encoding")
-        {
+        if is_forward_stripped_header(name.trim()) {
             continue;
         }
         let (value, line_ending) = match rest.strip_suffix("\r\n") {
@@ -704,6 +711,18 @@ impl ProxyHandle {
             // and double-slashed URLs.
             let prefix = route.prefix.trim_matches('/');
 
+            // Synthetic endpoint-filtered routes (prefix
+            // `ENDPOINT_ROUTE_PREFIX` + `<domain>`, created by
+            // `partition_allow_domain` for `allow_domain`
+            // entries with `endpoints`) have no credential and no SDK to
+            // point at them, so a `{PREFIX}_BASE_URL` var only hands the
+            // agent a dead end it will try and fail (see #2286). Skip
+            // them entirely; the route itself stays in the route store,
+            // so proxying and endpoint filtering are unchanged.
+            if prefix.starts_with(crate::config::ENDPOINT_ROUTE_PREFIX) {
+                continue;
+            }
+
             // Base URL override (e.g., OPENAI_BASE_URL)
             let base_url_name = format!("{}_BASE_URL", prefix.to_uppercase());
             let url = format!("http://127.0.0.1:{}/{}", self.port, prefix);
@@ -717,35 +736,15 @@ impl ProxyHandle {
                 continue;
             }
 
-            // API key set to session token (phantom token pattern).
-            // Use explicit env_var if set (required for URI manager refs), otherwise
-            // fall back to uppercasing the credential_key (e.g., "openai_api_key" -> "OPENAI_API_KEY").
-            if let Some(ref env_var) = route.env_var {
-                vars.push((env_var.clone(), self.token.to_string()));
-            } else if let Some(ref cred_key) = route.credential_key {
-                // Skip URI-format keys (e.g. env://, op://, apple-password://) —
-                // uppercasing a URI produces a nonsensical env var name. These
-                // routes must declare an explicit env_var to get phantom token injection.
-                if !cred_key.contains("://") {
-                    let api_key_name = cred_key.to_uppercase();
-                    vars.push((api_key_name, self.token.to_string()));
+            // API key set to the session token (phantom token pattern), wrapped
+            // in the route's `phantom_format` when one is configured.
+            if let Some(name) = phantom_env_name(route, prefix) {
+                match phantom_value(route, &self.token) {
+                    Some(value) => vars.push((name, value)),
+                    // Never fall back to the bare token: the client would hold
+                    // a value the route rejects.
+                    None => warn!("Route '{}': invalid phantom_format; no phantom set", prefix),
                 }
-            } else if route.spiffe.is_some() {
-                // SPIFFE routes use the same phantom token pattern for SDK-style
-                // `*_BASE_URL` clients even though upstream auth is SPIFFE.
-                let api_key_name = format!("{}_API_KEY", prefix.to_uppercase());
-                vars.push((api_key_name, self.token.to_string()));
-            } else if route
-                .oauth2
-                .as_ref()
-                .and_then(|o| o.client_assertion.as_ref())
-                .is_some()
-            {
-                // OAuth2 jwt-bearer assertion routes need the same phantom token
-                // pattern — the proxy validates session integrity before injecting
-                // the exchanged access token, so the child process must present it.
-                let api_key_name = format!("{}_API_KEY", prefix.to_uppercase());
-                vars.push((api_key_name, self.token.to_string()));
             }
         }
         vars
@@ -1057,6 +1056,23 @@ struct ProxyState {
     bound_port: u16,
 }
 
+impl ProxyState {
+    /// Interactive approval context for hosts not on the allowlist, when a
+    /// `network.approval_backends` backend is configured. Shared by the
+    /// CONNECT and plain-HTTP forward paths so both use the same backend,
+    /// session cache, and in-flight prompt coalescing.
+    fn network_approval(&self) -> Option<connect::NetworkApproval<'_>> {
+        self.network_approval_backend
+            .as_ref()
+            .map(|backend| connect::NetworkApproval {
+                backend,
+                session_decisions: self.network_session_decisions.as_ref(),
+                in_flight: self.network_inflight.as_ref(),
+                session_id: &self.network_session_id,
+            })
+    }
+}
+
 struct CompositeNonceResolver {
     external: Option<Arc<dyn crate::token::NonceResolver>>,
     oauth: Arc<OAuthCaptureStore>,
@@ -1105,6 +1121,97 @@ impl crate::token::NonceResolver for CompositeNonceResolver {
             .is_some_and(|resolver| resolver.contains_phantom(value))
             || self.oauth.contains_phantom(value)
     }
+}
+
+/// Env var name carrying a route's phantom token, if the route has one.
+///
+/// Uses explicit `env_var` if set (required for URI manager refs), otherwise the
+/// uppercased `credential_key` (e.g., "openai_api_key" -> "OPENAI_API_KEY").
+/// URI-format keys (env://, op://, apple-password://) are skipped because
+/// uppercasing a URI yields a nonsensical name.
+fn phantom_env_name(route: &crate::config::RouteConfig, prefix: &str) -> Option<String> {
+    if let Some(ref env_var) = route.env_var {
+        return Some(env_var.clone());
+    }
+    if let Some(ref cred_key) = route.credential_key {
+        return (!cred_key.contains("://")).then(|| cred_key.to_uppercase());
+    }
+    // SPIFFE and OAuth2 jwt-bearer assertion routes use the same phantom
+    // pattern: the proxy validates session integrity before injecting the
+    // exchanged token, so the child must present it.
+    let uses_assertion = route
+        .oauth2
+        .as_ref()
+        .and_then(|o| o.client_assertion.as_ref())
+        .is_some();
+    (route.spiffe.is_some() || uses_assertion).then(|| format!("{}_API_KEY", prefix.to_uppercase()))
+}
+
+/// Phantom value for a route: the session token, wrapped in `phantom_format`
+/// when set. `None` means the template is invalid.
+fn phantom_value(route: &crate::config::RouteConfig, token: &str) -> Option<String> {
+    match route.phantom_format.as_deref() {
+        None => Some(token.to_string()),
+        Some(fmt) => crate::token::PhantomTemplate::parse_route(fmt)
+            .ok()
+            .map(|t| t.render(token)),
+    }
+}
+
+/// Reject `phantom_format` configurations that would make the injected
+/// environment ambiguous or clobber env vars nono sets itself.
+pub fn validate_phantom_formats(
+    routes: &[crate::config::RouteConfig],
+    intercept_ca_env_vars: &[String],
+) -> Result<()> {
+    use std::collections::HashMap;
+
+    let base_url_names: std::collections::HashSet<String> = routes
+        .iter()
+        .map(|r| format!("{}_BASE_URL", r.prefix.trim_matches('/').to_uppercase()))
+        .collect();
+    let mut formats: HashMap<String, Option<&str>> = HashMap::new();
+    for route in routes {
+        let prefix = route.prefix.trim_matches('/');
+        let Some(name) = phantom_env_name(route, prefix) else {
+            // The route would reject the bare token yet no env var carries the
+            // formatted phantom, leaving it unusable.
+            if route.phantom_format.is_some() {
+                return Err(ProxyError::Config(format!(
+                    "route '{prefix}': `phantom_format` needs an `env_var` (none can be derived)"
+                )));
+            }
+            continue;
+        };
+        if let Some(fmt) = route.phantom_format.as_deref() {
+            let upper = name.to_ascii_uppercase();
+            let reserved = matches!(
+                upper.as_str(),
+                "HTTP_PROXY" | "HTTPS_PROXY" | "NO_PROXY" | "ALL_PROXY" | "NODE_USE_ENV_PROXY"
+            ) || upper.starts_with("NONO_")
+                || base_url_names.contains(&name)
+                || intercept_ca_env_vars.iter().any(|v| v == &name);
+            if reserved {
+                return Err(ProxyError::Config(format!(
+                    "route '{prefix}': `phantom_format` cannot target reserved env var '{name}'"
+                )));
+            }
+            if let Err(e) = crate::token::PhantomTemplate::parse_route(fmt) {
+                return Err(ProxyError::Config(format!("route '{prefix}': {e}")));
+            }
+        }
+        match formats.get(&name) {
+            Some(prev) if *prev != route.phantom_format.as_deref() => {
+                return Err(ProxyError::Config(format!(
+                    "env var '{name}' is shared by routes with different `phantom_format` values"
+                )));
+            }
+            _ => {
+                formats.insert(name, route.phantom_format.as_deref());
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Start the proxy server.
@@ -1187,6 +1294,7 @@ pub async fn start_with_network_approval(
     network_session_id: String,
 ) -> Result<ProxyHandle> {
     validate_no_proxy_config(&config)?;
+    validate_phantom_formats(&config.routes, &config.intercept_ca_env_vars)?;
 
     // Load route-level configuration (upstream, L7 filtering, custom TLS CA)
     // for ALL routes, regardless of credential presence. This happens before
@@ -1195,7 +1303,7 @@ pub async fn start_with_network_approval(
     let route_store = if config.routes.is_empty() {
         RouteStore::empty()
     } else {
-        RouteStore::load(&config.routes).await?
+        RouteStore::load_with_registry(&config.routes, config.secret_registry.as_ref()).await?
     };
     let route_hosts = route_store.route_upstream_hosts();
     validate_no_proxy_route_conflicts(&config.no_proxy, &route_hosts)?;
@@ -1226,10 +1334,11 @@ pub async fn start_with_network_approval(
 
     info!("Proxy server listening on {}", local_addr);
 
-    let oauth_capture_store = OAuthCaptureStore::load_with_persistence(
+    let mut oauth_capture_store = OAuthCaptureStore::load_with_persistence(
         &config.oauth_capture,
         config.oauth_capture_store_path.clone(),
     )?;
+    oauth_capture_store.set_secret_registry(config.secret_registry.clone());
     let oauth_capture_store = Arc::new(oauth_capture_store);
     let effective_nonce_resolver: Option<Arc<dyn crate::token::NonceResolver>> =
         if oauth_capture_store.is_empty() {
@@ -1285,10 +1394,11 @@ pub async fn start_with_network_approval(
     let (credential_store, proxy_diagnostics) = if config.routes.is_empty() {
         (CredentialStore::empty(), Vec::new())
     } else {
-        let outcome = CredentialStore::load_with_diagnostics(
+        let outcome = CredentialStore::load_with_registry(
             &config.routes,
             &tls_connector,
             config.outer_caps.as_ref(),
+            config.secret_registry.as_ref(),
         )
         .await?;
         (outcome.store, outcome.diagnostics)
@@ -1868,7 +1978,7 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
                         let requires_http1 = state.route_store.requires_http1(&host_port);
                         if state.enable_h2 && requires_http1 {
                             debug!(
-                                "tls_intercept: disabling h2 for {}:{}: AWS SigV4 requires HTTP/1.1",
+                                "tls_intercept: disabling h2 for {}:{}: AWS SigV4 or operation policy requires HTTP/1.1",
                                 host, port
                             );
                         }
@@ -1997,20 +2107,9 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
             None
         };
 
-        // Interactive approval for CONNECT hosts not on the allowlist, when a
-        // `network.approval_backends` backend is configured. Shared session
-        // cache lets "Always allow"/"Always deny" suppress re-prompts. Not
+        // Interactive approval for CONNECT hosts not on the allowlist. Not
         // applied to the chained external-proxy path (that upstream enforces).
-        let network_approval =
-            state
-                .network_approval_backend
-                .as_ref()
-                .map(|backend| connect::NetworkApproval {
-                    backend,
-                    session_decisions: state.network_session_decisions.as_ref(),
-                    in_flight: state.network_inflight.as_ref(),
-                    session_id: &state.network_session_id,
-                });
+        let network_approval = state.network_approval();
 
         if let Some(ext_config) = use_external {
             external::handle_external_proxy(
@@ -2161,8 +2260,10 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
 ///    reverse), honouring `require_auth` so `--no-auth` exempts this path too.
 ///    On failure: 407 + audit denial, matching the reverse path's
 ///    no-credential branch.
-/// 2. Parse host+port from the absolute URL and run the host filter. On deny:
-///    403 + `HostDenied` audit event, mirroring the no-routes inline `else`.
+/// 2. Parse host+port from the absolute URL and run the host filter. A plain
+///    allowlist miss consults the network approval backend, as CONNECT does
+///    (not when chaining through the external proxy). On deny: 403 + audit
+///    event (`HostDenied`, or `ApproveDenied` for a refused approval).
 /// 3. Rewrite the request line to origin-form and strip hop-by-hop proxy
 ///    headers, then forward via the shared L7 pipeline using the
 ///    DNS-rebinding-safe resolved addresses (or the external proxy chain).
@@ -2259,24 +2360,61 @@ async fn handle_forward_http(
             .await;
     }
 
+    // Chained through the external/enterprise proxy unless this is a bypass
+    // host. Decided up front because approval is not offered on the chained
+    // path, mirroring CONNECT (`external::handle_external_proxy`).
+    let chain_external =
+        state.config.external_proxy.is_some() && !state.bypass_matcher.matches(&host);
+
     let check = state.filter.check_host(&host, port).await?;
-    if !check.result.is_allowed() {
-        let reason = check.result.reason();
-        audit::log_denied(
+
+    // A plain allowlist miss may still proceed if the operator approves the
+    // host (or approved it earlier this session), exactly as on the CONNECT
+    // path; see `connect::authorize_host`. Approval is not offered when
+    // chaining through the external proxy.
+    let network_approval = if chain_external {
+        None
+    } else {
+        state.network_approval()
+    };
+    let (resolved_addrs, approved_backend) = match connect::authorize_host(
+        audit::ProxyMode::Reverse,
+        &host,
+        port,
+        check,
+        network_approval.as_ref(),
+        &state.filter,
+        state.audit_log.as_ref(),
+    )
+    .await?
+    {
+        connect::HostAuthorization::Authorized {
+            addrs,
+            approval_backend,
+        } => (addrs, approval_backend),
+        connect::HostAuthorization::Denied { reason } => {
+            let sanitised = reason.replace(['\r', '\n'], " ");
+            let response = format!("HTTP/1.1 403 Forbidden: {}\r\n\r\n", sanitised);
+            stream.write_all(response.as_bytes()).await?;
+            return Ok(());
+        }
+    };
+    if let Some(backend) = approved_backend.as_deref() {
+        // Host was authorized by a runtime approval decision, not the static
+        // allowlist — record it as such, with the deciding backend. Per-request
+        // L7 events follow from forward_request.
+        audit::log_host_approval(
             state.audit_log.as_ref(),
             audit::ProxyMode::Reverse,
             &audit::EventContext {
-                denial_category: Some(nono::undo::NetworkAuditDenialCategory::HostDenied),
+                approval_backend: Some(backend),
                 ..audit::EventContext::default()
             },
             &host,
             port,
-            &reason,
+            nono::undo::NetworkAuditDecision::ApproveGranted,
+            None,
         );
-        let sanitised = reason.replace(['\r', '\n'], " ");
-        let response = format!("HTTP/1.1 403 Forbidden: {}\r\n\r\n", sanitised);
-        stream.write_all(response.as_bytes()).await?;
-        return Ok(());
     }
 
     // Build the origin-form request line and extract method + path so the
@@ -2341,6 +2479,9 @@ async fn handle_forward_http(
     let mut request_bytes = Vec::with_capacity(origin_line.len() + filtered_headers.len() + 64);
     request_bytes.extend_from_slice(origin_line.as_bytes());
     request_bytes.extend_from_slice(&filtered_headers);
+    // One request per inbound connection: ask the upstream to close after the
+    // response so the EOF-delimited relay ends when the response does.
+    request_bytes.extend_from_slice(b"Connection: close\r\n");
     // Always re-frame when the client declared a body (CL or chunked TE),
     // including empty bodies — otherwise upstreams may answer 411 or hang.
     if reverse::should_reframe_with_content_length(header_bytes) {
@@ -2352,7 +2493,7 @@ async fn handle_forward_http(
     //    proxy when configured (unless the host is a bypass host), else
     //    connect directly to the resolved addresses (DNS-rebinding-safe).
     let ext_proxy_addr = match state.config.external_proxy.as_ref() {
-        Some(ext) if !(state.bypass_matcher.matches(&host)) => {
+        Some(ext) if chain_external => {
             // Mirror the CONNECT/intercept paths: external proxy auth is
             // configured-but-unimplemented, so fail loudly rather than
             // silently connecting unauthenticated.
@@ -2388,7 +2529,7 @@ async fn handle_forward_http(
             proxy_auth_header: None,
         },
         None => UpstreamStrategy::Direct {
-            resolved_addrs: &check.resolved_addrs,
+            resolved_addrs: &resolved_addrs,
         },
     };
 
@@ -2410,6 +2551,7 @@ async fn handle_forward_http(
             auth_mechanism: Some(nono::undo::NetworkAuditAuthMechanism::ProxyAuthorization),
             auth_outcome: Some(nono::undo::NetworkAuditAuthOutcome::Succeeded),
             managed_credential_active: Some(credential_redeemed),
+            approval_backend: approved_backend.as_deref(),
             ..audit::EventContext::default()
         },
         target: &host,
@@ -2417,7 +2559,15 @@ async fn handle_forward_http(
         path: &inbound_path,
     };
 
-    match forward::forward_request(stream, &request_bytes, &body, upstream, audit_ctx).await {
+    match forward::forward_request_closing_inbound(
+        stream,
+        &request_bytes,
+        &body,
+        upstream,
+        audit_ctx,
+    )
+    .await
+    {
         Ok(_status) => Ok(()),
         Err(e) => {
             warn!("forward-http upstream connection failed: {}", e);
@@ -2552,6 +2702,283 @@ async fn enforce_forward_http_endpoint_rules(
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+
+    /// Mock origin that records each full request head it receives.
+    async fn spawn_recording_upstream() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let heads = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let heads_handle = std::sync::Arc::clone(&heads);
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let heads_handle = std::sync::Arc::clone(&heads_handle);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    if let Ok(n) = sock.read(&mut buf).await {
+                        heads_handle
+                            .lock()
+                            .unwrap()
+                            .push(String::from_utf8_lossy(&buf[..n]).to_string());
+                    }
+                    let _ = sock
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                        )
+                        .await;
+                });
+            }
+        });
+        (format!("127.0.0.1:{}", addr.port()), heads)
+    }
+
+    /// End to end: a route with `phantom_format` accepts only the rendered
+    /// phantom, swaps in the real credential, and never forwards the phantom.
+    #[tokio::test]
+    async fn test_phantom_format_reverse_route_end_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret_path = dir.path().join("secret");
+        std::fs::write(&secret_path, "real-upstream-secret").unwrap();
+
+        let (upstream, heads) = spawn_recording_upstream().await;
+        let token = "c".repeat(64);
+        let mut route = declarative_route(&format!("http://{upstream}"));
+        route.credential_key = Some(format!("file://{}", secret_path.display()));
+        route.credential_format = Some("Bearer {}".to_string());
+        route.phantom_format = Some("ghp_{}".to_string());
+        route.env_var = Some("GH_TOKEN".to_string());
+        let config = ProxyConfig {
+            routes: vec![route],
+            allowed_hosts: vec!["127.0.0.1".to_string()],
+            session_token: Some(Zeroizing::new(token.clone())),
+            ..Default::default()
+        };
+        let handle = start(config.clone()).await.unwrap();
+
+        let vars = handle.credential_env_vars(&config);
+        assert!(vars.contains(&("GH_TOKEN".to_string(), format!("ghp_{token}"))));
+
+        let request = |auth: &str| {
+            format!(
+                "GET /svc/x HTTP/1.1\r\nHost: h\r\nAuthorization: {auth}\r\nConnection: close\r\n\r\n"
+            )
+        };
+
+        // The bare session token and a wrong body are rejected.
+        for bad in [
+            format!("Bearer {token}"),
+            format!("Bearer ghp_{}", "d".repeat(64)),
+        ] {
+            let resp = send_raw_request(handle.port, request(&bad).as_bytes()).await;
+            assert!(resp.starts_with("HTTP/1.1 401"), "{bad}: {resp:?}");
+        }
+        assert!(
+            heads.lock().unwrap().is_empty(),
+            "rejected requests must not reach upstream"
+        );
+
+        // The rendered phantom is accepted and swapped for the real credential.
+        let resp = send_raw_request(
+            handle.port,
+            request(&format!("Bearer ghp_{token}")).as_bytes(),
+        )
+        .await;
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp:?}");
+        let seen = heads.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1);
+        assert!(
+            seen[0].contains("Bearer real-upstream-secret"),
+            "{}",
+            seen[0]
+        );
+        assert!(!seen[0].contains(&token), "phantom must not be forwarded");
+
+        // No audit event or response carries the token.
+        let events = format!("{:?}", handle.drain_audit_events());
+        assert!(!events.contains(&token));
+
+        handle.shutdown();
+    }
+
+    /// Regression: a route without `phantom_format` keeps requiring the bare token.
+    #[tokio::test]
+    async fn test_unformatted_reverse_route_still_requires_bare_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret_path = dir.path().join("secret");
+        std::fs::write(&secret_path, "real-upstream-secret").unwrap();
+
+        let (upstream, heads) = spawn_recording_upstream().await;
+        let token = "e".repeat(64);
+        let mut route = declarative_route(&format!("http://{upstream}"));
+        route.credential_key = Some(format!("file://{}", secret_path.display()));
+        route.credential_format = Some("Bearer {}".to_string());
+        let config = ProxyConfig {
+            routes: vec![route],
+            allowed_hosts: vec!["127.0.0.1".to_string()],
+            session_token: Some(Zeroizing::new(token.clone())),
+            ..Default::default()
+        };
+        let handle = start(config).await.unwrap();
+
+        let request = |auth: &str| {
+            format!(
+                "GET /svc/x HTTP/1.1\r\nHost: h\r\nAuthorization: {auth}\r\nConnection: close\r\n\r\n"
+            )
+        };
+        let resp = send_raw_request(
+            handle.port,
+            request(&format!("Bearer ghp_{token}")).as_bytes(),
+        )
+        .await;
+        assert!(resp.starts_with("HTTP/1.1 401"), "{resp:?}");
+        let resp =
+            send_raw_request(handle.port, request(&format!("Bearer {token}")).as_bytes()).await;
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp:?}");
+        assert_eq!(heads.lock().unwrap().len(), 1);
+
+        handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_start_rejects_invalid_phantom_format() {
+        let mut route = declarative_route("https://api.example.com");
+        route.credential_key = Some("env://NONO_TEST_MISSING".to_string());
+        route.phantom_format = Some("Bearer {}".to_string());
+        let config = ProxyConfig {
+            routes: vec![route],
+            ..Default::default()
+        };
+        assert!(start(config).await.is_err());
+    }
+
+    fn phantom_route(
+        prefix: &str,
+        env_var: Option<&str>,
+        phantom_format: Option<&str>,
+    ) -> crate::config::RouteConfig {
+        crate::config::RouteConfig {
+            prefix: prefix.to_string(),
+            upstream: "https://api.example.com".to_string(),
+            credential_key: Some("env://CRED".to_string()),
+            env_var: env_var.map(str::to_string),
+            phantom_format: phantom_format.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    fn handle_with_token(loaded: &[&str]) -> ProxyHandle {
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        ProxyHandle {
+            listener_attach: None,
+            port: 12345,
+            token: Zeroizing::new("tok".to_string()),
+            audit_log: Some(audit::new_audit_log()),
+            shutdown_tx,
+            loaded_routes: loaded.iter().map(|s| s.to_string()).collect(),
+            no_proxy_hosts: Vec::new(),
+            managed_loopback_upstream: false,
+            canonical_no_proxy_hosts: Vec::new(),
+            intercept_ca_path: None,
+            intercept_ca_env_vars: crate::config::default_intercept_ca_env_vars(),
+            diagnostics: vec![],
+        }
+    }
+
+    #[test]
+    fn test_phantom_format_env_vars() {
+        let handle = handle_with_token(&["gh", "oa"]);
+        let config = ProxyConfig {
+            routes: vec![
+                phantom_route("gh", Some("GH_TOKEN"), Some("ghp_{}")),
+                phantom_route("oa", Some("OA_KEY"), None),
+            ],
+            ..Default::default()
+        };
+        let vars = handle.credential_env_vars(&config);
+        let get = |k: &str| vars.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+        assert_eq!(get("GH_TOKEN"), Some("ghp_tok"));
+        assert_eq!(get("OA_KEY"), Some("tok"));
+
+        // A route whose credential did not load gets no phantom.
+        let handle = handle_with_token(&[]);
+        assert!(
+            handle
+                .credential_env_vars(&config)
+                .iter()
+                .all(|(k, _)| k.ends_with("_BASE_URL"))
+        );
+    }
+
+    #[test]
+    fn test_phantom_format_derived_env_name() {
+        let handle = handle_with_token(&["gh"]);
+        let mut route = phantom_route("gh", None, Some("ghp_{}"));
+        route.credential_key = Some("gh_token".to_string());
+        let config = ProxyConfig {
+            routes: vec![route],
+            ..Default::default()
+        };
+        let vars = handle.credential_env_vars(&config);
+        assert!(vars.contains(&("GH_TOKEN".to_string(), "ghp_tok".to_string())));
+    }
+
+    #[test]
+    fn test_validate_phantom_formats() {
+        let ca = crate::config::default_intercept_ca_env_vars();
+        let ok = |routes: Vec<crate::config::RouteConfig>| validate_phantom_formats(&routes, &ca);
+
+        // Same env var with identical formats (or none) is allowed.
+        assert!(
+            ok(vec![
+                phantom_route("a", Some("X_TOKEN"), Some("ghp_{}")),
+                phantom_route("b", Some("X_TOKEN"), Some("ghp_{}")),
+            ])
+            .is_ok()
+        );
+        assert!(
+            ok(vec![
+                phantom_route("a", Some("X_TOKEN"), None),
+                phantom_route("b", Some("X_TOKEN"), None),
+            ])
+            .is_ok()
+        );
+        // Differing formats on one env var are ambiguous.
+        assert!(
+            ok(vec![
+                phantom_route("a", Some("X_TOKEN"), Some("ghp_{}")),
+                phantom_route("b", Some("X_TOKEN"), Some("gho_{}")),
+            ])
+            .is_err()
+        );
+        assert!(
+            ok(vec![
+                phantom_route("a", Some("X_TOKEN"), Some("ghp_{}")),
+                phantom_route("b", Some("X_TOKEN"), None),
+            ])
+            .is_err()
+        );
+        // Reserved env vars.
+        for name in [
+            "NONO_PROXY_TOKEN",
+            "HTTPS_PROXY",
+            "https_proxy",
+            "NO_PROXY",
+            "NODE_USE_ENV_PROXY",
+            "SSL_CERT_FILE",
+            "OTHER_BASE_URL",
+        ] {
+            let routes = vec![
+                phantom_route("a", Some(name), Some("ghp_{}")),
+                phantom_route("other", Some("OTHER_KEY"), None),
+            ];
+            assert!(ok(routes).is_err(), "{name}");
+        }
+        // No derivable env var (URI key, no env_var) leaves a formatted route dead.
+        let mut uri = phantom_route("a", None, Some("ghp_{}"));
+        uri.credential_key = Some("op://v/i/f".to_string());
+        assert!(ok(vec![uri]).is_err());
+        // Unformatted routes keep today's behavior.
+        assert!(ok(vec![phantom_route("a", Some("HTTPS_PROXY"), None)]).is_ok());
+    }
     use super::*;
     use tokio::io::AsyncReadExt;
 
@@ -2764,6 +3191,740 @@ mod tests {
         });
     }
 
+    enum AwsStep {
+        Send(Vec<u8>),
+        /// Read from the client side until the bytes seen so far contain this.
+        ExpectRead(&'static [u8]),
+    }
+
+    struct AwsCaseResult {
+        /// Raw bytes the client read back from the proxy.
+        client: Vec<u8>,
+        /// Raw request (head and body) the upstream received, if any.
+        upstream: Option<Vec<u8>>,
+    }
+
+    /// Run one request through the CONNECT-intercept AWS path against a mock
+    /// upstream. `steps` gets the upstream port for the Host header.
+    fn run_aws_case(
+        endpoint_policy: serde_json::Value,
+        steps: impl FnOnce(u16) -> Vec<AwsStep>,
+    ) -> AwsCaseResult {
+        run_aws_case_with_routes(endpoint_policy, |_, _| Vec::new(), steps)
+    }
+
+    /// Like [`run_aws_case`] with extra routes on the same upstream. The
+    /// closure gets the upstream port and the upstream CA file path.
+    fn run_aws_case_with_routes(
+        endpoint_policy: serde_json::Value,
+        extra_routes: impl FnOnce(u16, &std::path::Path) -> Vec<serde_json::Value>,
+        steps: impl FnOnce(u16) -> Vec<AwsStep>,
+    ) -> AwsCaseResult {
+        run_aws_case_at("localhost", true, endpoint_policy, extra_routes, steps)
+    }
+
+    /// Like [`run_aws_case_with_routes`] with the upstream at `host` (mapped to
+    /// the local mock upstream) and, when `aws_auth` is false, a
+    /// credential-free main route.
+    fn run_aws_case_at(
+        host: &str,
+        aws_auth: bool,
+        endpoint_policy: serde_json::Value,
+        extra_routes: impl FnOnce(u16, &std::path::Path) -> Vec<serde_json::Value>,
+        steps: impl FnOnce(u16) -> Vec<AwsStep>,
+    ) -> AwsCaseResult {
+        use base64::Engine;
+        use rustls::pki_types::{CertificateDer, ServerName, pem::PemObject};
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::{TcpListener, TcpStream};
+
+        let _lock = crate::test_env::ENV_LOCK.lock().unwrap();
+        crate::filter::TEST_HOSTS
+            .lock()
+            .unwrap()
+            .push((host.to_string(), std::net::Ipv4Addr::LOCALHOST.into()));
+        let dir = tempfile::tempdir().unwrap();
+        let empty_profile = dir.path().join("aws-empty");
+        std::fs::write(&empty_profile, "").unwrap();
+        let _env = crate::test_env::EnvVarGuard::set_all(&[
+            ("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE"),
+            (
+                "AWS_SECRET_ACCESS_KEY",
+                "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            ),
+            ("AWS_SESSION_TOKEN", "fake-session-token"),
+            ("AWS_REGION", "us-east-1"),
+            ("AWS_CONFIG_FILE", empty_profile.to_str().unwrap()),
+            (
+                "AWS_SHARED_CREDENTIALS_FILE",
+                empty_profile.to_str().unwrap(),
+            ),
+            ("AWS_EC2_METADATA_DISABLED", "true"),
+        ]);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                let ca = Arc::new(EphemeralCa::generate().unwrap());
+                let cache = Arc::new(CertCache::new(Arc::clone(&ca)));
+                let acceptor = tokio_rustls::TlsAcceptor::from(
+                    tls_intercept::acceptor::build_server_config(cache, true).unwrap(),
+                );
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let upstream_port = listener.local_addr().unwrap().port();
+
+                let captured: Arc<std::sync::Mutex<Option<Vec<u8>>>> =
+                    Arc::new(std::sync::Mutex::new(None));
+                let captured_task = Arc::clone(&captured);
+                let upstream = tokio::spawn(async move {
+                    let (sock, _) = listener.accept().await.unwrap();
+                    let mut tls = acceptor.accept(sock).await.unwrap();
+                    let mut request = Vec::new();
+                    let header_end = loop {
+                        let mut byte = [0];
+                        tls.read_exact(&mut byte).await.unwrap();
+                        request.push(byte[0]);
+                        if request.ends_with(b"\r\n\r\n") {
+                            break request.len();
+                        }
+                    };
+                    let head = String::from_utf8_lossy(&request[..header_end]).to_ascii_lowercase();
+                    let len = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:"))
+                        .map_or(0, |v| v.trim().parse::<usize>().unwrap());
+                    let mut body = vec![0; len];
+                    tls.read_exact(&mut body).await.unwrap();
+                    request.extend_from_slice(&body);
+                    // Whatever else the proxy sent counts as forwarded too.
+                    let mut extra = Vec::new();
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_millis(200),
+                        tls.read_buf(&mut extra),
+                    )
+                    .await;
+                    request.extend_from_slice(&extra);
+                    *captured_task.lock().unwrap() = Some(request);
+                    tls.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                    )
+                    .await
+                    .unwrap();
+                    tls.shutdown().await.unwrap();
+                });
+
+                let ca_file = dir.path().join("upstream-ca.pem");
+                std::fs::write(&ca_file, ca.cert_pem()).unwrap();
+                let mut route = serde_json::json!({
+                    "prefix": "aws",
+                    "upstream": format!("https://{host}:{upstream_port}"),
+                    "aws_auth": {"region": "us-east-1", "service": "ssm"},
+                    "tls_ca": ca_file,
+                });
+                if !aws_auth {
+                    route.as_object_mut().unwrap().remove("aws_auth");
+                }
+                if endpoint_policy.is_null() {
+                    // Legacy allow-list: non-explicit, so a miss lets other
+                    // routes on this host handle the request.
+                    route["endpoint_rules"] =
+                        serde_json::json!([{"method": "GET", "path": "/never"}]);
+                } else {
+                    route["endpoint_policy"] = endpoint_policy;
+                }
+                let route = serde_json::from_value(route).unwrap();
+                let mut routes = vec![route];
+                for extra in extra_routes(upstream_port, &ca_file) {
+                    routes.push(serde_json::from_value(extra).unwrap());
+                }
+                let handle = start(ProxyConfig {
+                    routes,
+                    enable_h2: true,
+                    intercept_ca_dir: Some(dir.path().to_path_buf()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+
+                let mut sock = TcpStream::connect(("127.0.0.1", handle.port))
+                    .await
+                    .unwrap();
+                let auth = base64::engine::general_purpose::STANDARD
+                    .encode(format!("nono:{}", handle.token.as_str()));
+                sock.write_all(
+                    format!(
+                        "CONNECT {host}:{upstream_port} HTTP/1.1\r\nHost: {host}:{upstream_port}\r\nProxy-Authorization: Basic {auth}\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+                let mut response = Vec::new();
+                while !response.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    sock.read_exact(&mut byte).await.unwrap();
+                    response.push(byte[0]);
+                }
+                assert!(response.starts_with(b"HTTP/1.1 200"));
+
+                let bundle = std::fs::read(handle.intercept_ca_path().unwrap()).unwrap();
+                let mut roots = rustls::RootCertStore::empty();
+                for cert in CertificateDer::pem_slice_iter(&bundle) {
+                    roots.add(cert.unwrap()).unwrap();
+                }
+                let mut client = rustls::ClientConfig::builder_with_provider(Arc::new(
+                    rustls::crypto::ring::default_provider(),
+                ))
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+                client.alpn_protocols = vec![b"http/1.1".to_vec()];
+                let mut tls = tokio_rustls::TlsConnector::from(Arc::new(client))
+                    .connect(ServerName::try_from(host.to_string()).unwrap(), sock)
+                    .await
+                    .unwrap();
+
+                let mut seen = Vec::new();
+                for step in steps(upstream_port) {
+                    match step {
+                        AwsStep::Send(bytes) => {
+                            tls.write_all(&bytes).await.unwrap();
+                            tls.flush().await.unwrap();
+                        }
+                        AwsStep::ExpectRead(needle) => {
+                            while !seen.windows(needle.len()).any(|w| w == needle) {
+                                let mut buf = [0u8; 1024];
+                                let n = tls.read(&mut buf).await.unwrap();
+                                assert!(n > 0, "closed before {:?}", String::from_utf8_lossy(needle));
+                                seen.extend_from_slice(&buf[..n]);
+                            }
+                        }
+                    }
+                }
+                let mut rest = Vec::new();
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    tls.read_to_end(&mut rest),
+                )
+                .await;
+                seen.extend_from_slice(&rest);
+
+                // Let an in-flight upstream finish capturing before aborting.
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                upstream.abort();
+                handle.shutdown();
+                let upstream = captured.lock().unwrap().clone();
+                AwsCaseResult {
+                    client: seen,
+                    upstream,
+                }
+            })
+            .await
+            .unwrap()
+        })
+    }
+
+    fn allow_ops_policy(ops: &[&str]) -> serde_json::Value {
+        serde_json::json!({
+            "default": {"decision": "deny"},
+            "allow": [{"method": "POST", "path": "/", "operations": ops}]
+        })
+    }
+
+    fn json_request(port: u16, target: &str, body: &[u8], extra: &str) -> Vec<u8> {
+        let mut req = format!(
+            "POST / HTTP/1.1\r\nHost: localhost:{port}\r\nContent-Type: application/x-amz-json-1.1\r\nX-Amz-Target: {target}\r\nAuthorization: agent-signature\r\nContent-Length: {}\r\n{extra}Connection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        req.extend_from_slice(body);
+        req
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    /// Split an upstream capture into (lowercased head, body).
+    fn split_capture(raw: &[u8]) -> (String, Vec<u8>) {
+        let end = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+        (
+            String::from_utf8_lossy(&raw[..end]).to_ascii_lowercase(),
+            raw[end..].to_vec(),
+        )
+    }
+
+    fn assert_signed_body(head: &str, body: &[u8]) {
+        assert!(head.contains(&format!("x-amz-content-sha256: {}", sha256_hex(body))));
+        assert!(head.contains("aws4-hmac-sha256 credential=akiaiosfodnn7example/"));
+        assert!(!head.contains("agent-signature"));
+    }
+
+    #[test]
+    fn aws_operations_allowed_op_is_signed_and_forwarded_verbatim() {
+        let body = br#"{"Path":"/prod"}"#;
+        let result = run_aws_case(allow_ops_policy(&["Describe*", "GetParameter"]), |port| {
+            vec![AwsStep::Send(json_request(
+                port,
+                "AmazonSSM.GetParameter",
+                body,
+                "",
+            ))]
+        });
+        assert!(result.client.starts_with(b"HTTP/1.1 200"));
+        let (head, forwarded) = split_capture(&result.upstream.expect("forwarded"));
+        assert_eq!(forwarded, body);
+        assert_signed_body(&head, body);
+        let signed = head
+            .lines()
+            .find(|l| l.starts_with("authorization:"))
+            .unwrap();
+        assert!(signed.contains("x-amz-target"));
+    }
+
+    /// A credential-free `allow_domain` route on an AWS host filters by
+    /// operation and forwards the agent's own signed request unchanged.
+    #[test]
+    fn ep_aws_route_forwards_agent_signed_request_verbatim() {
+        let host = "ssm.us-east-1.amazonaws.com";
+        let run = |target: &'static str, body: &'static [u8]| {
+            run_aws_case_at(
+                host,
+                false,
+                allow_ops_policy(&["Describe*"]),
+                |_, _| Vec::new(),
+                move |port| vec![AwsStep::Send(json_request(port, target, body, ""))],
+            )
+        };
+        let body = br#"{"MaxResults":1}"#;
+        let allowed = run("AmazonSSM.DescribeParameters", body);
+        assert!(allowed.client.starts_with(b"HTTP/1.1 200"));
+        let (head, forwarded) = split_capture(&allowed.upstream.expect("forwarded"));
+        assert_eq!(forwarded, body);
+        assert!(head.contains("authorization: agent-signature"));
+        assert!(!head.contains("aws4-hmac-sha256"));
+
+        let denied = run("AmazonSSM.DeleteParameter", b"{}");
+        assert!(denied.client.starts_with(b"HTTP/1.1 403"));
+        assert!(denied.upstream.is_none());
+    }
+
+    #[test]
+    fn aws_operations_denied_op_gets_403_and_no_upstream() {
+        let result = run_aws_case(allow_ops_policy(&["Describe*"]), |port| {
+            vec![AwsStep::Send(json_request(
+                port,
+                "AmazonSSM.DeleteParameter",
+                b"{}",
+                "",
+            ))]
+        });
+        assert!(result.client.starts_with(b"HTTP/1.1 403"));
+        assert!(result.upstream.is_none());
+    }
+
+    #[test]
+    fn aws_operations_cross_protocol_request_is_unknown_and_denied() {
+        let result = run_aws_case(allow_ops_policy(&["Describe*"]), |port| {
+            let mut req = json_request(port, "AmazonSSM.DescribeParameters", b"{}", "");
+            let line_end = req.windows(2).position(|w| w == b"\r\n").unwrap();
+            req.splice(
+                ..line_end,
+                b"POST /?Action=DeleteParameter HTTP/1.1".to_vec(),
+            );
+            vec![AwsStep::Send(req)]
+        });
+        assert!(result.client.starts_with(b"HTTP/1.1 403"));
+        assert!(result.upstream.is_none());
+    }
+
+    #[test]
+    fn aws_operations_query_form_body_is_signed() {
+        let body = b"Action=DescribeInstances&Version=2016-11-15";
+        let result = run_aws_case(allow_ops_policy(&["DescribeInstances"]), |port| {
+            let mut req = format!(
+                "POST / HTTP/1.1\r\nHost: localhost:{port}\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .into_bytes();
+            req.extend_from_slice(body);
+            vec![AwsStep::Send(req)]
+        });
+        assert!(result.client.starts_with(b"HTTP/1.1 200"));
+        let (head, forwarded) = split_capture(&result.upstream.expect("forwarded"));
+        assert_eq!(forwarded, body);
+        assert_signed_body(&head, body);
+    }
+
+    #[test]
+    fn aws_operations_query_gzip_body_is_unknown_and_denied() {
+        let result = run_aws_case(allow_ops_policy(&["DescribeInstances"]), |port| {
+            let body = b"Action=DescribeInstances";
+            let mut req = format!(
+                "POST / HTTP/1.1\r\nHost: localhost:{port}\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .into_bytes();
+            req.extend_from_slice(body);
+            vec![AwsStep::Send(req)]
+        });
+        assert!(result.client.starts_with(b"HTTP/1.1 403"));
+        assert!(result.upstream.is_none());
+    }
+
+    #[test]
+    fn aws_operations_chunked_body_is_decoded_once_and_signed() {
+        let result = run_aws_case(allow_ops_policy(&["GetParameter"]), |port| {
+            let req = format!(
+                "POST / HTTP/1.1\r\nHost: localhost:{port}\r\nContent-Type: application/x-amz-json-1.1\r\nX-Amz-Target: AmazonSSM.GetParameter\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n"
+            );
+            vec![AwsStep::Send(req.into_bytes())]
+        });
+        let (head, forwarded) = split_capture(&result.upstream.expect("forwarded"));
+        assert_eq!(forwarded, b"hello world");
+        assert!(!head.contains("transfer-encoding"));
+        assert!(head.contains("content-length: 11"));
+        assert_signed_body(&head, b"hello world");
+    }
+
+    #[test]
+    fn aws_operations_expect_continue_is_answered_and_stripped() {
+        let body = br#"{"Name":"x"}"#;
+        let result = run_aws_case(allow_ops_policy(&["GetParameter"]), |port| {
+            let head = format!(
+                "POST / HTTP/1.1\r\nHost: localhost:{port}\r\nContent-Type: application/x-amz-json-1.1\r\nX-Amz-Target: AmazonSSM.GetParameter\r\nExpect: 100-continue\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            vec![
+                AwsStep::Send(head.into_bytes()),
+                AwsStep::ExpectRead(b"HTTP/1.1 100 Continue\r\n\r\n"),
+                AwsStep::Send(body.to_vec()),
+            ]
+        });
+        let (head, forwarded) = split_capture(&result.upstream.expect("forwarded"));
+        assert!(!head.contains("expect:"));
+        assert_eq!(forwarded, body);
+        assert_signed_body(&head, body);
+    }
+
+    #[test]
+    fn aws_operations_pipelined_bytes_are_not_forwarded() {
+        let body = br#"{"Name":"x"}"#;
+        let result = run_aws_case(allow_ops_policy(&["GetParameter"]), |port| {
+            let mut req = json_request(port, "AmazonSSM.GetParameter", body, "");
+            req.extend_from_slice(&json_request(port, "AmazonSSM.DeleteParameter", b"{}", ""));
+            vec![AwsStep::Send(req)]
+        });
+        let (head, forwarded) = split_capture(&result.upstream.expect("forwarded"));
+        assert_eq!(forwarded, body);
+        assert!(!head.contains("deleteparameter"));
+    }
+
+    /// A non-AWS route sharing the AWS host reuses the pre-read body and is
+    /// forwarded unsigned.
+    #[test]
+    fn aws_host_non_aws_route_forwards_pre_read_body() {
+        let body = b"plain-body";
+        let result = run_aws_case_with_routes(
+            // AWS route with a legacy allow-list that misses, so it steps aside.
+            serde_json::Value::Null,
+            |port, ca| {
+                vec![serde_json::json!({
+                    "prefix": "plain",
+                    "upstream": format!("https://localhost:{port}"),
+                    "tls_ca": ca,
+                    "endpoint_rules": [{"method": "POST", "path": "/public"}]
+                })]
+            },
+            |port| {
+                let mut req = format!(
+                    "POST /public HTTP/1.1\r\nHost: localhost:{port}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .into_bytes();
+                req.extend_from_slice(body);
+                vec![AwsStep::Send(req)]
+            },
+        );
+        assert!(result.client.starts_with(b"HTTP/1.1 200"));
+        let (head, forwarded) = split_capture(&result.upstream.expect("forwarded"));
+        assert_eq!(forwarded, body);
+        assert!(!head.contains("aws4-hmac-sha256"));
+    }
+
+    #[test]
+    fn aws_operations_oversized_body_gets_413() {
+        let result = run_aws_case(allow_ops_policy(&["GetParameter"]), |port| {
+            let head = format!(
+                "POST / HTTP/1.1\r\nHost: localhost:{port}\r\nContent-Type: application/x-amz-json-1.1\r\nX-Amz-Target: AmazonSSM.GetParameter\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                16 * 1024 * 1024 + 1
+            );
+            vec![AwsStep::Send(head.into_bytes())]
+        });
+        assert!(result.client.starts_with(b"HTTP/1.1 413"));
+        assert!(result.upstream.is_none());
+    }
+
+    /// Run one intercepted POST through the proxy and return the status line,
+    /// handing the request headers the upstream received to `on_upstream`.
+    /// `None` from the upstream side means the proxy never forwarded.
+    async fn aws_intercept_round_trip(
+        route: crate::config::RouteConfig,
+        ca: Arc<EphemeralCa>,
+        listener: tokio::net::TcpListener,
+        dir: &std::path::Path,
+        agent_authorization: &str,
+    ) -> (String, Option<String>) {
+        use base64::Engine;
+        use rustls::pki_types::{CertificateDer, ServerName, pem::PemObject};
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpStream;
+
+        let upstream_port = listener.local_addr().unwrap().port();
+        let cache = Arc::new(CertCache::new(Arc::clone(&ca)));
+        let acceptor = tokio_rustls::TlsAcceptor::from(
+            tls_intercept::acceptor::build_server_config(cache, false).unwrap(),
+        );
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel::<String>();
+        let upstream = tokio::spawn(async move {
+            let Ok((sock, _)) = listener.accept().await else {
+                return;
+            };
+            let mut tls = acceptor.accept(sock).await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                tls.read_exact(&mut byte).await.unwrap();
+                request.push(byte[0]);
+                assert!(request.len() < 16384);
+            }
+            let mut body = [0; 2];
+            tls.read_exact(&mut body).await.unwrap();
+            let _ = seen_tx.send(String::from_utf8(request).unwrap());
+            tls.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await
+                .unwrap();
+            tls.shutdown().await.unwrap();
+        });
+
+        let handle = start(ProxyConfig {
+            routes: vec![route],
+            intercept_ca_dir: Some(dir.to_path_buf()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        let mut sock = TcpStream::connect(("127.0.0.1", handle.port))
+            .await
+            .unwrap();
+        let auth = base64::engine::general_purpose::STANDARD
+            .encode(format!("nono:{}", handle.token.as_str()));
+        sock.write_all(
+            format!(
+                "CONNECT localhost:{upstream_port} HTTP/1.1\r\nHost: localhost:{upstream_port}\r\nProxy-Authorization: Basic {auth}\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+        let mut response = Vec::new();
+        while !response.ends_with(b"\r\n\r\n") {
+            let mut byte = [0];
+            sock.read_exact(&mut byte).await.unwrap();
+            response.push(byte[0]);
+        }
+        assert!(response.starts_with(b"HTTP/1.1 200"));
+
+        let bundle = std::fs::read(handle.intercept_ca_path().unwrap()).unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in CertificateDer::pem_slice_iter(&bundle) {
+            roots.add(cert.unwrap()).unwrap();
+        }
+        let client = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        let mut tls = tokio_rustls::TlsConnector::from(Arc::new(client))
+            .connect(ServerName::try_from("localhost").unwrap(), sock)
+            .await
+            .unwrap();
+        tls.write_all(
+            format!(
+                "POST / HTTP/1.1\r\nHost: localhost:{upstream_port}\r\nAuthorization: {agent_authorization}\r\nX-Amz-Date: 20261105T000000Z\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+        let mut status = Vec::new();
+        while !status.ends_with(b"\r\n") {
+            let mut byte = [0];
+            tls.read_exact(&mut byte).await.unwrap();
+            status.push(byte[0]);
+        }
+
+        handle.shutdown();
+        upstream.abort();
+        (
+            String::from_utf8(status).unwrap().trim_end().to_string(),
+            seen_rx.await.ok(),
+        )
+    }
+
+    /// `aws_auth.profiles`: each request signs as the host profile mapped to
+    /// the placeholder access key ID in its own Authorization header, and an
+    /// unlisted key is refused without reaching the upstream.
+    #[test]
+    fn aws_intercept_selects_profile_by_placeholder_access_key_id() {
+        let _lock = crate::test_env::ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("aws-config");
+        std::fs::write(
+            &config,
+            "[profile dev-ro]\nregion = us-east-1\n\n[profile staging-ro]\nregion = us-east-1\n",
+        )
+        .unwrap();
+        let credentials = dir.path().join("aws-credentials");
+        std::fs::write(
+            &credentials,
+            "[dev-ro]\naws_access_key_id = AKIAREALDEVRO000001\naws_secret_access_key = dev-secret\n\n\
+             [staging-ro]\naws_access_key_id = AKIAREALSTGRO000001\naws_secret_access_key = stg-secret\n",
+        )
+        .unwrap();
+        let _env = crate::test_env::EnvVarGuard::set_all(&[
+            ("AWS_CONFIG_FILE", config.to_str().unwrap()),
+            ("AWS_SHARED_CREDENTIALS_FILE", credentials.to_str().unwrap()),
+            // Host env credentials must not shadow the mapped profiles: the
+            // default chain would try them before the named profile.
+            ("AWS_ACCESS_KEY_ID", "AKIAHOSTENVIRON0001"),
+            ("AWS_SECRET_ACCESS_KEY", "host-env-secret"),
+            ("AWS_SESSION_TOKEN", "host-env-session"),
+            ("AWS_PROFILE", "staging-ro"),
+            ("AWS_EC2_METADATA_DISABLED", "true"),
+        ]);
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                let ca = Arc::new(EphemeralCa::generate().unwrap());
+                let ca_file = dir.path().join("upstream-ca.pem");
+                std::fs::write(&ca_file, ca.cert_pem()).unwrap();
+                let agent = |akid: &str| {
+                    format!(
+                        "AWS4-HMAC-SHA256 Credential={akid}/20261105/us-east-1/sts/aws4_request, SignedHeaders=host;x-amz-date, Signature=agent-signature"
+                    )
+                };
+
+                for (placeholder, real) in [
+                    ("NONOPROFILE0DEVRO01", "AKIAREALDEVRO000001"),
+                    ("NONOPROFILE0STGRO01", "AKIAREALSTGRO000001"),
+                ] {
+                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let port = listener.local_addr().unwrap().port();
+                    let route = serde_json::from_value(serde_json::json!({
+                        "prefix": "sts",
+                        "upstream": format!("https://localhost:{port}"),
+                        "aws_auth": {
+                            "region": "us-east-1",
+                            "service": "sts",
+                            "profiles": {
+                                "NONOPROFILE0DEVRO01": "dev-ro",
+                                "NONOPROFILE0STGRO01": "staging-ro"
+                            }
+                        },
+                        "tls_ca": ca_file,
+                    }))
+                    .unwrap();
+                    let (status, seen) = aws_intercept_round_trip(
+                        route,
+                        Arc::clone(&ca),
+                        listener,
+                        dir.path(),
+                        &agent(placeholder),
+                    )
+                    .await;
+                    assert!(status.starts_with("HTTP/1.1 200"), "{placeholder}: {status}");
+                    let headers = seen.unwrap();
+                    assert!(
+                        headers.contains(&format!("Credential={real}/")),
+                        "{placeholder} should sign as {real}: {headers}"
+                    );
+                    assert!(!headers.contains(placeholder), "{headers}");
+                    assert!(!headers.contains("AKIAHOSTENVIRON0001"), "{headers}");
+                    assert!(!headers.contains("host-env-session"), "{headers}");
+                    assert!(!headers.contains("agent-signature"), "{headers}");
+                }
+
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let port = listener.local_addr().unwrap().port();
+                let route = serde_json::from_value(serde_json::json!({
+                    "prefix": "sts",
+                    "upstream": format!("https://localhost:{port}"),
+                    "aws_auth": {
+                        "region": "us-east-1",
+                        "service": "sts",
+                        "profiles": { "NONOPROFILE0DEVRO01": "dev-ro" }
+                    },
+                    "tls_ca": ca_file,
+                }))
+                .unwrap();
+                let (status, seen) = aws_intercept_round_trip(
+                    route,
+                    Arc::clone(&ca),
+                    listener,
+                    dir.path(),
+                    &agent("NONOPROFILE0STGRO01"),
+                )
+                .await;
+                assert!(status.starts_with("HTTP/1.1 403"), "{status}");
+                assert!(seen.is_none(), "unlisted key must not reach upstream");
+
+                // A non-SigV4 Authorization (no access key ID to select by) is
+                // refused the same way and never falls back to any profile.
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let port = listener.local_addr().unwrap().port();
+                let route = serde_json::from_value(serde_json::json!({
+                    "prefix": "sts",
+                    "upstream": format!("https://localhost:{port}"),
+                    "aws_auth": {
+                        "region": "us-east-1",
+                        "service": "sts",
+                        "profiles": { "NONOPROFILE0DEVRO01": "dev-ro" }
+                    },
+                    "tls_ca": ca_file,
+                }))
+                .unwrap();
+                let (status, seen) = aws_intercept_round_trip(
+                    route,
+                    Arc::clone(&ca),
+                    listener,
+                    dir.path(),
+                    "Bearer NONOPROFILE0DEVRO01",
+                )
+                .await;
+                assert!(status.starts_with("HTTP/1.1 403"), "{status}");
+                assert!(seen.is_none(), "unselectable request must not reach upstream");
+            })
+            .await
+            .unwrap();
+        });
+    }
+
     #[test]
     fn normalize_authority_normalises_case_and_default_port() {
         assert_eq!(normalize_authority("API.OpenAI.com"), "api.openai.com:443");
@@ -2803,6 +3964,7 @@ mod tests {
             query_param_name: None,
             proxy: None,
             env_var: None,
+            phantom_format: None,
             endpoint_rules: Vec::new(),
             endpoint_policy: None,
             tls_ca: None,
@@ -2982,6 +4144,7 @@ mod tests {
             query_param_name: None,
             proxy: None,
             env_var: None,
+            phantom_format: None,
             endpoint_rules: vec![],
             endpoint_policy: None,
             tls_ca: None,
@@ -3045,6 +4208,66 @@ mod tests {
             .next()
             .unwrap_or("")
             .to_string()
+    }
+
+    /// The reverse path serves one request per inbound connection, so the
+    /// pooled-upstream response must tell the client `Connection: close` even
+    /// when the upstream advertised keep-alive, and the proxy must close the
+    /// inbound connection once the body is relayed.
+    #[tokio::test]
+    async fn reverse_pool_response_tells_client_connection_close() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nKeep-Alive: timeout=30\r\nContent-Length: 2\r\n\r\nok",
+                    )
+                    .await;
+                // Behave like a keep-alive server: hold the socket open.
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            }
+        });
+        let config = ProxyConfig {
+            routes: vec![declarative_route(&format!("http://{upstream}"))],
+            allowed_hosts: vec!["127.0.0.1".to_string()],
+            require_auth: false,
+            ..Default::default()
+        };
+        let handle = start(config).await.unwrap();
+
+        let mut client = tokio::net::TcpStream::connect(("127.0.0.1", handle.port))
+            .await
+            .unwrap();
+        client
+            .write_all(b"GET /svc/ HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: keep-alive\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.read_to_end(&mut response),
+        )
+        .await
+        .expect("proxy must close the inbound connection after the response")
+        .unwrap();
+        let response = String::from_utf8_lossy(&response).to_lowercase();
+        assert!(response.starts_with("http/1.1 200"), "got: {response:?}");
+        assert_eq!(
+            response.matches("connection:").count(),
+            1,
+            "exactly one Connection header expected, got: {response:?}"
+        );
+        assert!(
+            response.contains("connection: close\r\n"),
+            "got: {response:?}"
+        );
+        assert!(!response.contains("keep-alive"), "got: {response:?}");
+        assert!(response.ends_with("\r\n\r\nok"), "got: {response:?}");
+        handle.shutdown();
     }
 
     #[tokio::test]
@@ -3242,6 +4465,78 @@ mod tests {
         String::from_utf8_lossy(&resp).to_string()
     }
 
+    /// The reverse proxy does not resolve AWS operations, so a request on a
+    /// route whose own policy, or whose host's `allow_domain` policy, has
+    /// `operations` rules gets 501 instead of being evaluated as `Unknown`.
+    #[tokio::test]
+    async fn test_reverse_proxy_returns_501_when_operation_rules_apply() {
+        let host = "ssm.us-east-1.amazonaws.com";
+        crate::filter::TEST_HOSTS
+            .lock()
+            .unwrap()
+            .push((host.to_string(), std::net::Ipv4Addr::LOCALHOST.into()));
+        let (upstream, heads) = spawn_recording_upstream().await;
+        let port = upstream.rsplit(':').next().unwrap();
+        let aws_upstream = format!("http://{host}:{port}");
+        let deny_delete: crate::config::EndpointPolicyConfig =
+            serde_json::from_value(serde_json::json!({
+                "default": {"decision": "allow"},
+                "deny": [{"method": "POST", "path": "/", "operations": ["DeleteParameter"]}]
+            }))
+            .unwrap();
+        let mut own_policy = declarative_route(&aws_upstream);
+        own_policy.endpoint_policy = Some(deny_delete.clone());
+        let mut host_policy = declarative_route(&aws_upstream);
+        host_policy.prefix = format!("_ep_{host}");
+        host_policy.endpoint_policy = Some(deny_delete);
+        let request = |prefix: &str| {
+            format!(
+                "POST /{prefix}/ HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Amz-Target: AmazonSSM.DeleteParameter\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+            )
+        };
+
+        for (name, routes) in [
+            ("route policy", vec![own_policy]),
+            (
+                "host policy",
+                vec![declarative_route(&aws_upstream), host_policy],
+            ),
+        ] {
+            let handle = start(ProxyConfig {
+                routes,
+                allowed_hosts: vec![host.to_string()],
+                require_auth: false,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+            let response = send_raw_request(handle.port, request("svc").as_bytes()).await;
+            assert!(
+                response.starts_with("HTTP/1.1 501"),
+                "{name}: expected 501, got {response:?}"
+            );
+            handle.shutdown();
+        }
+        assert!(
+            heads.lock().unwrap().is_empty(),
+            "refused requests must not reach upstream"
+        );
+
+        // Without operation rules the same request is forwarded.
+        let handle = start(ProxyConfig {
+            routes: vec![declarative_route(&aws_upstream)],
+            allowed_hosts: vec![host.to_string()],
+            require_auth: false,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let response = send_raw_request(handle.port, request("svc").as_bytes()).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response:?}");
+        assert_eq!(heads.lock().unwrap().len(), 1);
+        handle.shutdown();
+    }
+
     #[tokio::test]
     async fn test_websocket_upgrade_returns_501_without_reaching_upstream() {
         // A structurally valid WebSocket handshake must be rejected
@@ -3387,10 +4682,11 @@ mod tests {
             },
             deny: vec![EndpointPolicyRule {
                 method: "*".to_string(),
-                path: "/v1/secrets/**".to_string(),
+                path: "/v1/secrets/**".into(),
                 backend: None,
                 reason: None,
                 timeout_secs: None,
+                operations: None,
             }],
             ..EndpointPolicyConfig::default()
         });
@@ -3638,6 +4934,7 @@ mod tests {
                     query_param_name: None,
                     proxy: None,
                     env_var: None,
+                    phantom_format: None,
                     endpoint_rules: vec![],
                     endpoint_policy: None,
                     tls_ca: None,
@@ -3718,6 +5015,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                phantom_format: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -3808,6 +5106,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                phantom_format: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -3860,6 +5159,7 @@ mod tests {
                     query_param_name: None,
                     proxy: None,
                     env_var: None,
+                    phantom_format: None,
                     endpoint_rules: vec![],
                     endpoint_policy: None,
                     tls_ca: None,
@@ -3884,6 +5184,7 @@ mod tests {
                     query_param_name: None,
                     proxy: None,
                     env_var: None,
+                    phantom_format: None,
                     endpoint_rules: vec![],
                     endpoint_policy: None,
                     tls_ca: None,
@@ -3930,7 +5231,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let endpoint_rule = crate::config::EndpointRule {
             method: "GET".to_string(),
-            path: "/repos/*".to_string(),
+            path: "/repos/*".into(),
         };
         let config = ProxyConfig {
             routes: vec![
@@ -3948,6 +5249,7 @@ mod tests {
                     query_param_name: None,
                     proxy: None,
                     env_var: None,
+                    phantom_format: None,
                     endpoint_rules: vec![],
                     endpoint_policy: None,
                     tls_ca: None,
@@ -3973,6 +5275,7 @@ mod tests {
                     query_param_name: None,
                     proxy: None,
                     env_var: None,
+                    phantom_format: None,
                     endpoint_rules: vec![endpoint_rule.clone(), endpoint_rule],
                     endpoint_policy: None,
                     tls_ca: None,
@@ -4019,7 +5322,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let endpoint_rule = crate::config::EndpointRule {
             method: "GET".to_string(),
-            path: "/**".to_string(),
+            path: "/**".into(),
         };
         let config = ProxyConfig {
             routes: vec![
@@ -4037,6 +5340,7 @@ mod tests {
                     query_param_name: None,
                     proxy: None,
                     env_var: None,
+                    phantom_format: None,
                     endpoint_rules: vec![],
                     endpoint_policy: None,
                     tls_ca: None,
@@ -4062,6 +5366,7 @@ mod tests {
                     query_param_name: None,
                     proxy: None,
                     env_var: None,
+                    phantom_format: None,
                     endpoint_rules: vec![endpoint_rule],
                     endpoint_policy: None,
                     tls_ca: None,
@@ -4115,6 +5420,7 @@ mod tests {
             query_param_name: None,
             proxy: None,
             env_var: None,
+            phantom_format: None,
             endpoint_rules: vec![],
             endpoint_policy: None,
             tls_ca: None,
@@ -4164,6 +5470,7 @@ mod tests {
             query_param_name: None,
             proxy: None,
             env_var: None,
+            phantom_format: None,
             endpoint_rules: vec![],
             endpoint_policy: None,
             tls_ca: None,
@@ -4283,6 +5590,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                phantom_format: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -4341,6 +5649,7 @@ mod tests {
                 proxy: None,
                 env_var: None, // No explicit env_var — should fall back to uppercase
                 endpoint_rules: vec![],
+                phantom_format: None,
                 endpoint_policy: None,
                 tls_ca: None,
                 tls_client_cert: None,
@@ -4406,6 +5715,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: Some("OPENAI_API_KEY".to_string()),
+                phantom_format: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -4438,6 +5748,99 @@ mod tests {
         assert!(
             bad_var.is_none(),
             "Should not generate env var from op:// URI uppercase"
+        );
+    }
+
+    #[test]
+    fn test_proxy_credential_env_vars_skips_synthetic_endpoint_routes() {
+        // Synthetic `_ep_<domain>` routes (created by `partition_allow_domain`
+        // for `allow_domain` entries with `endpoints`) must not export a
+        // `{PREFIX}_BASE_URL` var: agents find it with `env` and try a dead
+        // end instead of the real host. See #2286.
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let handle = ProxyHandle {
+            listener_attach: None,
+            port: 12345,
+            token: Zeroizing::new("test_token".to_string()),
+            audit_log: Some(audit::new_audit_log()),
+            shutdown_tx,
+            loaded_routes: ["openai".to_string()].into_iter().collect(),
+            no_proxy_hosts: Vec::new(),
+            managed_loopback_upstream: false,
+            canonical_no_proxy_hosts: Vec::new(),
+            intercept_ca_path: None,
+            intercept_ca_env_vars: crate::config::default_intercept_ca_env_vars(),
+            diagnostics: vec![],
+        };
+        let config = ProxyConfig {
+            routes: vec![
+                crate::config::RouteConfig {
+                    redeem_phantoms: Vec::new(),
+                    prefix: "openai".to_string(),
+                    upstream: "https://api.openai.com".to_string(),
+                    credential_key: Some("openai_api_key".to_string()),
+                    inject_mode: crate::config::InjectMode::Header,
+                    inject_header: "Authorization".to_string(),
+                    credential_format: Some("Bearer {}".to_string()),
+                    path_pattern: None,
+                    path_replacement: None,
+                    query_param_name: None,
+                    proxy: None,
+                    env_var: None,
+                    phantom_format: None,
+                    endpoint_rules: vec![],
+                    endpoint_policy: None,
+                    tls_ca: None,
+                    tls_client_cert: None,
+                    tls_client_key: None,
+                    oauth2: None,
+                    aws_auth: None,
+                    spiffe: None,
+                    upgrades: vec![],
+                    rate_limit: None,
+                },
+                crate::config::RouteConfig {
+                    redeem_phantoms: Vec::new(),
+                    prefix: format!("{}example.com", crate::config::ENDPOINT_ROUTE_PREFIX),
+                    upstream: "https://example.com".to_string(),
+                    credential_key: None,
+                    inject_mode: crate::config::InjectMode::Header,
+                    inject_header: "Authorization".to_string(),
+                    credential_format: None,
+                    path_pattern: None,
+                    path_replacement: None,
+                    query_param_name: None,
+                    proxy: None,
+                    env_var: None,
+                    phantom_format: None,
+                    endpoint_rules: vec![crate::config::EndpointRule {
+                        method: "GET".to_string(),
+                        path: "/**".into(),
+                    }],
+                    endpoint_policy: None,
+                    tls_ca: None,
+                    tls_client_cert: None,
+                    tls_client_key: None,
+                    oauth2: None,
+                    aws_auth: None,
+                    spiffe: None,
+                    upgrades: vec![],
+                    rate_limit: None,
+                },
+            ],
+            ..Default::default()
+        };
+
+        let vars = handle.credential_env_vars(&config);
+
+        // The credential route keeps its vars; the synthetic endpoint route
+        // contributes none.
+        assert_eq!(vars.len(), 2); // OPENAI_BASE_URL + OPENAI_API_KEY
+        assert!(vars.iter().any(|(k, _)| k == "OPENAI_BASE_URL"));
+        assert!(vars.iter().any(|(k, _)| k == "OPENAI_API_KEY"));
+        assert!(
+            vars.iter().all(|(k, _)| !k.starts_with("_EP_")),
+            "synthetic endpoint routes must not export _EP_*_BASE_URL vars: {vars:?}"
         );
     }
 
@@ -4478,6 +5881,7 @@ mod tests {
                     query_param_name: None,
                     proxy: None,
                     env_var: None,
+                    phantom_format: None,
                     endpoint_rules: vec![],
                     endpoint_policy: None,
                     tls_ca: None,
@@ -4502,6 +5906,7 @@ mod tests {
                     query_param_name: None,
                     proxy: None,
                     env_var: Some("GITHUB_TOKEN".to_string()),
+                    phantom_format: None,
                     endpoint_rules: vec![],
                     endpoint_policy: None,
                     tls_ca: None,
@@ -4570,6 +5975,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                phantom_format: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -4636,6 +6042,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                phantom_format: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -4676,6 +6083,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                phantom_format: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -4739,6 +6147,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                phantom_format: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -4791,6 +6200,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: Some("ANTHROPIC_API_KEY".to_string()),
+                phantom_format: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -5071,6 +6481,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                phantom_format: None,
                 endpoint_rules: Vec::new(),
                 endpoint_policy: None,
                 tls_ca: None,
@@ -5118,6 +6529,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                phantom_format: None,
                 endpoint_rules: Vec::new(),
                 endpoint_policy: None,
                 tls_ca: None,
@@ -5189,6 +6601,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                phantom_format: None,
                 endpoint_rules: Vec::new(),
                 endpoint_policy: None,
                 tls_ca: None,
@@ -5230,6 +6643,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                phantom_format: None,
                 endpoint_rules: Vec::new(),
                 endpoint_policy: None,
                 tls_ca: None,
@@ -5273,6 +6687,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                phantom_format: None,
                 endpoint_rules: Vec::new(),
                 endpoint_policy: None,
                 tls_ca: None,
@@ -5473,6 +6888,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                phantom_format: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -6265,19 +7681,65 @@ mod tests {
         );
     }
 
+    /// Wait for the fixture's headers and Content-Length body before replying.
+    /// A TCP read can contain just part of either, even over loopback.
+    async fn read_origin_request(stream: impl tokio::io::AsyncRead + Unpin) -> String {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut reader = BufReader::new(stream);
+            let mut request = String::new();
+            let mut content_length = 0;
+            loop {
+                let mut line = String::new();
+                assert!(reader.read_line(&mut line).await.unwrap() > 0);
+                request.push_str(&line);
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':')
+                    && name.eq_ignore_ascii_case("content-length")
+                {
+                    content_length = value.trim().parse().unwrap();
+                }
+            }
+            let mut body = vec![0; content_length];
+            reader.read_exact(&mut body).await.unwrap();
+            request.push_str(&String::from_utf8_lossy(&body));
+            request
+        })
+        .await
+        .expect("origin must receive a complete request")
+    }
+
+    #[tokio::test]
+    async fn origin_fixture_reads_fragmented_request_without_waiting_for_eof() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut sender, receiver) = tokio::io::duplex(16);
+        let reader = tokio::spawn(read_origin_request(receiver));
+        let body = "fragmented request body";
+        let head = format!(
+            "POST /mcp HTTP/1.1\r\nHost: localhost\r\ncOnTeNt-LeNgTh: {}\r\n\r\n",
+            body.len()
+        );
+        sender.write_all(head.as_bytes()).await.unwrap();
+        tokio::task::yield_now().await;
+        sender.write_all(body.as_bytes()).await.unwrap();
+        assert_eq!(reader.await.unwrap(), format!("{head}{body}"));
+    }
+
     /// Spawn a one-shot local HTTP/1.1 origin server that echoes the received
     /// request line back in the body and returns 200. Returns its address and
     /// a receiver that yields the raw request bytes it saw.
     async fn spawn_echo_origin() -> (std::net::SocketAddr, tokio::sync::oneshot::Receiver<String>) {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::io::AsyncWriteExt;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (tx, rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             if let Ok((mut sock, _)) = listener.accept().await {
-                let mut buf = [0u8; 4096];
-                let n = sock.read(&mut buf).await.unwrap_or(0);
-                let received = String::from_utf8_lossy(&buf[..n]).to_string();
+                let received = read_origin_request(&mut sock).await;
                 let body = "ok";
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -6290,6 +7752,83 @@ mod tests {
             }
         });
         (addr, rx)
+    }
+
+    /// Regression: a keep-alive upstream (e.g. uvicorn serving an MCP
+    /// Streamable HTTP endpoint) must not leave the forward path waiting for
+    /// EOF, and the client must be told not to reuse the connection.
+    ///
+    /// The origin behaves like a keep-alive server: it closes after the
+    /// response only when the request says `Connection: close`, otherwise it
+    /// holds the socket open well past the test timeout.
+    #[tokio::test]
+    async fn forward_http_keep_alive_upstream_does_not_stall() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = listener.local_addr().unwrap();
+        let (tx, origin_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            let received = read_origin_request(&mut sock).await;
+            let body = "event: message\r\ndata: {}\r\n\r\n";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nmcp-session-id: s1\r\nconnection: keep-alive\r\ntransfer-encoding: chunked\r\n\r\n{:x}\r\n{body}\r\n0\r\n\r\n",
+                body.len()
+            );
+            let _ = sock.write_all(response.as_bytes()).await;
+            let close_requested = received
+                .lines()
+                .any(|l| l.eq_ignore_ascii_case("connection: close"));
+            let _ = tx.send(received);
+            if !close_requested {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            }
+        });
+
+        let config = ProxyConfig {
+            allowed_hosts: vec!["127.0.0.1".to_string()],
+            require_auth: false,
+            ..ProxyConfig::default()
+        };
+        let handle = start(config).await.unwrap();
+
+        let mut stream = TcpStream::connect(("127.0.0.1", handle.port))
+            .await
+            .unwrap();
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#;
+        let request = format!(
+            "POST http://127.0.0.1:{port}/mcp HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: keep-alive\r\nKeep-Alive: timeout=30\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len(),
+            port = origin_addr.port(),
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+
+        let mut response = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            stream.read_to_end(&mut response),
+        )
+        .await
+        .expect("proxy must close the inbound connection once the response ends")
+        .unwrap();
+        let response = String::from_utf8_lossy(&response).to_lowercase();
+        assert!(response.starts_with("http/1.1 200"), "got: {response}");
+        assert!(response.contains("mcp-session-id: s1"), "got: {response}");
+        assert!(response.contains("connection: close"), "got: {response}");
+        assert!(!response.contains("keep-alive"), "got: {response}");
+        assert!(
+            response.ends_with("0\r\n\r\n"),
+            "body truncated: {response}"
+        );
+
+        let received = origin_rx.await.unwrap().to_lowercase();
+        assert!(received.contains("connection: close"), "got: {received}");
+        assert!(!received.contains("keep-alive"), "got: {received}");
+        assert!(received.ends_with(body), "body not forwarded: {received}");
     }
 
     /// Absolute-form http:// to an ALLOWED host is forwarded and returns the
@@ -6402,6 +7941,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                phantom_format: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -6491,6 +8031,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                phantom_format: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -6590,6 +8131,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                phantom_format: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -6718,9 +8260,10 @@ mod tests {
             query_param_name: None,
             proxy: None,
             env_var: None,
+            phantom_format: None,
             endpoint_rules: vec![crate::config::EndpointRule {
                 method: "GET".to_string(),
-                path: "/get".to_string(),
+                path: "/get".into(),
             }],
             endpoint_policy: None,
             tls_ca: None,
@@ -7038,6 +8581,7 @@ mod tests {
                 query_param_name: None,
                 proxy: None,
                 env_var: None,
+                phantom_format: None,
                 endpoint_rules: vec![],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -7079,6 +8623,299 @@ mod tests {
                 .any(|e| e.mode == nono::undo::NetworkAuditMode::Reverse),
             "expected a Reverse-mode audit event, got: {events:?}"
         );
+
+        handle.shutdown();
+    }
+
+    // --- Network approval on the plain-HTTP forward path (issue #2261) ---
+
+    /// Start a proxy whose allowlist excludes `127.0.0.1`, with a network
+    /// approval backend that always answers `decision`.
+    async fn start_forward_approval_proxy(
+        config: ProxyConfig,
+        decision: nono::ApprovalDecision,
+    ) -> (ProxyHandle, Arc<std::sync::atomic::AtomicUsize>) {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let backend: Arc<dyn nono::ApprovalBackend> = Arc::new(crate::test_env::CountingBackend {
+            decision,
+            calls: Arc::clone(&calls),
+        });
+        let handle = start_with_network_approval(
+            config,
+            None,
+            None,
+            None,
+            Some(backend),
+            "test-session".to_string(),
+        )
+        .await
+        .unwrap();
+        (handle, calls)
+    }
+
+    /// Send one absolute-form `GET` for `target` through the proxy and return
+    /// the full response.
+    async fn send_forward_get(handle: &ProxyHandle, target: &str, host_header: &str) -> String {
+        use base64::Engine;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", handle.port))
+            .await
+            .unwrap();
+        let creds = base64::engine::general_purpose::STANDARD
+            .encode(format!("nono:{}", handle.token.as_str()));
+        let request = format!(
+            "GET {target} HTTP/1.1\r\nHost: {host_header}\r\nProxy-Authorization: Basic {creds}\r\n\r\n"
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        String::from_utf8_lossy(&response).to_string()
+    }
+
+    fn not_allowlisted_config() -> ProxyConfig {
+        ProxyConfig {
+            allowed_hosts: vec!["example.com".to_string()],
+            ..ProxyConfig::default()
+        }
+    }
+
+    /// An allowlist miss over plain HTTP asks the approval backend, and an
+    /// approved host is forwarded and audited as `ApproveGranted`.
+    #[tokio::test]
+    async fn forward_http_allowlist_miss_is_forwarded_when_approved() {
+        let (origin_addr, origin_rx) = spawn_echo_origin().await;
+        let (handle, calls) =
+            start_forward_approval_proxy(not_allowlisted_config(), nono::ApprovalDecision::Granted)
+                .await;
+
+        let authority = format!("127.0.0.1:{}", origin_addr.port());
+        let response =
+            send_forward_get(&handle, &format!("http://{authority}/hello"), &authority).await;
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "approved host should be forwarded, got: {response}"
+        );
+        let received = origin_rx.await.unwrap();
+        assert!(
+            received.starts_with("GET /hello HTTP/1.1"),
+            "upstream should see origin-form request, got: {received:?}"
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let events = handle.drain_audit_events();
+        assert!(
+            events.iter().any(
+                |e| e.decision == nono::undo::NetworkAuditDecision::ApproveGranted
+                    && e.target == "127.0.0.1"
+                    && e.approval_backend.as_deref() == Some("counting")
+            ),
+            "expected an ApproveGranted audit event, got: {events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| e.decision == nono::undo::NetworkAuditDecision::Allow
+                    && e.status == Some(200)
+                    && e.approval_backend.as_deref() == Some("counting")),
+            "expected the L7 event to carry the approving backend, got: {events:?}"
+        );
+
+        handle.shutdown();
+    }
+
+    /// A refused plain-HTTP allowlist miss returns 403 and audits
+    /// `ApproveDenied`.
+    #[tokio::test]
+    async fn forward_http_allowlist_miss_is_403_when_approval_denied() {
+        let (handle, calls) = start_forward_approval_proxy(
+            not_allowlisted_config(),
+            nono::ApprovalDecision::Denied {
+                reason: "operator said no".to_string(),
+            },
+        )
+        .await;
+
+        let response = send_forward_get(&handle, "http://127.0.0.1:9/secret", "127.0.0.1:9").await;
+        assert!(
+            response.starts_with("HTTP/1.1 403"),
+            "denied approval should 403, got: {response}"
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let events = handle.drain_audit_events();
+        assert!(
+            events.iter().any(
+                |e| e.decision == nono::undo::NetworkAuditDecision::ApproveDenied
+                    && e.target == "127.0.0.1"
+                    && e.approval_backend.as_deref() == Some("counting")
+                    && e.denial_category
+                        == Some(nono::undo::NetworkAuditDenialCategory::HostDenied)
+            ),
+            "expected an ApproveDenied audit event, got: {events:?}"
+        );
+
+        handle.shutdown();
+    }
+
+    /// A cloud-metadata target is a hard denial: the backend is never asked,
+    /// even though it would grant.
+    #[tokio::test]
+    async fn forward_http_metadata_target_is_never_prompted() {
+        let (handle, calls) =
+            start_forward_approval_proxy(not_allowlisted_config(), nono::ApprovalDecision::Granted)
+                .await;
+
+        let response = send_forward_get(
+            &handle,
+            "http://169.254.169.254/latest/meta-data/",
+            "169.254.169.254",
+        )
+        .await;
+        assert!(
+            response.starts_with("HTTP/1.1 403"),
+            "metadata target must be denied, got: {response}"
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        let events = handle.drain_audit_events();
+        assert!(
+            events
+                .iter()
+                .all(|e| e.decision != nono::undo::NetworkAuditDecision::ApproveGranted),
+            "metadata target must not be approved, got: {events:?}"
+        );
+
+        handle.shutdown();
+    }
+
+    /// When the request would be chained through the external proxy, approval
+    /// is not offered, matching the CONNECT external-proxy path.
+    #[tokio::test]
+    async fn forward_http_external_proxy_chain_is_never_prompted() {
+        let config = ProxyConfig {
+            external_proxy: Some(crate::config::ExternalProxyConfig {
+                address: "127.0.0.1:9".to_string(),
+                auth: None,
+                bypass_hosts: Vec::new(),
+            }),
+            ..not_allowlisted_config()
+        };
+        let (handle, calls) =
+            start_forward_approval_proxy(config, nono::ApprovalDecision::Granted).await;
+
+        let response = send_forward_get(&handle, "http://127.0.0.1:9/secret", "127.0.0.1:9").await;
+        assert!(
+            response.starts_with("HTTP/1.1 403"),
+            "chained allowlist miss must be denied, got: {response}"
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        handle.shutdown();
+    }
+
+    /// Origin that accepts any number of connections and answers each with
+    /// `200 OK`, so one test can open a CONNECT tunnel and send a forward
+    /// request to the same `host:port`.
+    async fn spawn_multi_origin() -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    if sock.read(&mut buf).await.unwrap_or(0) > 0 {
+                        let _ = sock
+                            .write_all(
+                                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                            )
+                            .await;
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    /// Send a CONNECT for `authority` through the proxy and return the status
+    /// line of the proxy's reply.
+    async fn send_connect(handle: &ProxyHandle, authority: &str) -> String {
+        use base64::Engine;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", handle.port))
+            .await
+            .unwrap();
+        let creds = base64::engine::general_purpose::STANDARD
+            .encode(format!("nono:{}", handle.token.as_str()));
+        let request = format!(
+            "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nProxy-Authorization: Basic {creds}\r\n\r\n"
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut status = String::new();
+        tokio::io::BufReader::new(stream)
+            .read_line(&mut status)
+            .await
+            .unwrap();
+        status
+    }
+
+    /// An "Always allow" given on a CONNECT tunnel also covers plain-HTTP
+    /// forward requests to the same `host:port`: both paths share the session
+    /// cache, so the backend is consulted only once.
+    #[tokio::test]
+    async fn forward_http_reuses_connect_session_grant() {
+        let origin_addr = spawn_multi_origin().await;
+        let (handle, calls) = start_forward_approval_proxy(
+            not_allowlisted_config(),
+            nono::ApprovalDecision::GrantedForSession,
+        )
+        .await;
+
+        let authority = format!("127.0.0.1:{}", origin_addr.port());
+        let status = send_connect(&handle, &authority).await;
+        assert!(
+            status.starts_with("HTTP/1.1 200"),
+            "approved CONNECT should be established, got: {status}"
+        );
+
+        let response =
+            send_forward_get(&handle, &format!("http://{authority}/hello"), &authority).await;
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "session-granted host should be forwarded, got: {response}"
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        handle.shutdown();
+    }
+
+    /// An "Always deny" given on a plain-HTTP forward request also blocks a
+    /// CONNECT tunnel to the same `host:port` without re-prompting.
+    #[tokio::test]
+    async fn connect_reuses_forward_http_session_denial() {
+        let origin_addr = spawn_multi_origin().await;
+        let (handle, calls) = start_forward_approval_proxy(
+            not_allowlisted_config(),
+            nono::ApprovalDecision::DeniedForSession,
+        )
+        .await;
+
+        let authority = format!("127.0.0.1:{}", origin_addr.port());
+        let response =
+            send_forward_get(&handle, &format!("http://{authority}/hello"), &authority).await;
+        assert!(
+            response.starts_with("HTTP/1.1 403"),
+            "session-denied host should 403, got: {response}"
+        );
+
+        let status = send_connect(&handle, &authority).await;
+        assert!(
+            status.starts_with("HTTP/1.1 403"),
+            "session-denied CONNECT should 403, got: {status}"
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
 
         handle.shutdown();
     }

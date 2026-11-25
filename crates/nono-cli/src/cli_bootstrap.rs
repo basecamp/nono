@@ -26,6 +26,7 @@ pub(crate) fn init_theme(cli: &Cli) {
 /// `RUST_LOG=debug`. It is a no-op when `RUST_LOG` is unset or empty, so normal
 /// runs stay silent. Errors from a double-init are swallowed: the launcher only
 /// ever calls this once, but `try_init` keeps it defensive.
+#[cfg(target_os = "macos")]
 pub(crate) fn init_internal_entrypoint_tracing() {
     let Some(filter) = std::env::var_os("RUST_LOG") else {
         return;
@@ -135,10 +136,8 @@ fn cli_verbosity(cli: &Cli) -> u8 {
         | Commands::Rollback(_)
         | Commands::Trust(_)
         | Commands::Audit(_)
+        | Commands::Remote(_)
         | Commands::Platform(_)
-        | Commands::Login(_)
-        | Commands::Logout(_)
-        | Commands::Connect(_)
         | Commands::Pull(_)
         | Commands::Remove(_)
         | Commands::Update(_)
@@ -150,6 +149,8 @@ fn cli_verbosity(cli: &Cli) -> u8 {
         | Commands::Attach(_)
         | Commands::Logs(_)
         | Commands::Inspect(_)
+        | Commands::Replay(_)
+        | Commands::Transcript(_)
         | Commands::Session(_)
         | Commands::Profile(_)
         | Commands::Pin(_)

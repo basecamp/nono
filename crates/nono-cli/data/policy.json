@@ -151,6 +151,7 @@
           "/sbin",
           "/usr/bin",
           "/usr/sbin",
+          "/usr/libexec",
           "/usr/local/bin",
           "/usr/lib",
           "/usr/local/lib",
@@ -230,6 +231,7 @@
           "/etc/locale.gen",
           "/etc/alternatives",
           "/etc/os-release",
+          "/etc/debian_version",
           "/etc/passwd",
           "/etc/services",
           "/etc/mime.types",
@@ -419,7 +421,9 @@
           "/etc/mise",
           "~/.local/bin/mise",
           "~/.config/mise",
-          "~/.local/share/mise"
+          "~/.local/share/mise",
+          "~/.local/state/mise",
+          "~/.tool-versions"
         ]
       }
     },
