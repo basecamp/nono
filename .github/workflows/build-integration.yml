@@ -5,7 +5,8 @@
 #
 # rebuild-integration.yml starts it on each rebuild; start it by hand with
 # `gh workflow run build-integration.yml --ref integration`. A push does not
-# start it: a commit merged into integration is replaced by the next rebuild.
+# start it: a commit merged into integration is superseded by the next rebuild,
+# whose tree is the recipe's alone.
 # A failed build keeps one issue labelled integration-build open until a build
 # succeeds.
 #

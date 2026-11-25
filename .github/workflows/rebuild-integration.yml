@@ -1,7 +1,9 @@
 # Rebuilds `integration` from the upstream nolabs-ai/nono `main` commit pinned in
 # .github/integration/upstream and the topic branches in .github/integration/topics
 # (.github/integration/rebuild, see INTEGRATION.md), daily and after every change to this branch,
-# then starts build-integration.yml on the result.
+# then starts build-integration.yml on the result. Each rebuild is one commit on integration's tip
+# with exactly the recipe's tree, its second parent the fresh rebuild, pushed as a fast-forward:
+# the org's rules refuse a force-push to a default branch.
 #
 # A pin that is unreadable or not on upstream main, a topic branch that is missing or does not
 # merge, or a push that is refused, stops the rebuild: nothing is pushed or built, and one issue
@@ -51,7 +53,7 @@ jobs:
     timeout-minutes: 20
     environment: integration-rebuild
     permissions:
-      contents: write # force-push integration (GITHUB_TOKEN, when INTEGRATION_PUSH_TOKEN is unset)
+      contents: write # push integration (GITHUB_TOKEN, when INTEGRATION_PUSH_TOKEN is unset)
       actions: write # start build-integration.yml on the result
     outputs:
       sha: ${{ steps.rebuild.outputs.sha }}
