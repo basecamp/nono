@@ -1293,10 +1293,19 @@ pub async fn start_with_network_approval(
     // for ALL routes, regardless of credential presence. This happens before
     // binding so route/no_proxy conflicts fail configuration instead of being
     // silently omitted from the generated environment.
+    // This start's view of the OS trust store, loaded on first use and
+    // shared by the route connectors, the upstream connector and the
+    // intercept bundle; the next start takes its own.
+    let trust_roots = crate::native_roots::TrustRoots::new();
     let route_store = if config.routes.is_empty() {
         RouteStore::empty()
     } else {
-        RouteStore::load_with_registry(&config.routes, config.secret_registry.as_ref()).await?
+        RouteStore::load_with_roots(
+            &config.routes,
+            config.secret_registry.as_ref(),
+            &trust_roots,
+        )
+        .await?
     };
     let route_hosts = route_store.route_upstream_hosts();
     validate_no_proxy_route_conflicts(&config.no_proxy, &route_hosts)?;
@@ -1347,21 +1356,17 @@ pub async fn start_with_network_approval(
     // crypto providers are in the dependency tree.
     // Must be created before CredentialStore::load_with_diagnostics() because OAuth2 token
     // exchange needs TLS.
-    let mut root_store = rustls::RootCertStore::empty();
-    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let native = rustls_native_certs::load_native_certs();
-    if !native.errors.is_empty() {
+    // The store is webpki roots plus this start's snapshot of the OS trust
+    // store, shared with the route store and the intercept bundle.
+    let native = trust_roots.native();
+    if native.error_count > 0 {
         debug!(
             "failed to load {} native cert(s); continuing with webpki roots + any that succeeded",
-            native.errors.len()
+            native.error_count
         );
     }
     let native_count = native.certs.len();
-    for cert in native.certs {
-        if let Err(e) = root_store.add(cert) {
-            debug!("skipping unparseable native cert: {e}");
-        }
-    }
+    let root_store = trust_roots.base_root_store();
     if native_count > 0 {
         debug!("added {native_count} native system CA(s) to upstream trust store");
     }
@@ -1542,12 +1547,15 @@ pub async fn start_with_network_approval(
                     Arc::clone(&ca),
                     config.leaf_validity,
                 ));
-                let path = tls_intercept::write_bundle(tls_intercept::BundleInputs {
-                    dir,
-                    filename: "intercept-ca.pem",
-                    parent_ssl_cert_file: config.intercept_parent_ca_pems.as_deref(),
-                    ephemeral_ca_pem: ca.cert_pem(),
-                })?;
+                let path = tls_intercept::bundle::write_bundle_with_roots(
+                    tls_intercept::BundleInputs {
+                        dir,
+                        filename: "intercept-ca.pem",
+                        parent_ssl_cert_file: config.intercept_parent_ca_pems.as_deref(),
+                        ephemeral_ca_pem: ca.cert_pem(),
+                    },
+                    trust_roots.native(),
+                )?;
                 Ok((cache, path))
             }) {
                 Ok((cache, path)) => {
