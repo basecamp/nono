@@ -339,6 +339,22 @@ fn metadata_mediation_applies_under_network_namespace_isolation() {
     run_mode_and_time_matrix("metadata-isolate", MEDIATED_ISOLATED, "ops");
 }
 
+/// Under a mount mask the supervisor would resolve and apply each change
+/// outside the child's mount namespace, so the combination is refused.
+#[test]
+fn metadata_mediation_is_refused_with_mount_isolation() {
+    let t = nono_test!("metadata-mounts");
+    let profile = t.write_profile(
+        "metadata-mounts",
+        r#"{"meta":{"name":"metadata-mounts"},"linux":{"metadata_mediation":"write_grants","isolate":{"mounts":true}}}"#,
+    );
+    t.run()
+        .profile(&profile)
+        .exec(Argv::new("/bin/true"))
+        .assert_failure("metadata mediation cannot see the child's mount namespace")
+        .assert_stderr_contains("cannot be combined with linux.metadata_mediation");
+}
+
 #[test]
 fn metadata_mediation_resolves_relative_names_from_the_dirfd() {
     let Some(py) = python3_bin() else {
