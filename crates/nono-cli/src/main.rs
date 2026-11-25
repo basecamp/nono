@@ -362,6 +362,7 @@ mod tests {
             set_vars: None,
             profile_network_block: false,
             allow_http2_requested: false,
+            allowlist_denial_message: None,
         };
 
         let effective = resolve_effective_proxy_settings(&args, &prepared)?;
@@ -449,6 +450,7 @@ mod tests {
             set_vars: None,
             profile_network_block: false,
             allow_http2_requested: false,
+            allowlist_denial_message: None,
         };
 
         let effective = resolve_effective_proxy_settings(&args, &prepared)?;
