@@ -267,7 +267,7 @@ The proxy resolves DNS itself and checks all resolved IP addresses against the l
 2. DNS returns a link-local address (e.g., `169.254.169.254`)
 3. The proxy would connect to the cloud metadata service thinking it's an allowed external API
 
-Link-local IPs (169.254.0.0/16, fe80::/10) are always blocked after DNS resolution. Cloud metadata hostnames are also hardcoded as denied. Private network addresses (RFC1918) are allowed to support enterprise environments.
+Link-local IPs (169.254.0.0/16, fe80::/10) are always blocked after DNS resolution. Cloud metadata hostnames are also hardcoded as denied. Private network addresses (RFC1918) are allowed by default to support enterprise environments; a profile's `network.resolved_addresses.public_only` refuses loopback, private, shared (CGNAT) and unspecified answers too, except the classes its `exceptions` name for a host. The check runs on the same resolved addresses the proxy then connects to.
 
 ### Credential Isolation
 
