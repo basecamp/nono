@@ -5,6 +5,9 @@ upstream `main` commit pinned in `upstream` plus the topic branches listed in `t
 fork's builds never wait on upstream, and upstream's churn never breaks them. The pin moves by
 pull request: the daily trial (`rebuild --try-upstream`) opens one when every topic merges onto
 upstream `main`'s tip, and an issue naming the topic and files when one doesn't.
+`integration` is never force-pushed: its tip always has exactly the tree of its recipe, and each
+rebuild is one commit on top of the last, whose second parent is the fresh rebuild. Never base
+work on it.
 A PR that changes this directory (a carry PR: adding, reordering or dropping a topic, moving the
 pin, or changing the rebuild) follows the fork's rules, not upstream's contribution workflow:
 

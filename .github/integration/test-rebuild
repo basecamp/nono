@@ -5,11 +5,13 @@
 #   .github/integration/test-rebuild
 #
 # Cases: a rebuild that pushes, on the pinned upstream commit (upstream's workflows removed, the
-# fork layer and the recipe's topics in, INTEGRATION.md written); a rerun that finds integration
+# fork layer and the recipe's topics in, INTEGRATION.md written), as a fast-forward: one commit on
+# the old tip with the rebuild's tree, the rebuild its second parent; a rerun that finds integration
 # current and pushes nothing; upstream moving (integration stays on the pin, the trial builds on
 # the tip, moving the pin rebuilds there); a topic that does not merge onto the tip (the trial
 # names it, the pinned rebuild is unaffected), and one that is missing (exit 1, a reason, nothing
-# pushed); a topic already upstream (noted, still a rebuild); a push whose lease is stale; a layer
+# pushed); a topic already upstream (noted, still a rebuild); a push whose lease is stale, the tip
+# moved on or back to an ancestor (which a fast-forward alone would take); a layer
 # without the recipe; a pin missing, malformed, or not on upstream main (exit 1, named, nothing
 # pushed).
 # shellcheck disable=SC2015,SC2016 # `A && B || die` (die exits); backticks are Markdown
@@ -56,6 +58,24 @@ run() { # run ARGS...: the rebuild from the clone, stdout to $t/out, stderr to $
   rc=0; (cd "$w" && REBUILD_REASON_FILE="$t/reason" "$w/.github/integration/rebuild" "$@") >"$t/out" 2>"$t/err" || rc=$?
 }
 tip() { g "$t/fork.git" rev-parse refs/heads/integration; }
+# fastforward CASE OLD NEW: NEW is one commit on OLD (first parent) with exactly the tree of the
+# rebuild (second parent), which has upstream's pin and every topic in the recipe as ancestors.
+fastforward() {
+  local f="$t/fork.git" topic topics
+  [ "$(g "$f" rev-list --parents -n1 "$3" | wc -w)" = 3 ] || die "$1: $3 is not a two-parent commit"
+  [ "$(g "$f" rev-parse "$3^1")" = "$2" ] || die "$1: first parent is not the old tip $2"
+  g "$f" merge-base --is-ancestor "$2" "$3" || die "$1: not a fast-forward from $2"
+  [ "$(g "$f" rev-parse "$3^{tree}")" = "$(g "$f" rev-parse "$3^2^{tree}")" ] || die "$1: tip's tree is not the rebuild's"
+  [ "$(g "$f" log -1 --format=%s "$3^2")" = 'ci: fork layer for integration' ] || die "$1: second parent is not the rebuild"
+  g "$f" merge-base --is-ancestor "$(sed -n 's/^pin=//p' "$t/out")" "$3^2" || die "$1: upstream pin not an ancestor of the rebuild"
+  read -ra topics <<<"$(sed -n 's/^topics=//p' "$t/out")"
+  [ "${#topics[@]}" -gt 0 ] || die "$1: no topics line"
+  for topic in "${topics[@]}"; do
+    g "$f" merge-base --is-ancestor "${topic##*@}" "$3^2" || die "$1: topic $topic not an ancestor of the rebuild"
+  done
+  [ "$(g "$f" log -1 --format=%s "$3")" = 'ci: integration rebuilt from its recipe' ] || die "$1: wrapper subject"
+  [ "$(g "$f" log -1 --format=%b "$3")" = "$(g "$f" log -1 --format=%b "$3^2")" ] || die "$1: wrapper body differs from the rebuild's"
+}
 up() { g "$t/up" rev-parse main; }
 # setpin SHA [TOPICS]: commit a new pin (and recipe) onto the fork's integration, as a merged PR would.
 setpin() {
@@ -84,11 +104,13 @@ g "$t/fork.git" cat-file -e "$after:src/one.txt" || die "1: fix/one not merged"
 g "$t/fork.git" show "$after:INTEGRATION.md" | grep -q '| \[`fix/two`\].*| Fixes `two` \\| pipes |$' || die "1: INTEGRATION.md row"
 g "$t/fork.git" merge-base --is-ancestor "$(up)" "$after" || die "1: not on upstream main"
 g "$t/fork.git" show "$after:INTEGRATION.md" | grep -q "^Pinned: nolabs-ai/nono \`main\` at \[\`$(up | cut -c1-12)\`\]" || die "1: INTEGRATION.md pin"
-ok "1: rebuild pushes the pinned upstream + topics + fork layer, upstream workflows removed"
+fastforward 1 "$before" "$after"
+ok "1: rebuild pushes the pinned upstream + topics + fork layer, upstream workflows removed, as a fast-forward"
 
 # 2. A rerun finds it current.
 run --push
-[ "$rc" = 0 ] && grep -qx 'changed=false' "$t/out" && [ "$(tip)" = "$after" ] || die "2: rc=$rc $(cat "$t/out" "$t/err")"
+[ "$rc" = 0 ] && grep -qx 'changed=false' "$t/out" && grep -qx "sha=$after" "$t/out" && [ "$(tip)" = "$after" ] \
+  || die "2: rc=$rc $(cat "$t/out" "$t/err")"
 ok "2: rerun is current, pushes nothing"
 
 # 3. Upstream moves: integration stays on the pin; the trial builds on the tip; moving the pin
@@ -101,11 +123,19 @@ run --push
 run --try-upstream
 [ "$rc" = 0 ] && grep -qx 'changed=true' "$t/out" && grep -qx "base=$(up)" "$t/out" && grep -qx "pin=$pinned" "$t/out" \
   && [ "$(tip)" = "$after" ] || die "3: trial: rc=$rc $(cat "$t/out" "$t/err")"
-g "$w" merge-base --is-ancestor "$(up)" "$(sed -n 's/^sha=//p' "$t/out")" || die "3: trial not built on the tip"
+trial="$(sed -n 's/^sha=//p' "$t/out")"
+g "$w" merge-base --is-ancestor "$(up)" "$trial" || die "3: trial not built on the tip"
+# The trial's result is the bare rebuild: not wrapped onto integration.
+[ "$(g "$w" log -1 --format=%s "$trial")" = 'ci: fork layer for integration' ] \
+  && ! g "$w" merge-base --is-ancestor "$after" "$trial" || die "3: trial result wrapped onto integration"
 setpin "$(up)"
+before="$(tip)"
 run --push
 [ "$rc" = 0 ] && grep -qx 'changed=true' "$t/out" && grep -qx "base=$(up)" "$t/out" || die "3: rc=$rc $(cat "$t/err")"
 g "$t/fork.git" merge-base --is-ancestor "$(up)" "$(tip)" || die "3: not rebuilt onto the new pin"
+grep -qx "sha=$(tip)" "$t/out" || die "3: sha line is not the pushed tip"
+fastforward 3 "$before" "$(tip)"
+g "$t/fork.git" merge-base --is-ancestor "$after" "$(tip)" || die "3: the first rebuild is no longer an ancestor"
 ok "3: upstream moved: integration stays on the pin, the trial builds on the tip, a new pin rebuilds"
 
 # 4. A topic that does not merge onto the tip: the trial names it; the pinned rebuild is unaffected.
@@ -163,6 +193,8 @@ before="$(tip)"
 run --layer HEAD
 [ "$rc" = 0 ] && [ "$(tip)" = "$before" ] || die "7: rc=$rc"
 sha="$(sed -n 's/^sha=//p' "$t/out")"
+# Without --push, sha is what --push would push: on the fork's tip, which it was built from.
+[ "$(g "$w" rev-parse "$sha^1")" = "$before" ] || die "7: sha is not on the fork's tip"
 [ "$(g "$w" show "$sha:src/a.txt")" = "$(printf 'one\nTWO\nthree')" ] \
   && [ "$(g "$w" show "$sha:INTEGRATION.md" | grep -c '^| \[`fix/')" = 1 ] || die "7: --layer recipe not used"
 ok "7: --layer uses the proposed recipe; no --push, nothing pushed"
@@ -170,6 +202,7 @@ ok "7: --layer uses the proposed recipe; no --push, nothing pushed"
 # 8. A push whose lease went stale (integration moved meanwhile) is refused.
 echo 'upstream three' > "$t/up/src/c.txt"; g "$t/up" add -A; g "$t/up" commit -q -m 'upstream: three'
 setpin "$(up)"
+pinned="$(tip)"
 # Move the fork's integration after the rebuild fetched it: a pre-push hook in the clone does it
 # (--git-dir: a hook runs with the pushing repository's GIT_DIR set).
 cat > "$w/.git/hooks/pre-push" <<EOF
@@ -182,7 +215,20 @@ run --push
 rm -f "$w/.git/hooks/pre-push"
 [ "$rc" = 1 ] && grep -q '^pushing .* to integration was refused' "$t/reason" || die "8: rc=$rc $(cat "$t/reason" 2>/dev/null)"
 [ "$(tip)" = "$(g "$t/fork.git" rev-parse refs/heads/fix/one)" ] || die "8: the lease did not hold"
-ok "8: a stale lease refuses the push"
+# Moved back to an ancestor of the tip it was built on, after the rebuild fetched it and before
+# its push starts (a git on PATH that moves it first): the push would be a fast-forward, and only
+# the lease refuses it.
+back="$(g "$t/fork.git" rev-parse "$pinned^1")"
+g "$t/fork.git" update-ref refs/heads/integration "$pinned"
+mkdir -p "$t/mover"
+printf '#!/bin/sh\ncase " $* " in *" push "*) "%s" --git-dir="%s" update-ref refs/heads/integration %s ;; esac\nexec "%s" "$@"\n' \
+  "$real" "$t/fork.git" "$back" "$real" > "$t/mover/git"
+chmod +x "$t/mover/git"
+rm -f "$t/reason"
+PATH="$t/mover:$PATH" run --push
+[ "$rc" = 1 ] && grep -q '^pushing .* to integration was refused' "$t/reason" || die "8 back: rc=$rc $(cat "$t/reason" 2>/dev/null)"
+[ "$(tip)" = "$back" ] || die "8 back: the lease did not hold"
+ok "8: a stale lease refuses the push, the tip moved away or back to an ancestor"
 
 # 9. A layer without the recipe (deleted or renamed) stops it: it never rebuilds with no topics.
 rm -f "$w/.git/hooks/pre-push"
