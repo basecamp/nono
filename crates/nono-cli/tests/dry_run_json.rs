@@ -501,6 +501,29 @@ fn the_report_is_the_capability_set_the_run_applies() {
     assert_eq!(probe["executable"], canon(Path::new("/bin/cat")).as_str());
 }
 
+/// Under a mount mask the run resolves grants in its own mount namespace,
+/// which host-path grants cannot show: the report says so.
+#[cfg(target_os = "linux")]
+#[test]
+fn mount_isolation_makes_the_report_incomplete() {
+    let t = nono_test!("dry-run-json-mounts");
+    let report = report(
+        &t,
+        r#"{"meta":{"name":"t"},"linux":{"isolate":{"mounts":true}}}"#,
+        |run| run,
+    );
+    assert!(
+        report["incomplete"]
+            .as_array()
+            .expect("incomplete")
+            .iter()
+            .any(|i| i
+                .as_str()
+                .is_some_and(|i| i.starts_with("linux.isolate.mounts"))),
+        "{report}"
+    );
+}
+
 /// Capability elevation lets the supervisor grant paths beyond the list at
 /// runtime: the report says so, and a consumer fails closed.
 #[cfg(target_os = "linux")]

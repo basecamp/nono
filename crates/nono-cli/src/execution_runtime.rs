@@ -285,6 +285,7 @@ pub(crate) fn dry_run_children(plan: &LaunchPlan) -> Result<DryRunMediation> {
         let runtime = crate::tool_sandbox::PreparedToolSandboxRuntime::prepare(
             crate::tool_sandbox::ToolSandboxPrepare {
                 config: &buildable,
+                session_socket_auth: flags.session_socket_auth,
                 #[cfg(target_os = "linux")]
                 initial_program: &resolved_program,
                 resolved_command_binaries: flags.resolved_command_binaries.as_ref(),

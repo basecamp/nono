@@ -118,6 +118,16 @@ pub(crate) fn dry_run_report(
                 .to_string(),
         );
     }
+    // Under a mount mask the child resolves each grant in its own mount
+    // namespace (masked host paths, a private `/tmp`, paths re-bound through
+    // the masks), which these host-path grants cannot show.
+    #[cfg(target_os = "linux")]
+    if plan.flags.isolate.mounts {
+        incomplete.push(
+            "linux.isolate.mounts: the run resolves these grants in its own mount namespace (masked host paths, a private /tmp, granted paths re-bound through the masks), which this list doesn't model"
+                .to_string(),
+        );
+    }
     // Every file grant read back from the profile the launch applies, from
     // the session's augmented set (`grant_outer_caps`), or the plan's own set
     // when no mediation runs — the same choice the launch makes. On Linux

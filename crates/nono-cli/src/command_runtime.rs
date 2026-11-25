@@ -154,13 +154,22 @@ fn resolve_program_from_profile_or_cli(
 }
 
 pub(crate) fn run_sandbox(mut run_args: RunArgs, silent: bool) -> Result<()> {
-    crate::platform_policy::prepare_start(&mut run_args.sandbox, silent)?;
     let command = run_args.command.clone();
     // A JSON dry run reads no credential source from here on: nothing runs or
     // prompts for one, and each credential is planned as declared.
     let dry_run_json = run_args.sandbox.dry_run && run_args.json;
     if dry_run_json {
         crate::credential_runtime::enter_plan_only();
+        // Nor does it refresh the platform policy, which signs a request with
+        // the device's key and contacts the platform: on an enrolled device
+        // the plan is the local one, and the report says the run's may differ.
+        if crate::platform_client::load_policy_state()?.is_some() {
+            crate::credential_runtime::note_undecided(
+                "the platform policy, which the run refreshes from the platform and applies at startup (it can select the profile and refuse options), and a dry run doesn't fetch",
+            );
+        }
+    } else {
+        crate::platform_policy::prepare_start(&mut run_args.sandbox, silent)?;
     }
 
     // Load profile once and reuse for binary resolution and command_args.
