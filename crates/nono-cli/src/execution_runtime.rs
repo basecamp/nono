@@ -200,6 +200,159 @@ fn recommended_pack_profile(program: &Path) -> Option<(&'static str, &'static [&
     }
 }
 
+/// What command mediation adds to a run, for `nono run --dry-run --json`.
+#[derive(Default)]
+pub(crate) struct DryRunMediation {
+    /// Each sandbox a brokered command can run under, as the launch builds it.
+    pub(crate) children: Vec<crate::tool_sandbox::DryRunChild>,
+    /// The session's capability set after runtime augmentation
+    /// (`grant_outer_caps`: command-mediation shims and sockets, and the
+    /// platform rules), i.e. the set the launch generates its profile from.
+    /// `None` when no command mediation runs, so the report uses the plan's
+    /// own set, exactly as the launch does. Read only where a profile is
+    /// generated (macOS); the Linux dry run keeps it for the same shape.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) session_caps: Option<CapabilitySet>,
+    /// Each command-policy credential, as declared and as it resolves.
+    pub(crate) credentials: Vec<crate::tool_sandbox::DryRunCredential>,
+    /// The credentials that don't resolve as declared, and why: left out of
+    /// the runtime the dry run prepares, so the rest is still built.
+    pub(crate) unresolved: Vec<(String, String)>,
+}
+
+/// Each sandbox the plan's brokered commands can run under, built by the
+/// command-mediation runtime `execute_sandboxed` prepares (the same
+/// `PreparedToolSandboxRuntime::prepare`, with the plan's capability set, deny
+/// paths and command policies), for a run from the plan's working directory;
+/// for `nono run --dry-run --json`. No proxy is started: the command-scoped
+/// credential routes the plan's proxy would carry are named, and each scope it
+/// would serve gets a stand-in loopback address; its ports and trust bundle
+/// (nono's own, and network, out of the report's contract) are not modeled. The
+/// runtime's directory is removed before this returns.
+pub(crate) fn dry_run_children(plan: &LaunchPlan) -> Result<DryRunMediation> {
+    let flags = &plan.flags;
+    let Some(command_policies) = flags
+        .command_policies
+        .as_ref()
+        .filter(|config| config.is_active())
+    else {
+        return Ok(DryRunMediation::default());
+    };
+    validate_command_policy_execution_support()?;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let caps = &plan.caps;
+        let requested_workdir =
+            flags
+                .workdir
+                .canonicalize()
+                .map_err(|e| NonoError::PathCanonicalization {
+                    path: flags.workdir.to_path_buf(),
+                    source: e,
+                })?;
+        let proxy_credentials: std::collections::BTreeSet<String> = flags
+            .network
+            .proxy_options()
+            .filter(|proxy| proxy.is_active())
+            .map(|proxy| {
+                proxy
+                    .tool_sandbox_proxy_credentials
+                    .iter()
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        let scoped_proxy_env_vars =
+            crate::proxy_runtime::dry_run_scoped_proxy_env_vars(&flags.network);
+        // (A credential the launch can't resolve as declared would stop the
+        // run; the dry run names it and builds the rest without it. A raw-file
+        // credential must resolve; a local socket may be unavailable.)
+        let credentials =
+            crate::tool_sandbox::dry_run_credentials(command_policies, &proxy_credentials);
+        let unresolved: Vec<(String, String)> = credentials
+            .iter()
+            .filter_map(|c| c.unresolved.clone().map(|reason| (c.name.clone(), reason)))
+            .collect();
+        let mut buildable = command_policies.clone();
+        for credential in credentials
+            .iter()
+            .filter(|c| c.unresolved.is_some() && c.kind != "local-socket")
+        {
+            buildable.credentials.remove(&credential.name);
+        }
+        #[cfg(target_os = "linux")]
+        let resolved_program = exec_strategy::resolve_program(&plan.program)?;
+        let runtime = crate::tool_sandbox::PreparedToolSandboxRuntime::prepare(
+            crate::tool_sandbox::ToolSandboxPrepare {
+                config: &buildable,
+                #[cfg(target_os = "linux")]
+                initial_program: &resolved_program,
+                resolved_command_binaries: flags.resolved_command_binaries.as_ref(),
+                audit_context: crate::tool_sandbox::ToolSandboxAuditContext::new(
+                    flags.profile_display_name.clone(),
+                    flags.redaction_policy.clone(),
+                ),
+                allowed_commands: caps.allowed_commands(),
+                blocked_commands: caps.blocked_commands(),
+                outer_caps: caps,
+                deny_paths: &plan.deny_paths,
+                #[cfg(target_os = "macos")]
+                bypass_protection_paths: &flags.bypass_protection_paths,
+                approval_sockets: &approval_sockets(flags),
+                policy_root: &requested_workdir,
+                proxy_credentials: &proxy_credentials,
+                reserved_proxy_ports: &std::collections::BTreeSet::new(),
+                scoped_proxy_env_vars: &scoped_proxy_env_vars,
+                proxy_trust_bundle_paths: &[],
+                shared_broker: None,
+            },
+        )?;
+        let children = runtime.dry_run_children(&requested_workdir);
+        // The session's augmented set, exactly as the launch builds it before
+        // generating its profile (grant_outer_caps adds the mediation shims
+        // and sockets and the platform rules). The report generates the
+        // profile from this same set, so it reads back what the launch applies.
+        let mut granted = caps.clone();
+        let granted = runtime.grant_outer_caps(&mut granted).map(|()| granted);
+        // Clean up the runtime directory before propagating a grant error, as
+        // the macOS runtime disarms its preparation cleanup and has no
+        // drop-time cleanup: a failed dry run must not leave it behind.
+        runtime.cleanup_runtime_dir();
+        Ok(DryRunMediation {
+            children,
+            session_caps: Some(granted?),
+            credentials,
+            unresolved,
+        })
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = command_policies;
+        Ok(DryRunMediation::default())
+    }
+}
+
+/// The `unix://` approval helpers on every surface of a launch. Neither the
+/// agent nor a mediated command may be able to replace one of these sockets.
+fn approval_sockets(flags: &ExecutionFlags) -> Vec<(String, std::path::PathBuf)> {
+    crate::approval_runtime::approval_socket_paths(
+        [&flags.approval_backends]
+            .into_iter()
+            .chain(
+                flags
+                    .command_policies
+                    .as_ref()
+                    .map(|config| &config.approval_backends),
+            )
+            .chain(
+                flags
+                    .network
+                    .proxy_options()
+                    .map(|proxy| &proxy.network_approval_backends),
+            ),
+    )
+}
+
 pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
     let LaunchPlan {
         program,
@@ -376,23 +529,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         output::print_supervised_info(flags.silent, rollback.requested, network.is_proxy_active());
     }
 
-    // `unix://` approval helpers on every surface. Neither the agent nor a
-    // mediated command may be able to replace one of these sockets.
-    let approval_sockets = crate::approval_runtime::approval_socket_paths(
-        [&flags.approval_backends]
-            .into_iter()
-            .chain(
-                flags
-                    .command_policies
-                    .as_ref()
-                    .map(|config| &config.approval_backends),
-            )
-            .chain(
-                network
-                    .proxy_options()
-                    .map(|proxy| &proxy.network_approval_backends),
-            ),
-    );
+    let approval_sockets = approval_sockets(&flags);
 
     // One registry per session collects every credential value nono resolves
     // so the supervisor can redact it from terminal recordings (NEP-0010

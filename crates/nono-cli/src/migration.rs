@@ -20,7 +20,9 @@ pub enum MigrationOutcome {
 
 /// Check one exact package in the registry, then offer to install it.
 pub fn check_and_pull_package(package_ref: &PackageRef) -> Result<MigrationOutcome> {
-    if env_flag(ENV_NO_MIGRATE) {
+    // (A JSON dry run only plans: it looks nothing up, asks nothing, pulls
+    // nothing.)
+    if env_flag(ENV_NO_MIGRATE) || crate::credential_runtime::plan_only() {
         return Ok(MigrationOutcome::Skipped);
     }
 

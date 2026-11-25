@@ -154,6 +154,12 @@ fn resolve_program_from_profile_or_cli(
 
 pub(crate) fn run_sandbox(mut run_args: RunArgs, silent: bool) -> Result<()> {
     let command = run_args.command.clone();
+    // A JSON dry run reads no credential source from here on: nothing runs or
+    // prompts for one, and each credential is planned as declared.
+    let dry_run_json = run_args.sandbox.dry_run && run_args.json;
+    if dry_run_json {
+        crate::credential_runtime::enter_plan_only();
+    }
 
     // Load profile once and reuse for binary resolution and command_args.
     let loaded_profile = match run_args.sandbox.profile.as_ref() {
@@ -171,7 +177,21 @@ pub(crate) fn run_sandbox(mut run_args: RunArgs, silent: bool) -> Result<()> {
         silent,
     )?;
 
-    if should_auto_enable_claude_launch_services(&run_args.sandbox, &program, &cmd_args) {
+    // (What only Claude Code's Keychain login decides, a JSON dry run leaves
+    // undecided, and says so.)
+    let mut undecided: Vec<String> = Vec::new();
+    if dry_run_json
+        && crate::sandbox_prepare::claude_launch_services_needs_login(
+            &run_args.sandbox,
+            &program,
+            &cmd_args,
+        )
+    {
+        undecided.push(
+            "whether the run grants Claude Code LaunchServices depends on its Keychain login, which a dry run doesn't read"
+                .to_string(),
+        );
+    } else if should_auto_enable_claude_launch_services(&run_args.sandbox, &program, &cmd_args) {
         warn!(
             "Auto-enabling --allow-launch-services for Claude Code because no refresh-capable local auth was detected"
         );
@@ -204,6 +224,29 @@ pub(crate) fn run_sandbox(mut run_args: RunArgs, silent: bool) -> Result<()> {
                 cmd_args.push(OsString::from(expanded));
             }
         }
+    }
+
+    if args.dry_run && run_args.json {
+        // The launch's own plan, built as `run` builds it, reported as data on
+        // stdout; nothing else is printed there, and the program isn't launched.
+        let raw_rules = loaded_profile
+            .as_ref()
+            .map(|(_, profile)| profile.unsafe_macos_seatbelt_rules.clone())
+            .unwrap_or_default();
+        let plan = prepare_run_launch_plan(run_args, program, cmd_args, true)?;
+        let mediation = crate::execution_runtime::dry_run_children(&plan)?;
+        undecided.extend(crate::credential_runtime::undecided());
+        let report = crate::dry_run_report::dry_run_report(
+            &plan,
+            &mediation,
+            &undecided,
+            &raw_rules,
+            &plan.flags.workdir,
+        )?;
+        let text = serde_json::to_string_pretty(&report)
+            .map_err(|e| NonoError::ConfigParse(format!("dry-run report: {e}")))?;
+        println!("{text}");
+        return Ok(());
     }
 
     if args.dry_run {

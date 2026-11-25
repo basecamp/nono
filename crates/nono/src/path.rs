@@ -1,5 +1,6 @@
 //! Path utilities shared across nono library and CLI.
 
+use crate::error::{NonoError, Result};
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 
@@ -121,6 +122,91 @@ fn resolve_hops(
     }
 
     result
+}
+
+/// One metadata-only read the macOS profile grants for a `$PATH` directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PathMetadataRead {
+    /// The path itself (Seatbelt `literal`).
+    Path(String),
+    /// The direct children of the directory, not the directory itself and
+    /// nothing deeper (Seatbelt `regex "^<dir>/[^/]+$"`).
+    Children(String),
+}
+
+/// The metadata reads granted for `$PATH` directories, in the order the
+/// macOS profile emits them. The profile generator and the dry-run report
+/// both use this, so the report lists exactly what the profile grants.
+///
+/// Separate sets: a dir may appear both as a `$PATH` target (needs a direct-
+/// children grant, to cover `<dir>/<command>`) and as another entry's
+/// ancestor (needs only the literal). Tracking them together would let an
+/// ancestor-first literal suppress the later direct-children grant and
+/// re-break nested lookups.
+///
+/// # Errors
+///
+/// Returns an error if a `$PATH` directory is not valid UTF-8.
+pub fn path_metadata_reads(dirs: &[PathBuf]) -> Result<Vec<PathMetadataRead>> {
+    let mut reads = Vec::new();
+    let mut seen_dir = HashSet::new();
+    let mut seen_ancestor = HashSet::new();
+    for dir in dirs {
+        let dir_str = dir.to_str().ok_or_else(|| {
+            NonoError::SandboxInit(format!(
+                "PATH directory contains non-UTF-8 bytes: {}",
+                dir.display()
+            ))
+        })?;
+        if seen_dir.insert(dir_str.to_string()) {
+            // Command resolution only stats direct children (`<dir>/<command>`),
+            // never descends recursively, so scope the grant to that instead of
+            // a recursive `subpath` — the latter would expose metadata for the
+            // entire subtree nested under a $PATH dir.
+            reads.push(PathMetadataRead::Path(dir_str.to_string()));
+            reads.push(PathMetadataRead::Children(dir_str.to_string()));
+        }
+        // Ancestors (literal): Seatbelt checks metadata on every component
+        // during traversal. A dir's own grant already covers it and its
+        // ancestors-were-walked, so stop at the first already-covered one.
+        push_ancestors(dir, &seen_dir, &mut seen_ancestor, &mut reads);
+
+        // A $PATH dir reached through a multi-hop symlink needs metadata
+        // grants on the intermediate hops too, or the kernel denies EPERM
+        // (not ENOENT) dereferencing one, aborting the PATH walk.
+        for hop in collect_symlink_hops(dir) {
+            let Some(hop_str) = hop.to_str() else {
+                continue;
+            };
+            if !seen_dir.contains(hop_str) && seen_ancestor.insert(hop_str.to_string()) {
+                reads.push(PathMetadataRead::Path(hop_str.to_string()));
+            }
+            push_ancestors(&hop, &seen_dir, &mut seen_ancestor, &mut reads);
+        }
+    }
+    Ok(reads)
+}
+
+fn push_ancestors(
+    path: &Path,
+    seen_dir: &HashSet<String>,
+    seen_ancestor: &mut HashSet<String>,
+    reads: &mut Vec<PathMetadataRead>,
+) {
+    let mut current = path.parent();
+    while let Some(parent) = current {
+        let Some(parent_str) = parent.to_str() else {
+            break;
+        };
+        if parent_str == "/" || parent_str.is_empty() {
+            break;
+        }
+        if seen_dir.contains(parent_str) || !seen_ancestor.insert(parent_str.to_string()) {
+            break;
+        }
+        reads.push(PathMetadataRead::Path(parent_str.to_string()));
+        current = parent.parent();
+    }
 }
 
 #[cfg(test)]
@@ -263,5 +349,63 @@ mod tests {
 
         let hops = collect_symlink_hops(&gitconfig_link);
         assert_eq!(hops, vec![gitconfig_link, current]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_metadata_reads_list_symlink_hops_and_their_ancestors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path().canonicalize().expect("canonicalize");
+        fs::create_dir(base.join("real")).expect("real");
+        fs::create_dir(base.join("R")).expect("R");
+        std::os::unix::fs::symlink(base.join("real"), base.join("R/hop")).expect("hop");
+        std::os::unix::fs::symlink(base.join("R/hop"), base.join("asn-path")).expect("asn-path");
+        let entry = base.join("asn-path");
+        let text = |p: &Path| p.to_str().expect("utf-8").to_string();
+
+        let reads = path_metadata_reads(std::slice::from_ref(&entry)).expect("reads");
+
+        assert!(reads.contains(&PathMetadataRead::Path(text(&entry))));
+        assert!(reads.contains(&PathMetadataRead::Path(text(&base))));
+        assert!(reads.contains(&PathMetadataRead::Path(text(&base.join("R/hop")))));
+        assert!(reads.contains(&PathMetadataRead::Path(text(&base.join("R")))));
+        let children: Vec<_> = reads
+            .iter()
+            .filter(|r| matches!(r, PathMetadataRead::Children(_)))
+            .collect();
+        assert_eq!(children, [&PathMetadataRead::Children(text(&entry))]);
+        assert!(!reads.contains(&PathMetadataRead::Path(text(&base.join("real")))));
+    }
+
+    #[test]
+    fn path_metadata_reads_keep_children_for_a_dir_seen_first_as_an_ancestor() {
+        let dirs = [
+            PathBuf::from("/nono-test-absent/a/b"),
+            PathBuf::from("/nono-test-absent/a"),
+            PathBuf::from("/nono-test-absent/a"),
+        ];
+
+        let reads = path_metadata_reads(&dirs).expect("reads");
+
+        assert_eq!(
+            reads,
+            [
+                PathMetadataRead::Path("/nono-test-absent/a/b".to_string()),
+                PathMetadataRead::Children("/nono-test-absent/a/b".to_string()),
+                PathMetadataRead::Path("/nono-test-absent/a".to_string()),
+                PathMetadataRead::Path("/nono-test-absent".to_string()),
+                PathMetadataRead::Path("/nono-test-absent/a".to_string()),
+                PathMetadataRead::Children("/nono-test-absent/a".to_string()),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_metadata_reads_refuse_a_non_utf8_dir() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = PathBuf::from(std::ffi::OsStr::from_bytes(b"/nono-test-\xff"));
+
+        assert!(path_metadata_reads(&[dir]).is_err());
     }
 }
