@@ -408,7 +408,15 @@ impl Child {
         let end = rest.iter().position(|&b| b == b'/').unwrap_or(rest.len());
         let (number, rest) = rest.split_at(end);
         let fd = std::str::from_utf8(number).ok()?.parse::<i32>().ok()?;
-        Some((fd, rest.strip_prefix(b"/").unwrap_or(rest)))
+        // Any separators after N mean a lookup beneath it, as the kernel
+        // resolves them: `N/` and `N//` still require a directory (`.`), and
+        // `N//child` is `child` beneath N, never `/child`.
+        if rest.is_empty() {
+            return Some((fd, rest));
+        }
+        let start = rest.iter().position(|&b| b != b'/').unwrap_or(rest.len());
+        let beneath = &rest[start..];
+        Some((fd, if beneath.is_empty() { b"." } else { beneath }))
     }
 
     fn tgid(&self) -> Option<u32> {
@@ -451,7 +459,11 @@ impl Child {
     /// is applied to. Where pidfds are unavailable (a seccomp profile denies
     /// them, say), fall back to reopening the procfs link: the inode is the
     /// same, but the access mode would come from a second lookup the child
-    /// could race, so that path never reports a writable descriptor.
+    /// could race, so that path never reports a writable descriptor. It
+    /// reads whether the descriptor is `O_PATH` from its fdinfo, and when
+    /// that can't be read, takes it to be one: a call that refuses `O_PATH`
+    /// descriptors then fails as it would on one, rather than apply a change
+    /// the kernel would have refused.
     fn dup_fd(&self, fd: i32) -> io::Result<ChildFd> {
         if fd < 0 {
             return Err(errno(libc::EBADF));
@@ -468,23 +480,38 @@ impl Child {
                 })
             }
             Err(error) if error.raw_os_error() == Some(libc::EBADF) => Err(error),
-            Err(_) => Ok(ChildFd {
-                fd: self.open_fd_link(fd)?,
-                opath: false,
-                writable: false,
-            }),
+            Err(_) => {
+                let link = self.open_fd_link(fd)?;
+                Ok(ChildFd {
+                    fd: link,
+                    opath: self
+                        .fd_flags(fd)
+                        .is_none_or(|flags| flags & libc::O_PATH != 0),
+                    writable: false,
+                })
+            }
         }
+    }
+
+    /// The open flags of the child's descriptor `fd`, from its fdinfo.
+    fn fd_flags(&self, fd: i32) -> Option<libc::c_int> {
+        let info = std::fs::read_to_string(format!("/proc/{}/fdinfo/{fd}", self.tid)).ok()?;
+        parse_fdinfo_flags(&info)
     }
 
     /// A pidfd for the notifying thread's descriptor table.
     fn pidfd(&self) -> io::Result<OwnedFd> {
         // A thread-group leader takes a plain pidfd; any other thread needs
-        // PIDFD_THREAD (Linux 6.9), or else its process's pidfd, which shares
-        // the descriptor table unless the thread unshared it.
+        // PIDFD_THREAD (Linux 6.9), or else its process's pidfd, but only
+        // while the thread still shares its process's descriptor table (a
+        // thread can unshare it), which kcmp(2) confirms. Otherwise the
+        // caller falls back to the thread's own procfs links.
         pidfd_open(self.tid, 0)
             .or_else(|_| pidfd_open(self.tid, PIDFD_THREAD))
             .or_else(|error| match self.tgid() {
-                Some(tgid) if tgid != self.tid => pidfd_open(tgid, 0),
+                Some(tgid) if tgid != self.tid && same_descriptor_table(self.tid, tgid) => {
+                    pidfd_open(tgid, 0)
+                }
                 _ => Err(error),
             })
     }
@@ -683,6 +710,31 @@ fn names_inode(path: &Path, stat: &libc::stat) -> bool {
     use std::os::unix::fs::MetadataExt;
     std::fs::symlink_metadata(path)
         .is_ok_and(|named| named.dev() == stat.st_dev && named.ino() == stat.st_ino)
+}
+
+/// The `flags:` line of a `/proc/<pid>/fdinfo/<fd>` entry, in octal.
+fn parse_fdinfo_flags(info: &str) -> Option<libc::c_int> {
+    info.lines()
+        .find_map(|line| line.strip_prefix("flags:"))
+        .and_then(|value| libc::c_int::from_str_radix(value.trim(), 8).ok())
+}
+
+/// Whether threads `a` and `b` share one descriptor table (`kcmp(2)`
+/// `KCMP_FILES`). Any failure to tell, kcmp missing included, is `false`.
+fn same_descriptor_table(a: u32, b: u32) -> bool {
+    const KCMP_FILES: libc::c_long = 2;
+    // SAFETY: kcmp takes only scalar arguments.
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_kcmp,
+            a as libc::pid_t,
+            b as libc::pid_t,
+            KCMP_FILES,
+            0 as libc::c_long,
+            0 as libc::c_long,
+        )
+    };
+    ret == 0
 }
 
 fn pidfd_open(pid: u32, flags: libc::c_uint) -> io::Result<OwnedFd> {
@@ -1179,6 +1231,71 @@ mod tests {
         assert_eq!(child.proc_fd_reference(b"/proc/self/fd/x"), None);
         assert_eq!(child.proc_fd_reference(b"/proc/self/fd"), None);
         assert_eq!(child.proc_fd_reference(b"/dev/fd/3"), None);
+    }
+
+    #[test]
+    fn proc_fd_suffixes_are_looked_up_beneath_the_descriptor() {
+        let child = Child { tid: 4242 };
+        // A trailing separator still requires a directory.
+        assert_eq!(
+            child.proc_fd_reference(b"/proc/self/fd/3/"),
+            Some((3, &b"."[..]))
+        );
+        assert_eq!(
+            child.proc_fd_reference(b"/proc/self/fd/3//"),
+            Some((3, &b"."[..]))
+        );
+        // Repeated separators never make the rest absolute.
+        assert_eq!(
+            child.proc_fd_reference(b"/proc/self/fd/3//child"),
+            Some((3, &b"child"[..]))
+        );
+    }
+
+    #[test]
+    fn a_trailing_slash_on_a_file_descriptor_is_not_a_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f");
+        std::fs::write(&file, "x").unwrap();
+        let fd = std::fs::File::open(&file).unwrap();
+        let link = OwnedFd::from(fd);
+        let result = open_at(&link, c".", true, false);
+        assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::ENOTDIR));
+    }
+
+    #[test]
+    fn fdinfo_flags_are_read_in_octal() {
+        let info = "pos:\t0\nflags:\t012100000\nmnt_id:\t30\nino:\t1\n";
+        let flags = parse_fdinfo_flags(info).unwrap();
+        assert_ne!(flags & libc::O_PATH, 0);
+        assert_eq!(
+            parse_fdinfo_flags("pos:\t0\nflags:\t0100002\n").unwrap() & libc::O_PATH,
+            0
+        );
+        assert_eq!(parse_fdinfo_flags("pos:\t0\n"), None);
+    }
+
+    #[test]
+    fn kcmp_tells_whether_a_thread_unshared_its_descriptor_table() {
+        let pid = std::process::id();
+        let probe = |unshare: bool| {
+            std::thread::spawn(move || {
+                if unshare {
+                    // SAFETY: unshare takes a flag; it changes only this thread.
+                    assert_eq!(unsafe { libc::unshare(libc::CLONE_FILES) }, 0);
+                }
+                // SAFETY: gettid takes no arguments.
+                let tid = unsafe { libc::gettid() } as u32;
+                same_descriptor_table(tid, pid)
+            })
+            .join()
+            .unwrap()
+        };
+        if !probe(false) {
+            eprintln!("skipping: kcmp(2) is unavailable on this host");
+            return;
+        }
+        assert!(!probe(true));
     }
 
     #[test]
