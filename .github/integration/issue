@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# Keep at most one open issue per LABEL for a workflow's outcome:
+#
+#   .github/integration/issue LABEL failure TITLE MESSAGE   comment on the open issue, or open one
+#   .github/integration/issue LABEL success MESSAGE         comment on the open issue and close it
+#
+# Run by the fork's workflows (GH_TOKEN with issues: write, GH_REPO). Fails, saying so, when the
+# repository has Issues turned off: a failure must not go unreported.
+set -euo pipefail
+
+[ $# -ge 3 ] || { echo "issue: usage: issue LABEL failure|success [TITLE] MESSAGE" >&2; exit 2; }
+label="$1" state="$2"
+: "${GH_REPO:?GH_REPO is required}"
+
+if [ "$(gh api "repos/$GH_REPO" --jq .has_issues)" != true ]; then
+  [ "$state" = success ] && exit 0
+  echo "::error::Issues are turned off on $GH_REPO, so this failure cannot open an issue. Turn them on: gh api -X PATCH repos/$GH_REPO -F has_issues=true"
+  exit 1
+fi
+
+open="$(gh issue list -R "$GH_REPO" --label "$label" --state open --limit 1 --json number --jq '.[0].number // empty')"
+case "$state" in
+  failure)
+    [ $# -eq 4 ] || { echo "issue: failure needs TITLE and MESSAGE" >&2; exit 2; }
+    title="$3" msg="$4"
+    if [ -n "$open" ]; then
+      gh issue comment "$open" -R "$GH_REPO" --body "$msg" >/dev/null
+      echo "commented on #$open"
+    else
+      gh label create "$label" -R "$GH_REPO" --color d93f0b --force \
+        --description "Opened and closed by the integration workflows" >/dev/null
+      gh issue create -R "$GH_REPO" --label "$label" --title "$title" \
+        --body "$msg"$'\n\n'"This issue closes itself after the next run that succeeds." >/dev/null
+      echo "opened an issue: $title"
+    fi
+    ;;
+  success)
+    msg="$3"
+    if [ -n "$open" ]; then
+      gh issue comment "$open" -R "$GH_REPO" --body "Resolved: $msg" >/dev/null
+      gh issue close "$open" -R "$GH_REPO" --reason completed >/dev/null
+      echo "closed #$open"
+    fi
+    ;;
+  *) echo "issue: state must be failure or success" >&2; exit 2 ;;
+esac
