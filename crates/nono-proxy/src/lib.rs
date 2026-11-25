@@ -46,6 +46,7 @@ pub mod server;
 pub mod spiffe;
 pub mod tls_intercept;
 pub mod token;
+pub(crate) mod upstream_failure;
 pub(crate) mod upstream_socket;
 
 #[cfg(test)]

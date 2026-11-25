@@ -2,10 +2,13 @@
 
 This branch is upstream [nolabs-ai/nono](https://github.com/nolabs-ai/nono) `main` plus fixes we have
 prepared for upstream that have not landed yet. `.github/workflows/rebuild-integration.yml`
-rebuilds it daily and after every change to it (`.github/integration/rebuild`): reset to
+rebuilds it daily and after every change to it (`.github/integration/rebuild`) from
 the upstream `main` commit pinned in `.github/integration/upstream`, the topic branches
-in `.github/integration/topics` merged in order, upstream's workflows removed,
-force-pushed. So never base work on it: base topic branches on the pinned upstream commit or an
+in `.github/integration/topics` merged in order, upstream's workflows removed. Its tip
+always has exactly the tree of that recipe: each rebuild is one commit on top of the last, whose
+second parent is the fresh rebuild, so a change merged into it outside the recipe and the fork
+layer is gone from the next one.
+So never base work on it: base topic branches on the pinned upstream commit or an
 earlier one (a topic is merged whole, so one based on a later upstream commit brings that history
 with it, past the pin), and
 change what it carries with a pull request to `.github/integration/topics`. A topic
@@ -44,3 +47,4 @@ Each is merged with `--no-ff`, in this order.
 | [`perf/profile-groups-batch`](https://github.com/basecamp/nono/tree/perf/profile-groups-batch) | `6245556e2ef7` | `nono profile groups NAME...` takes several names in one call: each name's own output in the order given (with `--json`, one JSON document per name, back to back), so a caller splits it into exactly what one call per name prints; an unknown name fails the call before anything is printed; one name and no name are unchanged byte for byte (upstream draft not filed) |
 | [`perf/native-roots-once`](https://github.com/basecamp/nono/tree/perf/native-roots-once) | `de046d97a808` | Each proxy start loads the system trust store once instead of three times (route store, upstream connector, TLS-intercept bundle; each scoped proxy too), one snapshot per start shared by all three, and builds a route a root store of its own only when it sets `tls_ca`; what each path trusts, and the bundle's refusal when no system roots load, are unchanged (upstream draft not filed) |
 | [`feat/seatbelt-profile-stats`](https://github.com/basecamp/nono/tree/feat/seatbelt-profile-stats) | `28a6e5c229a6` | On macOS, at debug level (`-vv`), the generated Seatbelt profile's size is logged by rule kind (action, operations and first filter, with count and bytes, largest first), and so is how long `sandbox_init` took; the profile is unchanged (upstream draft not filed) |
+| [`feat/proxy-502-says-why`](https://github.com/basecamp/nono/tree/feat/proxy-502-says-why) | `291b7049629a` | A 502 from the proxy that cannot reach an upstream says which host and why: the JSON body keeps `error` and adds `message`, `nono proxy could not reach HOST:PORT: CAUSE`, the cause one phrase from a fixed set (DNS lookup failed, connection refused, the network is unreachable, no route to host, timed out, TLS handshake failed, the upstream proxy could not be reached or refused the connection, else the connection failed), on the TLS-intercept HTTP/1.1 path and the CONNECT 502 (which had no body); the body never carries the error's own text; the CONNECT 502 now sends `Content-Type: application/json` and a `Content-Length`, and the intercept 502's `Content-Length` follows its longer body; what is allowed and denied, the status codes, status lines, logs and audit records are unchanged (upstream draft not filed) |
