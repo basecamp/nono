@@ -598,7 +598,27 @@ fn prepare_trust_launch_options(
         });
     }
 
-    let trust_policy = trust_scan::load_scan_policy(&scan_root, false, skip_dirs)?;
+    // (A plan-only run that declined to read the trust policy's own key from
+    // the keystore has no verified policy: it scans and grants nothing, and
+    // names that in `incomplete`, never acting on the unverified policy.)
+    let trust_policy = match trust_scan::load_scan_policy(&scan_root, false, skip_dirs) {
+        Err(error)
+            if crate::credential_runtime::plan_only()
+                && error
+                    .to_string()
+                    .contains(crate::credential_runtime::PLAN_ONLY_KEYSTORE) =>
+        {
+            crate::credential_runtime::note_undecided(
+                "verifying the trust policy needs its key from the keystore, which a dry run doesn't read: the run's instruction-file verification and the grants and write protection it adds are not planned",
+            );
+            return Ok(TrustLaunchOptions {
+                scan_root,
+                scan_performed: false,
+                ..TrustLaunchOptions::default()
+            });
+        }
+        loaded => loaded?,
+    };
     let result = trust_scan::run_pre_exec_scan(&scan_root, &trust_policy, silent, skip_dirs)?;
     if !result.results.is_empty() {
         info!(
