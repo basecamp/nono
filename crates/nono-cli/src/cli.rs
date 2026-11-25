@@ -1047,8 +1047,13 @@ pub struct ProfilePromoteArgs {
 
 #[derive(Parser, Debug)]
 pub struct ProfileGroupsArgs {
-    /// Group name to show details for (omit to list all)
-    pub name: Option<String>,
+    /// Group name(s) to show details for (omit to list all)
+    ///
+    /// With several names, the output is each name's own output in the order
+    /// given (with --json, one JSON document per name, back to back), and an
+    /// unknown name fails the whole call before anything is printed.
+    #[arg(value_name = "NAME")]
+    pub names: Vec<String>,
     /// Output as JSON
     #[arg(long)]
     pub json: bool,
@@ -5083,7 +5088,34 @@ mod tests {
         if let Commands::Profile(args) = cli.command
             && let ProfileCommands::Groups(a) = args.command
         {
-            assert_eq!(a.name.as_deref(), Some("deny_credentials"));
+            assert_eq!(a.names, vec!["deny_credentials".to_string()]);
+            return;
+        }
+        panic!("expected Commands::Profile(Groups(..))");
+    }
+
+    #[test]
+    fn test_profile_groups_with_several_names() {
+        let cli = Cli::try_parse_from([
+            "nono",
+            "profile",
+            "groups",
+            "deny_credentials",
+            "--json",
+            "system_read_linux",
+        ])
+        .expect("profile groups <name>... must parse");
+        if let Commands::Profile(args) = cli.command
+            && let ProfileCommands::Groups(a) = args.command
+        {
+            assert_eq!(
+                a.names,
+                vec![
+                    "deny_credentials".to_string(),
+                    "system_read_linux".to_string()
+                ]
+            );
+            assert!(a.json);
             return;
         }
         panic!("expected Commands::Profile(Groups(..))");

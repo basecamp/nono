@@ -21,6 +21,9 @@ nono profile groups --all-platforms
 # Show details for a specific group
 nono profile groups deny_credentials
 
+# Show details for several groups in one call
+nono profile groups deny_credentials deny_shell_history
+
 # Machine-readable output
 nono profile groups --json
 ```
@@ -60,9 +63,16 @@ nono profile: group 'deny_credentials'
 
 | Option | Description |
 |--------|-------------|
-| `[NAME]` | Group name to show details for (omit to list all) |
+| `[NAME]...` | Group name(s) to show details for (omit to list all) |
 | `--json` | Output as JSON |
 | `--all-platforms` | Show groups for all platforms, not just the current one |
+
+With several names, the output is each name's own output in the order given: what `nono profile groups NAME` prints for the first name, then the next, and so on. In text, a blank line separates them. With `--json` it is one JSON document per name, back to back, so a caller that asks for many groups in one process can split the answer back into exactly what one call per name prints (`jq` reads the documents in turn; `jq -s` collects them into an array). Every name is checked before anything is printed: an unknown name fails the whole call, with the error a single call for that name gives.
+
+```bash
+# One object per line, one per group
+nono profile groups deny_credentials deny_shell_history --json | jq -c .
+```
 
 ### `nono profile list`
 
