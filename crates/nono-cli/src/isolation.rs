@@ -82,6 +82,15 @@ pub(crate) fn validate_config(args: &SandboxArgs, prepared: &PreparedSandbox) ->
                 .to_string(),
         ));
     }
+    if isolate.mounts && prepared.metadata_mediation.is_write_grants() {
+        return Err(NonoError::ConfigParse(
+            "linux.isolate.mounts (--isolate mounts) cannot be combined with \
+             linux.metadata_mediation = \"write_grants\": the supervisor resolves and applies \
+             each mode or timestamp change outside the sandbox's mount namespace, where the \
+             masks and the private /tmp do not apply. Use one or the other."
+                .to_string(),
+        ));
+    }
     if !isolate.network {
         return Ok(());
     }

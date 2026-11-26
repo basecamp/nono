@@ -1187,7 +1187,7 @@ preferably, use `unix_socket_dir_bind` with a dedicated directory.
 
 Add `"loopback": true` (requires `network`) to let the command use TCP on the namespace's own loopback, for local dev servers and tests. Egress stays proxy-only and the host's localhost stays unreachable.
 
-Add `"mounts": true` to mask host IPC endpoints (`$XDG_RUNTIME_DIR`, the D-Bus system bus, container runtime sockets) and give the session a private `/tmp`. Paths the profile grants beneath a mask, including `unix_socket` grants, stay reachable. `"extra_masks": ["$HOME/.corp/agent.sock"]` adds masks (requires `mounts`); lists merge by deduplicated append, so no layer can remove a mask. `mounts` cannot be combined with `security.capability_elevation`.
+Add `"mounts": true` to mask host IPC endpoints (`$XDG_RUNTIME_DIR`, the D-Bus system bus, container runtime sockets) and give the session a private `/tmp`. Paths the profile grants beneath a mask, including `unix_socket` grants, stay reachable. `"extra_masks": ["$HOME/.corp/agent.sock"]` adds masks (requires `mounts`); lists merge by deduplicated append, so no layer can remove a mask. `mounts` cannot be combined with `security.capability_elevation` or `linux.metadata_mediation = "write_grants"`.
 
 Network isolation does not block pathname Unix sockets (such as `/run/docker.sock`); use `mounts` to hide them or `linux.af_unix_mediation` to mediate them. Any filesystem grant beneath a mask is re-bound, so a read grant of a directory under `$XDG_RUNTIME_DIR` makes every socket in it connectable.
 
@@ -1228,6 +1228,24 @@ Docker socket preserves the same host authority.
 #### Deprecation note
 
 `commands.deny` is deprecated startup-only gating — it blocks the command from launching but does not enforce socket access and should not be relied on as enforcement. It remains visible in `nono profile show` under the commands section for compatibility.
+
+### Confining mode and timestamp changes (Linux)
+
+Landlock does not mediate `chmod` or `utimensat` and their relatives, so by
+default a sandboxed process can change the mode bits and timestamps of any file
+it can name, even one it may not read. To allow those changes only within write
+grants (or through a descriptor the process holds open for writing):
+
+```json
+{
+  "linux": { "metadata_mediation": "write_grants" }
+}
+```
+
+Each such call then takes a supervisor round trip. `flock` is not affected: a
+process can lock exactly the files it may open, which Landlock already decides.
+macOS needs no setting: Seatbelt's `file-write*` rules already cover mode and
+timestamp changes.
 
 ### Allowing parent-of-protected-root grants (macOS only)
 

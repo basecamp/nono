@@ -578,6 +578,8 @@ pub(crate) struct PreparedSandbox {
     #[cfg(target_os = "linux")]
     pub(crate) af_unix_mediation: crate::profile::LinuxAfUnixMediation,
     #[cfg(target_os = "linux")]
+    pub(crate) metadata_mediation: crate::profile::LinuxMetadataMediation,
+    #[cfg(target_os = "linux")]
     pub(crate) sandbox_policy: crate::profile::LinuxSandboxPolicy,
     #[cfg(target_os = "linux")]
     pub(crate) explicit_sandbox_policy: Option<crate::profile::LinuxSandboxPolicy>,
@@ -1610,6 +1612,8 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
                 #[cfg(target_os = "linux")]
                 af_unix_mediation: crate::profile::LinuxAfUnixMediation::default(),
                 #[cfg(target_os = "linux")]
+                metadata_mediation: crate::profile::LinuxMetadataMediation::default(),
+                #[cfg(target_os = "linux")]
                 sandbox_policy: crate::profile::LinuxSandboxPolicy::default(),
                 #[cfg(target_os = "linux")]
                 explicit_sandbox_policy: None,
@@ -1652,6 +1656,8 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         wsl2_proxy_policy,
         #[cfg(target_os = "linux")]
         af_unix_mediation,
+        #[cfg(target_os = "linux")]
+        metadata_mediation,
         #[cfg(target_os = "linux")]
         sandbox_policy,
         #[cfg(target_os = "linux")]
@@ -2043,6 +2049,8 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
             wsl2_proxy_policy,
             #[cfg(target_os = "linux")]
             af_unix_mediation,
+            #[cfg(target_os = "linux")]
+            metadata_mediation,
             #[cfg(target_os = "linux")]
             sandbox_policy,
             #[cfg(target_os = "linux")]
@@ -3106,6 +3114,8 @@ mod tests {
             wsl2_proxy_policy: profile::Wsl2ProxyPolicy::default(),
             #[cfg(target_os = "linux")]
             af_unix_mediation: profile::LinuxAfUnixMediation::default(),
+            #[cfg(target_os = "linux")]
+            metadata_mediation: profile::LinuxMetadataMediation::default(),
             #[cfg(target_os = "linux")]
             sandbox_policy: profile::LinuxSandboxPolicy::default(),
             #[cfg(target_os = "linux")]
