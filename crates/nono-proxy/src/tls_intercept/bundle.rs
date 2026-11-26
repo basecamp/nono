@@ -54,6 +54,15 @@ pub struct BundleInputs<'a> {
 /// * unable to create the file with restrictive permissions
 /// * unable to write
 pub fn write_bundle(inputs: BundleInputs<'_>) -> Result<PathBuf> {
+    write_bundle_with_roots(inputs, crate::native_roots::TrustRoots::new().native())
+}
+
+/// [`write_bundle`] with the system trust store supplied: the proxy start's
+/// snapshot, which its connectors share, or in tests an empty or failing one.
+pub(crate) fn write_bundle_with_roots(
+    inputs: BundleInputs<'_>,
+    system_certs: &crate::native_roots::NativeRoots,
+) -> Result<PathBuf> {
     let mut pem = String::new();
 
     if let Some(parent_pem) = inputs.parent_ssl_cert_file {
@@ -81,18 +90,18 @@ pub fn write_bundle(inputs: BundleInputs<'_>) -> Result<PathBuf> {
         }
     }
 
-    // System trust store. We read full DER certs (rustls-native-certs returns
+    // System trust store, loaded once per process (`crate::native_roots`).
+    // We read full DER certs (rustls-native-certs returns
     // CertificateDer<'static>) and PEM-encode each one ourselves rather than
     // depending on a base64 helper crate.
-    let system_certs = rustls_native_certs::load_native_certs();
-    if !system_certs.errors.is_empty() {
+    if system_certs.error_count > 0 {
         // Non-fatal: some certs may have failed to parse, but we keep the
         // ones that did. Log so an operator can see the count if it ever
         // matters.
         debug!(
             "tls_intercept: rustls-native-certs reported {} non-fatal errors while \
              loading system trust store",
-            system_certs.errors.len()
+            system_certs.error_count
         );
     }
     if system_certs.certs.is_empty() && inputs.parent_ssl_cert_file.is_none() {
@@ -108,7 +117,7 @@ pub fn write_bundle(inputs: BundleInputs<'_>) -> Result<PathBuf> {
         "tls_intercept: appending {} certs from the system trust store to bundle",
         system_certs.certs.len()
     );
-    for cert in system_certs.certs {
+    for cert in &system_certs.certs {
         pem.push_str("-----BEGIN CERTIFICATE-----\n");
         pem.push_str(&base64_chunked(cert.as_ref()));
         pem.push_str("-----END CERTIFICATE-----\n");
@@ -255,6 +264,83 @@ mod tests {
 
         let contents = std::fs::read_to_string(&path).unwrap();
         assert!(contents.contains("MIIBcorpfake"));
+    }
+
+    #[test]
+    fn bundle_holds_the_shared_system_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = EphemeralCa::generate().unwrap();
+        let path = write_bundle(BundleInputs {
+            dir: dir.path(),
+            filename: "intercept-ca.pem",
+            parent_ssl_cert_file: None,
+            ephemeral_ca_pem: ca.cert_pem(),
+        })
+        .unwrap();
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let fresh = rustls_native_certs::load_native_certs().certs;
+        assert_eq!(
+            contents.matches("BEGIN CERTIFICATE").count(),
+            fresh.len() + 1,
+            "bundle should hold every native cert plus the ephemeral CA"
+        );
+        for cert in &fresh {
+            assert!(contents.contains(&base64_chunked(cert.as_ref())));
+        }
+    }
+
+    #[test]
+    fn bundle_refuses_when_no_system_roots_loaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = EphemeralCa::generate().unwrap();
+        let empty = crate::native_roots::NativeRoots {
+            certs: Vec::new(),
+            error_count: 1,
+        };
+        let err = write_bundle_with_roots(
+            BundleInputs {
+                dir: dir.path(),
+                filename: "intercept-ca.pem",
+                parent_ssl_cert_file: None,
+                ephemeral_ca_pem: ca.cert_pem(),
+            },
+            &empty,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            ProxyError::Config(
+                "tls_intercept: failed to load any system trust roots; \
+                 refusing to write a bundle that would strip the agent's TLS trust"
+                    .to_string()
+            )
+            .to_string()
+        );
+        assert!(!dir.path().join("intercept-ca.pem").exists());
+    }
+
+    #[test]
+    fn bundle_with_no_system_roots_keeps_a_parent_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = EphemeralCa::generate().unwrap();
+        let empty = crate::native_roots::NativeRoots {
+            certs: Vec::new(),
+            error_count: 0,
+        };
+        let parent = b"-----BEGIN CERTIFICATE-----\nMIIBcorpfake\n-----END CERTIFICATE-----\n";
+        let path = write_bundle_with_roots(
+            BundleInputs {
+                dir: dir.path(),
+                filename: "intercept-ca.pem",
+                parent_ssl_cert_file: Some(parent),
+                ephemeral_ca_pem: ca.cert_pem(),
+            },
+            &empty,
+        )
+        .unwrap();
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(contents.matches("BEGIN CERTIFICATE").count(), 2);
     }
 
     #[test]
