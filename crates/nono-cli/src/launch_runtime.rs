@@ -605,7 +605,27 @@ fn prepare_trust_launch_options(
         });
     }
 
-    let trust_policy = trust_scan::load_scan_policy(&scan_root, false, skip_dirs)?;
+    // (A plan-only run that declined to read the trust policy's own key from
+    // the keystore has no verified policy: it scans and grants nothing, and
+    // names that in `incomplete`, never acting on the unverified policy.)
+    let trust_policy = match trust_scan::load_scan_policy(&scan_root, false, skip_dirs) {
+        Err(error)
+            if crate::credential_runtime::plan_only()
+                && error
+                    .to_string()
+                    .contains(crate::credential_runtime::PLAN_ONLY_KEYSTORE) =>
+        {
+            crate::credential_runtime::note_undecided(
+                "verifying the trust policy needs its key from the keystore, which a dry run doesn't read: the run's instruction-file verification and the grants and write protection it adds are not planned",
+            );
+            return Ok(TrustLaunchOptions {
+                scan_root,
+                scan_performed: false,
+                ..TrustLaunchOptions::default()
+            });
+        }
+        loaded => loaded?,
+    };
     let result = trust_scan::run_pre_exec_scan(&scan_root, &trust_policy, silent, skip_dirs)?;
     if !result.results.is_empty() {
         info!(
@@ -616,7 +636,19 @@ fn prepare_trust_launch_options(
             result.results.len()
         );
     }
-    if !result.should_proceed() {
+    // (A plan-only run that declined to read a trust key from the keystore
+    // leaves those files unverified and ungranted, named in `incomplete`; any
+    // other failure stops it as it stops a run.)
+    let only_undecided = crate::credential_runtime::plan_only()
+        && result
+            .results
+            .iter()
+            .filter(|r| r.outcome.should_block(trust_policy.enforcement))
+            .all(|r| {
+                matches!(&r.outcome, nono::trust::VerificationOutcome::InvalidSignature { detail }
+                    if detail.contains(crate::credential_runtime::PLAN_ONLY_KEYSTORE))
+            });
+    if !result.should_proceed() && !only_undecided {
         return Err(NonoError::TrustVerification {
             path: String::new(),
             reason: "instruction files failed trust verification".to_string(),
@@ -799,6 +831,7 @@ mod tests {
             rollback_dest: None,
             no_diagnostics: false,
             diagnostics_json: false,
+            json: false,
             startup_timeout_secs: None,
             network_denial_audit_rate: None,
             network_denial_audit_burst: None,

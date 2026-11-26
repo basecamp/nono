@@ -402,6 +402,40 @@ fn enforced_internal_launcher_rejects_local_permissions() {
     assert_eq!(client.platform.requests.load(Ordering::SeqCst), requests);
 }
 
+/// A JSON dry run only plans: on an enrolled device it neither signs a
+/// request nor contacts the platform, and its report says the run's policy
+/// may differ from the plan.
+#[test]
+fn json_dry_run_does_not_refresh_the_platform_policy() {
+    let client = Client::new(Some(static_profile()));
+    client.platform.mode.store(2, Ordering::SeqCst);
+    let requests = client.platform.requests.load(Ordering::SeqCst);
+    let completed = client
+        .test
+        .run()
+        .no_rollback()
+        .dry_run_json()
+        .exec(Argv::new("/bin/true"))
+        .assert_success("a JSON dry run plans on an enrolled device");
+    assert_eq!(
+        client.platform.requests.load(Ordering::SeqCst),
+        requests,
+        "a JSON dry run makes no platform request"
+    );
+    let report: serde_json::Value = serde_json::from_str(&completed.stdout())
+        .unwrap_or_else(|e| panic!("stdout is one JSON document ({e}): {}", completed.stdout()));
+    assert!(
+        report["incomplete"]
+            .as_array()
+            .expect("incomplete")
+            .iter()
+            .any(|i| i
+                .as_str()
+                .is_some_and(|i| i.starts_with("the platform policy"))),
+        "{report}"
+    );
+}
+
 #[test]
 fn enforced_command_mediation_uses_the_delivered_policy() {
     let mut profile = static_profile();

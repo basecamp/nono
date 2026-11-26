@@ -154,8 +154,23 @@ fn resolve_program_from_profile_or_cli(
 }
 
 pub(crate) fn run_sandbox(mut run_args: RunArgs, silent: bool) -> Result<()> {
-    crate::platform_policy::prepare_start(&mut run_args.sandbox, silent)?;
     let command = run_args.command.clone();
+    // A JSON dry run reads no credential source from here on: nothing runs or
+    // prompts for one, and each credential is planned as declared.
+    let dry_run_json = run_args.sandbox.dry_run && run_args.json;
+    if dry_run_json {
+        crate::credential_runtime::enter_plan_only();
+        // Nor does it refresh the platform policy, which signs a request with
+        // the device's key and contacts the platform: on an enrolled device
+        // the plan is the local one, and the report says the run's may differ.
+        if crate::platform_client::load_policy_state()?.is_some() {
+            crate::credential_runtime::note_undecided(
+                "the platform policy, which the run refreshes from the platform and applies at startup (it can select the profile and refuse options), and a dry run doesn't fetch",
+            );
+        }
+    } else {
+        crate::platform_policy::prepare_start(&mut run_args.sandbox, silent)?;
+    }
 
     // Load profile once and reuse for binary resolution and command_args.
     let loaded_profile = match (
@@ -184,7 +199,24 @@ pub(crate) fn run_sandbox(mut run_args: RunArgs, silent: bool) -> Result<()> {
         silent,
     )?;
 
-    if !crate::platform_policy::enforced::active(&run_args.sandbox)
+    // An enforced platform policy never auto-enables it, so then nothing is
+    // left undecided. (What only Claude Code's Keychain login decides, a JSON
+    // dry run leaves undecided, and says so.)
+    let launch_services_auto = !crate::platform_policy::enforced::active(&run_args.sandbox);
+    let mut undecided: Vec<String> = Vec::new();
+    if launch_services_auto
+        && dry_run_json
+        && crate::sandbox_prepare::claude_launch_services_needs_login(
+            &run_args.sandbox,
+            &program,
+            &cmd_args,
+        )
+    {
+        undecided.push(
+            "whether the run grants Claude Code LaunchServices depends on its Keychain login, which a dry run doesn't read"
+                .to_string(),
+        );
+    } else if launch_services_auto
         && should_auto_enable_claude_launch_services(&run_args.sandbox, &program, &cmd_args)
     {
         warn!(
@@ -219,6 +251,29 @@ pub(crate) fn run_sandbox(mut run_args: RunArgs, silent: bool) -> Result<()> {
                 cmd_args.push(OsString::from(expanded));
             }
         }
+    }
+
+    if args.dry_run && run_args.json {
+        // The launch's own plan, built as `run` builds it, reported as data on
+        // stdout; nothing else is printed there, and the program isn't launched.
+        let raw_rules = loaded_profile
+            .as_ref()
+            .map(|(_, profile)| profile.unsafe_macos_seatbelt_rules.clone())
+            .unwrap_or_default();
+        let plan = prepare_run_launch_plan(run_args, program, cmd_args, true)?;
+        let mediation = crate::execution_runtime::dry_run_children(&plan)?;
+        undecided.extend(crate::credential_runtime::undecided());
+        let report = crate::dry_run_report::dry_run_report(
+            &plan,
+            &mediation,
+            &undecided,
+            &raw_rules,
+            &plan.flags.workdir,
+        )?;
+        let text = serde_json::to_string_pretty(&report)
+            .map_err(|e| NonoError::ConfigParse(format!("dry-run report: {e}")))?;
+        println!("{text}");
+        return Ok(());
     }
 
     if args.dry_run {
