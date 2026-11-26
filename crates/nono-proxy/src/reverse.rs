@@ -1801,6 +1801,23 @@ where
     send_json_error(stream, status, reason, &body, false).await
 }
 
+/// Send the 502 for an upstream the proxy could not use, naming the host and
+/// port the client asked for and the cause. Same status line, headers and
+/// `error` field as [`send_error_generic`]'s `502 Bad Gateway`; the body adds
+/// `message` (see [`crate::upstream_failure`]).
+pub(crate) async fn send_bad_gateway<S>(
+    stream: &mut S,
+    failure: crate::upstream_failure::UpstreamFailure,
+    host: &str,
+    port: u16,
+) -> Result<()>
+where
+    S: tokio::io::AsyncWrite + Unpin,
+{
+    let body = failure.bad_gateway_body(host, port);
+    send_json_error(stream, 502, "Bad Gateway", &body, false).await
+}
+
 /// Reject a host credential-capture failure without exposing helper diagnostics.
 /// Keep 503: this is not a challenge for the client's upstream credentials.
 pub(crate) async fn send_credential_capture_error<S>(stream: &mut S, is_head: bool) -> Result<()>

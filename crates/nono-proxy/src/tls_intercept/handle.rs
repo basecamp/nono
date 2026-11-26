@@ -25,6 +25,7 @@ use crate::reverse;
 use crate::route::RouteStore;
 use crate::tls_intercept::cert_cache::CertCache;
 use crate::tls_intercept::{acceptor, h2_forward, websocket};
+use crate::upstream_failure::UpstreamFailure;
 use std::sync::Arc;
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
@@ -1141,9 +1142,14 @@ where
         )
         .await
         {
+            RouteSelection::Rejected(502) => {
+                // The only 502 selection gives: no route for this host:port.
+                reverse::send_bad_gateway(tls_stream, UpstreamFailure::NoRoute, ctx.host, ctx.port)
+                    .await?;
+                return Ok(());
+            }
             RouteSelection::Rejected(status) => {
                 let msg = match status {
-                    502 => "Bad Gateway",
                     429 => "Too Many Requests",
                     _ => "Forbidden",
                 };
@@ -1515,7 +1521,8 @@ where
             ctx.port,
             &e.to_string(),
         );
-        let _ = reverse::send_error_generic(tls_stream, 502, "Bad Gateway").await;
+        let _ = reverse::send_bad_gateway(tls_stream, UpstreamFailure::of(&e), ctx.host, ctx.port)
+            .await;
     }
     Ok(())
 }
@@ -1706,7 +1713,8 @@ where
             ctx.port,
             &e.to_string(),
         );
-        let _ = reverse::send_error_generic(tls_stream, 502, "Bad Gateway").await;
+        let _ = reverse::send_bad_gateway(tls_stream, UpstreamFailure::of(&e), ctx.host, ctx.port)
+            .await;
     }
     Ok(())
 }
@@ -2049,7 +2057,8 @@ where
             ctx.port,
             &e.to_string(),
         );
-        let _ = reverse::send_error_generic(tls_stream, 502, "Bad Gateway").await;
+        let _ = reverse::send_bad_gateway(tls_stream, UpstreamFailure::of(&e), ctx.host, ctx.port)
+            .await;
     }
     Ok(())
 }
@@ -2171,7 +2180,8 @@ where
                 ctx.port,
                 &e.to_string(),
             );
-            reverse::send_error_generic(tls_stream, 502, "Bad Gateway").await?;
+            reverse::send_bad_gateway(tls_stream, UpstreamFailure::of(&e), ctx.host, ctx.port)
+                .await?;
             return Ok(());
         }
     };
@@ -2231,7 +2241,8 @@ where
             ctx.port,
             &e.to_string(),
         );
-        reverse::send_error_generic(tls_stream, 502, "Bad Gateway").await?;
+        let failure = UpstreamFailure::of(&ProxyError::Io(e));
+        reverse::send_bad_gateway(tls_stream, failure, ctx.host, ctx.port).await?;
         return Ok(());
     }
     // Forward any client bytes that arrived immediately after the handshake
@@ -2254,7 +2265,8 @@ where
             ctx.port,
             &e.to_string(),
         );
-        reverse::send_error_generic(tls_stream, 502, "Bad Gateway").await?;
+        let failure = UpstreamFailure::of(&ProxyError::Io(e));
+        reverse::send_bad_gateway(tls_stream, failure, ctx.host, ctx.port).await?;
         return Ok(());
     }
     if let Err(e) = upstream.flush().await {
@@ -2262,7 +2274,8 @@ where
             "tls_intercept: failed flushing WS handshake upstream: {}",
             e
         );
-        reverse::send_error_generic(tls_stream, 502, "Bad Gateway").await?;
+        let failure = UpstreamFailure::of(&ProxyError::Io(e));
+        reverse::send_bad_gateway(tls_stream, failure, ctx.host, ctx.port).await?;
         return Ok(());
     }
 
@@ -2278,7 +2291,8 @@ where
                 ctx.port,
                 &e.to_string(),
             );
-            reverse::send_error_generic(tls_stream, 502, "Bad Gateway").await?;
+            reverse::send_bad_gateway(tls_stream, UpstreamFailure::of(&e), ctx.host, ctx.port)
+                .await?;
             return Ok(());
         }
     };
@@ -5128,6 +5142,92 @@ mod tests {
         )
         .await;
         assert!(response.starts_with("HTTP/1.1 400"), "got {response:?}");
+    }
+
+    fn bad_gateway_response(message: &str) -> String {
+        let body = format!(r#"{{"error":"Bad Gateway","message":"{message}"}}"#);
+        format!(
+            "HTTP/1.1 502 Bad Gateway\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    #[tokio::test]
+    async fn refused_upstream_502_names_the_host_and_the_cause() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let ca = Arc::new(crate::tls_intercept::ca::EphemeralCa::generate().unwrap());
+        let store = Arc::new(OAuthCaptureStore::load(&[oauth_capture_config(port)]).unwrap());
+        let connector = https_connector_trusting(ca.cert_pem());
+        let filter = ProxyFilter::allow_all();
+        let session_token = Zeroizing::new("session-tok".to_string());
+        let ctx = oauth_intercept_ctx(ca, &connector, &filter, &session_token, store, port);
+
+        let response = drive_token_endpoint_request(
+            &ctx,
+            format!(
+                "GET /copilot_internal/v2/token?secret=q HTTP/1.1\r\nHost: localhost:{port}\r\nAuthorization: Bearer gho_plain_secret\r\n\r\n"
+            ),
+        )
+        .await;
+        assert_eq!(
+            response,
+            bad_gateway_response(&format!(
+                "nono proxy could not reach localhost:{port}: connection refused"
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn plaintext_upstream_502_says_tls_handshake_failed() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let _ = s.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await;
+        });
+
+        let ca = Arc::new(crate::tls_intercept::ca::EphemeralCa::generate().unwrap());
+        let store = Arc::new(OAuthCaptureStore::load(&[oauth_capture_config(port)]).unwrap());
+        let connector = https_connector_trusting(ca.cert_pem());
+        let filter = ProxyFilter::allow_all();
+        let session_token = Zeroizing::new("session-tok".to_string());
+        let ctx = oauth_intercept_ctx(ca, &connector, &filter, &session_token, store, port);
+
+        let response = drive_token_endpoint_request(
+            &ctx,
+            format!("GET /copilot_internal/v2/token HTTP/1.1\r\nHost: localhost:{port}\r\n\r\n"),
+        )
+        .await;
+        assert_eq!(
+            response,
+            bad_gateway_response(&format!(
+                "nono proxy could not reach localhost:{port}: TLS handshake failed"
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn no_route_502_names_the_host() {
+        let ca = Arc::new(crate::tls_intercept::ca::EphemeralCa::generate().unwrap());
+        let connector = https_connector_trusting(ca.cert_pem());
+        let filter = ProxyFilter::allow_all();
+        let session_token = Zeroizing::new("session-tok".to_string());
+        let ctx = test_intercept_ctx(&session_token, &connector, &filter);
+
+        let response = drive_token_endpoint_request(
+            &ctx,
+            "GET /v1/models HTTP/1.1\r\nHost: example.com\r\n\r\n".to_string(),
+        )
+        .await;
+        assert_eq!(
+            response,
+            bad_gateway_response(
+                "nono proxy refused example.com:443: no route is configured for this host and port"
+            )
+        );
     }
 
     #[test]
