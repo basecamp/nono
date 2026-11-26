@@ -68,7 +68,7 @@ To prevent prompt flooding, the supervisor uses a token bucket rate limiter:
 - **Rate**: 10 requests per second
 - **Burst capacity**: 5
 
-Requests exceeding the rate limit are automatically denied.
+Requests exceeding the rate limit are automatically denied without prompting. Each denial is recorded in the audit log as a capability decision with backend `supervisor-rate-limit`. Past an audit budget of 50 records (refilling at 20 per second), further denials are counted and recorded as a single summary entry instead.
 
 ### Minimum Requirements
 
