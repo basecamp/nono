@@ -2074,7 +2074,7 @@ pub struct RunArgs {
     #[arg(
         long,
         requires = "dry_run",
-        conflicts_with_all = ["detached", "remote"],
+        conflicts_with = "detached",
         help_heading = "OPTIONS"
     )]
     pub json: bool,
