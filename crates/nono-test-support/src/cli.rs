@@ -442,7 +442,7 @@ impl<'t> Invocation<'t> {
     }
 
     fn finish(self) -> Completed {
-        let mut cmd = self.t.hermetic_command();
+        let mut cmd = self.t.command();
         cmd.args(&self.args);
         for (key, value) in &self.envs {
             cmd.env(key, value);

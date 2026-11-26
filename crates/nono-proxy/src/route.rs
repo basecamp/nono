@@ -1229,11 +1229,11 @@ mod tests {
             endpoint_rules: vec![
                 EndpointRule {
                     method: "POST".to_string(),
-                    path: "/v1/chat/completions".to_string(),
+                    path: "/v1/chat/completions".into(),
                 },
                 EndpointRule {
                     method: "GET".to_string(),
-                    path: "/v1/models".to_string(),
+                    path: "/v1/models".into(),
                 },
             ],
             endpoint_policy: None,
@@ -1354,7 +1354,7 @@ mod tests {
                 phantom_format: None,
                 endpoint_rules: vec![EndpointRule {
                     method: "GET".to_string(),
-                    path: "/get".to_string(),
+                    path: "/get".into(),
                 }],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -1859,7 +1859,7 @@ mod tests {
             phantom_format: None,
             endpoint_rules: vec![EndpointRule {
                 method: "GET".to_string(),
-                path: "/v1/items".to_string(),
+                path: "/v1/items".into(),
             }],
             endpoint_policy: None,
             tls_ca: None,
@@ -2005,7 +2005,7 @@ mod tests {
             endpoint_policy: Some(crate::config::EndpointPolicyConfig {
                 allow: vec![crate::config::EndpointPolicyRule {
                     method: "POST".to_string(),
-                    path: "/".to_string(),
+                    path: "/".into(),
                     backend: None,
                     reason: None,
                     timeout_secs: None,
@@ -2161,7 +2161,7 @@ mod tests {
             upstream: "https://github.com".to_string(),
             endpoint_rules: vec![crate::config::EndpointRule {
                 method: "*".to_string(),
-                path: path.to_string(),
+                path: path.into(),
             }],
             ..RouteConfig::default()
         };
@@ -2195,7 +2195,7 @@ mod tests {
                 phantom_format: None,
                 endpoint_rules: vec![crate::config::EndpointRule {
                     method: "*".to_string(),
-                    path: "/org-a/**".to_string(),
+                    path: "/org-a/**".into(),
                 }],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -2223,7 +2223,7 @@ mod tests {
                 phantom_format: None,
                 endpoint_rules: vec![crate::config::EndpointRule {
                     method: "*".to_string(),
-                    path: "/org-b/**".to_string(),
+                    path: "/org-b/**".into(),
                 }],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -2305,7 +2305,7 @@ mod tests {
                 phantom_format: None,
                 endpoint_rules: vec![crate::config::EndpointRule {
                     method: "*".to_string(),
-                    path: path.to_string(),
+                    path: path.into(),
                 }],
                 endpoint_policy: None,
                 tls_ca: None,
@@ -2382,7 +2382,7 @@ mod tests {
             upstream: "https://github.com".to_string(),
             endpoint_rules: vec![crate::config::EndpointRule {
                 method: "*".to_string(),
-                path: "/org/**".to_string(),
+                path: "/org/**".into(),
             }],
             ..Default::default()
         };

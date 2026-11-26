@@ -43,6 +43,7 @@ pub(crate) struct LaunchPlan {
 
 #[derive(Clone, Default)]
 pub(crate) struct SessionLaunchOptions {
+    pub(crate) policy: Option<crate::platform_policy::PolicySession>,
     pub(crate) session_id: Option<String>,
     pub(crate) detached_start: bool,
     pub(crate) session_name: Option<String>,
@@ -131,6 +132,7 @@ pub(crate) struct OpenUrlIntent {
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ProxyLaunchOptions {
+    pub(crate) session_socket_auth: bool,
     pub(crate) domain_filter: Option<DomainFilterIntent>,
     pub(crate) endpoint_filter: Option<EndpointFilterIntent>,
     pub(crate) credentials: Option<CredentialProxyIntent>,
@@ -242,6 +244,7 @@ fn mark_network_audit_disabled(network: &mut NetworkIntent) {
 
 #[derive(Clone)]
 pub(crate) struct ExecutionFlags {
+    pub(crate) session_socket_auth: bool,
     pub(crate) strategy: exec_strategy::ExecStrategy,
     pub(crate) workdir: PathBuf,
     pub(crate) no_diagnostics: bool,
@@ -316,6 +319,7 @@ impl ExecutionFlags {
         )?;
         Ok(Self {
             strategy: exec_strategy::ExecStrategy::Supervised,
+            session_socket_auth: prepared.session_socket_auth,
             workdir: cwd.clone(),
             no_diagnostics: false,
             diagnostics_json: false,
@@ -328,7 +332,7 @@ impl ExecutionFlags {
             #[cfg(target_os = "linux")]
             af_unix_mediation: prepared.af_unix_mediation,
             #[cfg(target_os = "linux")]
-            isolate: prepared.isolate,
+            isolate: prepared.isolate.clone(),
             #[cfg(target_os = "linux")]
             metadata_mediation: prepared.metadata_mediation,
             #[cfg(target_os = "linux")]
@@ -496,6 +500,7 @@ pub(crate) fn prepare_run_launch_plan(
         diagnostics_json,
         diagnostic_verbosity: args.verbose,
         session: SessionLaunchOptions {
+            policy: prepared.policy_session.clone(),
             session_id: Some(session_id),
             detached_start: run_args.detached,
             session_name: run_args.name,
@@ -602,7 +607,27 @@ fn prepare_trust_launch_options(
         });
     }
 
-    let trust_policy = trust_scan::load_scan_policy(&scan_root, false, skip_dirs)?;
+    // (A plan-only run that declined to read the trust policy's own key from
+    // the keystore has no verified policy: it scans and grants nothing, and
+    // names that in `incomplete`, never acting on the unverified policy.)
+    let trust_policy = match trust_scan::load_scan_policy(&scan_root, false, skip_dirs) {
+        Err(error)
+            if crate::credential_runtime::plan_only()
+                && error
+                    .to_string()
+                    .contains(crate::credential_runtime::PLAN_ONLY_KEYSTORE) =>
+        {
+            crate::credential_runtime::note_undecided(
+                "verifying the trust policy needs its key from the keystore, which a dry run doesn't read: the run's instruction-file verification and the grants and write protection it adds are not planned",
+            );
+            return Ok(TrustLaunchOptions {
+                scan_root,
+                scan_performed: false,
+                ..TrustLaunchOptions::default()
+            });
+        }
+        loaded => loaded?,
+    };
     let result = trust_scan::run_pre_exec_scan(&scan_root, &trust_policy, silent, skip_dirs)?;
     if !result.results.is_empty() {
         info!(

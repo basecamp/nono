@@ -230,6 +230,10 @@ swapping a symlink or reassigning a descriptor number. Procfs magic links other
 than the caller's own `/proc/self/fd/N` are refused, since they would resolve
 in the supervisor's context.
 
+The supervisor makes those lookups from its own mount namespace, so metadata
+mediation cannot be combined with `linux.isolate.mounts`: the masks and the
+private `/tmp` would not apply to them, and nono refuses the profile.
+
 `flock(2)` is not mediated. It needs an open descriptor, and Landlock already
 requires read access to open one (an `O_PATH` descriptor cannot be locked), so
 a process can only lock files it may read. Shared locks on read-only files are

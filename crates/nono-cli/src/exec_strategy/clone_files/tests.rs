@@ -72,6 +72,8 @@ fn config(caps: &CapabilitySet, filesystem: bool, proxy: bool) -> ExecConfig<'_>
         },
         sandbox_policy: LinuxSandboxPolicy::Auto,
         namespaces: None,
+        mount_mask: None,
+        scoped_proxy_handles: &[],
         allowed_env_vars: None,
         denied_env_vars: None,
         case_insensitive_env_vars: false,
@@ -155,6 +157,7 @@ fn supervise_with(
 ) -> Result<i32> {
     let scrub = nono::ScrubPolicy::secure_default();
     let config = SupervisorConfig {
+        session_socket_auth: false,
         protected_roots: &[],
         deny_paths: &[],
         approval_backend: backend,
@@ -647,8 +650,12 @@ fn fd_churn_signals_and_late_descriptors() -> Result<()> {
         struct Restore(libc::sigaction);
         impl Drop for Restore {
             fn drop(&mut self) {
-                // SAFETY: restore the action saved by sigaction.
+                // Ignoring first discards a pending SIGUSR1 another thread has not taken yet.
+                // SAFETY: SIG_IGN is a valid action and self.0 was saved by sigaction.
                 unsafe {
+                    let mut ignore: libc::sigaction = std::mem::zeroed();
+                    ignore.sa_sigaction = libc::SIG_IGN;
+                    libc::sigaction(libc::SIGUSR1, &ignore, std::ptr::null_mut());
                     libc::sigaction(libc::SIGUSR1, &self.0, std::ptr::null_mut());
                 }
             }
@@ -973,6 +980,7 @@ fn full_cli_supervisor_combined_path() -> Result<()> {
         config.threading = ThreadingContext::CryptoExpected;
         let scrub = nono::ScrubPolicy::secure_default();
         let supervisor = SupervisorConfig {
+            session_socket_auth: false,
             protected_roots: &[],
             deny_paths: &[],
             approval_backend: &Deny,
@@ -1041,6 +1049,7 @@ fn tool_gate_with_combined_notifications() -> Result<()> {
         let credentials = std::collections::BTreeSet::new();
         let runtime = crate::tool_sandbox::PreparedToolSandboxRuntime::prepare(
             crate::tool_sandbox::ToolSandboxPrepare {
+                session_socket_auth: false,
                 config: &policy,
                 initial_program: Path::new("/usr/bin/python3"),
                 resolved_command_binaries: None,

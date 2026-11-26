@@ -141,6 +141,7 @@ fn run_pull(pack_ref: &str) -> Result<()> {
             registry: None,
             force: true,
             init: false,
+            fetch_only: false,
             help: None,
         },
         PullReason::ProfileAuto,
