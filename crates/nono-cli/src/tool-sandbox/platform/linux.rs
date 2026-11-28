@@ -3116,6 +3116,10 @@ fn build_outer_exec_files<'a>(
         }
     }
 
+    // A file reached under several names (a symlink in PATH, a directory listed
+    // twice) is checked and added once: every later visit finds the same
+    // canonical path and would add nothing, or fail the same check again.
+    let mut visited = HashSet::new();
     for dir in &plan.executable_dirs {
         let Ok(entries) = fs::read_dir(dir) else {
             continue;
@@ -3138,6 +3142,9 @@ fn build_outer_exec_files<'a>(
             let canonical = path
                 .canonicalize()
                 .map_err(|source| NonoError::PathCanonicalization { path, source })?;
+            if !visited.insert(canonical.clone()) {
+                continue;
+            }
             if let Err(err) =
                 validate_outer_exec_file_immutable(&canonical, outer_caps).and_then(|()| {
                     add_outer_exec_file_with_deps(
@@ -3322,11 +3329,9 @@ fn add_outer_exec_elf_closure(
     paths: &mut Vec<PathBuf>,
 ) -> Result<()> {
     for dep in elf_dependency_closure(path)? {
-        let metadata = fs::metadata(&dep).map_err(|source| NonoError::ConfigRead {
-            path: dep.clone(),
-            source,
-        })?;
-        if seen.insert(file_id(&metadata)) {
+        // Each entry is a canonical path the closure walk already stat'ed through
+        // the pass cache.
+        if seen.insert(cached_file_id(&dep)?) {
             paths.push(dep);
         }
     }
@@ -8561,6 +8566,204 @@ mod tests {
         assert!(
             err.to_string().contains("libmissing.so.1"),
             "error must name the unresolved dependency: {err}"
+        );
+        Ok(())
+    }
+
+    fn plan_with_executable_dirs(executable_dirs: Vec<PathBuf>) -> ResolvedToolSandboxPlan {
+        ResolvedToolSandboxPlan {
+            config: CommandPoliciesConfig::default(),
+            resolved: ResolvedCommandBinaries {
+                commands: BTreeMap::new(),
+                warnings: Vec::new(),
+            },
+            exec_helpers: BTreeMap::new(),
+            executable_dirs,
+            deny_only: BTreeMap::new(),
+            allowed_direct_bypasses: Vec::new(),
+            allowed_direct_bypass_ids: HashSet::new(),
+            outer_exec_writable_dirs: Vec::new(),
+        }
+    }
+
+    fn set_mode(path: &Path, mode: u32) -> Result<()> {
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).map_err(|source| {
+            NonoError::ConfigWrite {
+                path: path.to_path_buf(),
+                source,
+            }
+        })
+    }
+
+    fn canonical(path: &Path) -> Result<PathBuf> {
+        path.canonicalize()
+            .map_err(|source| NonoError::PathCanonicalization {
+                path: path.to_path_buf(),
+                source,
+            })
+    }
+
+    /// `build_outer_exec_files` over `dirs` in a fresh pass, as a sorted list,
+    /// after checking it names no file twice.
+    fn outer_exec_file_set(dirs: &[PathBuf], shim_source: &Path) -> Result<Vec<PathBuf>> {
+        reset_elf_resolution_cache();
+        let plan = plan_with_executable_dirs(dirs.to_vec());
+        let mut files = build_outer_exec_files(
+            std::iter::empty(),
+            &plan,
+            shim_source,
+            &CapabilitySet::new(),
+            None,
+        )?;
+        let count = files.len();
+        files.sort();
+        files.dedup();
+        assert_eq!(files.len(), count, "a file listed twice: {files:?}");
+        Ok(files)
+    }
+
+    /// One executable directory holding an ELF tool (a copy of `/bin/true`) and
+    /// a wrapper script that execs `/bin/true`, each under a single name.
+    fn outer_exec_fixture_dir(root: &Path) -> Result<PathBuf> {
+        let dir = root.join("bin");
+        create_dir(&dir)?;
+        set_mode(&dir, 0o700)?;
+        let tool = dir.join("tool");
+        fs::copy("/bin/true", &tool).map_err(|source| NonoError::ConfigWrite {
+            path: tool.clone(),
+            source,
+        })?;
+        set_mode(&tool, 0o500)?;
+        let wrap = dir.join("wrap");
+        write_test_file(&wrap, b"#!/bin/sh\nexec /bin/true \"$@\"\n")?;
+        set_mode(&wrap, 0o500)?;
+        Ok(dir)
+    }
+
+    #[test]
+    fn outer_exec_files_are_the_same_when_a_file_has_several_names() -> Result<()> {
+        let tmp = test_tempdir()?;
+        let dir = outer_exec_fixture_dir(tmp.path())?;
+        let shim_source = canonical(Path::new("/bin/true"))?;
+        let single = outer_exec_file_set(std::slice::from_ref(&dir), &shim_source)?;
+        assert!(single.contains(&canonical(&dir.join("tool"))?));
+        assert!(single.contains(&canonical(&dir.join("wrap"))?));
+
+        // The same files again: symlinks beside them, symlinks (one through
+        // another) in a second directory, and the first directory listed twice.
+        symlink_path(Path::new("tool"), &dir.join("tool-alias"))?;
+        symlink_path(Path::new("wrap"), &dir.join("wrap-alias"))?;
+        let other = tmp.path().join("other-bin");
+        create_dir(&other)?;
+        set_mode(&other, 0o700)?;
+        symlink_path(&dir.join("tool"), &other.join("tool"))?;
+        symlink_path(&other.join("tool"), &other.join("tool-chain"))?;
+        symlink_path(&dir.join("wrap-alias"), &other.join("wrap"))?;
+        let several = outer_exec_file_set(&[dir.clone(), other, dir], &shim_source)?;
+
+        assert_eq!(several, single);
+        Ok(())
+    }
+
+    #[test]
+    fn outer_exec_files_keep_a_file_whose_other_name_was_skipped() -> Result<()> {
+        // A hard link is another canonical path to the same inode, with its own
+        // parent directory: it is checked on its own, and a link that fails the
+        // check must not keep the file out under its other name.
+        let tmp = test_tempdir()?;
+        let dir = outer_exec_fixture_dir(tmp.path())?;
+        let shim_source = canonical(Path::new("/bin/true"))?;
+        let single = outer_exec_file_set(std::slice::from_ref(&dir), &shim_source)?;
+
+        let shared = tmp.path().join("group-writable-bin");
+        create_dir(&shared)?;
+        let link = shared.join("tool");
+        fs::hard_link(dir.join("tool"), &link).map_err(|source| NonoError::ConfigWrite {
+            path: link.clone(),
+            source,
+        })?;
+        set_mode(&shared, 0o770)?;
+        let with_link = outer_exec_file_set(&[shared, dir.clone()], &shim_source)?;
+
+        assert!(!with_link.contains(&canonical(&link)?));
+        assert!(with_link.contains(&canonical(&dir.join("tool"))?));
+        assert_eq!(with_link, single);
+        Ok(())
+    }
+
+    #[test]
+    fn outer_exec_elf_closure_matches_a_fresh_stat_of_each_entry() -> Result<()> {
+        // A program needing three sonames that are two files: `libone.so.1` and
+        // `libalias.so.1` are symlinks, and `libalias.so.1` names the same file
+        // as `libtwo.so.1`, which `libone` also needs.
+        let tmp = test_tempdir()?;
+        let lib = tmp.path().join("lib");
+        create_dir(&lib)?;
+        let lib_dir = lib.display().to_string();
+        let libone = lib.join("libone.so.1.0");
+        write_test_file(
+            &libone,
+            &build_test_elf(&TestElf {
+                is64: true,
+                interpreter: None,
+                dynamic: true,
+                needed: &["libtwo.so.1"],
+                rpath: None,
+                runpath: Some(&lib_dir),
+            }),
+        )?;
+        symlink_path(Path::new("libone.so.1.0"), &lib.join("libone.so.1"))?;
+        write_test_file(&lib.join("libtwo.so.1"), b"stand-in for a shared object")?;
+        symlink_path(Path::new("libtwo.so.1"), &lib.join("libalias.so.1"))?;
+        let program = tmp.path().join("program");
+        write_test_file(
+            &program,
+            &build_test_elf(&TestElf {
+                is64: true,
+                interpreter: None,
+                dynamic: true,
+                needed: &["libone.so.1", "libtwo.so.1", "libalias.so.1"],
+                rpath: None,
+                runpath: Some(&lib_dir),
+            }),
+        )?;
+        let sh = canonical(Path::new("/bin/sh"))?;
+
+        // Each closure is taken with fresh stats, as before the pass cache was
+        // reused, and then through `add_outer_exec_elf_closure`; the second
+        // program shares nothing, and `sh` again shares everything.
+        let programs = [canonical(&program)?, sh.clone(), sh];
+        reset_elf_resolution_cache();
+        let mut expected_seen = HashSet::new();
+        let mut expected = Vec::new();
+        for program in &programs {
+            for dep in elf_dependency_closure(program)? {
+                let metadata = fs::metadata(&dep).map_err(|source| NonoError::ConfigRead {
+                    path: dep.clone(),
+                    source,
+                })?;
+                if expected_seen.insert(file_id(&metadata)) {
+                    expected.push(dep);
+                }
+            }
+        }
+
+        reset_elf_resolution_cache();
+        let mut seen = HashSet::new();
+        let mut paths = Vec::new();
+        for program in &programs {
+            add_outer_exec_elf_closure(program, &mut seen, &mut paths)?;
+        }
+
+        assert_eq!(paths, expected);
+        assert_eq!(seen, expected_seen);
+        assert_eq!(
+            paths[..3],
+            [
+                canonical(&program)?,
+                canonical(&libone)?,
+                canonical(&lib.join("libtwo.so.1"))?
+            ]
         );
         Ok(())
     }
